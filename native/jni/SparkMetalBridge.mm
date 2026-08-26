@@ -1655,10 +1655,21 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetDecodePage(
             // Zero-value Dictionary page (valueCount == 0); nothing to expand.
             return;
         }
-        if (plain && runs.nonNullCount == 0) {
-            // Zero-value PLAIN page: PLAIN pages never populate `items` (see
-            // ParquetPageRuns.h), so the Dictionary-only guard above cannot
-            // catch this case.
+        if (plain && runs.allValid && runs.nonNullCount == 0) {
+            // Zero-VALUE-COUNT PLAIN page (valueCount == 0, so allValid is
+            // vacuously true and nonNullCount == 0): PLAIN pages never
+            // populate `items` (see ParquetPageRuns.h), so the
+            // Dictionary-only guard above cannot catch this case. CRITICAL:
+            // this must NOT also fire for an all-NULL page with
+            // valueCount > 0 (nonNullCount == 0 but allValid == false) --
+            // that page still needs to reach the `else` (with-nulls) branch
+            // below so it actually writes validity[row] = 1 for every one of
+            // its rows; skipping it here left those rows at the row group's
+            // initial zero-fill (ids = 0, validity = 0, i.e. "defined, key
+            // value 0"), which is silently wrong whenever 0 is itself a
+            // legal member of the value-space domain -- unlike dictionary-id
+            // space, 0 is an ordinary, frequently-legal value here, not a
+            // reserved sentinel.
             return;
         }
         if (!runs.allValid && runs.segments.empty()) {

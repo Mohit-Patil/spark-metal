@@ -1089,6 +1089,51 @@ object ParquetDecodeSmoke {
     files.head
   }
 
+  /**
+   * Test-fixture sanity check (mirrors runDecodeAndCountMode's
+   * `fullyNullPages` assertion for the dictionary path, generalized to any
+   * column/predicate): walks `file`'s raw Parquet pages for `columnName` and
+   * requires at least one page whose entire row range satisfies
+   * `isNullRow` -- proving, from the file's own physical page layout rather
+   * than an assumption about how the writer chose to split pages, that the
+   * fixture actually contains the "a whole page decodes to zero non-null
+   * values" shape a test claims to exercise. `isNullRow` is the SUITE'S OWN
+   * ground truth (the exact predicate used to construct the column), not a
+   * decode of the file, so this needs no native call at all.
+   */
+  private def assertHasFullyNullPage(file: String, columnName: String, isNullRow: Int => Boolean): Unit = {
+    val reader = ParquetFileReader.open(HadoopInputFile.fromPath(new Path(file), new Configuration()))
+    try {
+      val descriptor = reader.getFooter.getFileMetaData.getSchema.getColumns.asScala
+        .find(_.getPath()(0) == columnName)
+        .getOrElse(throw new RuntimeException(s"$file: missing column $columnName"))
+      var fullyNullPages = 0
+      var globalRowOffset = 0
+      var pageReadStore = reader.readNextRowGroup()
+      while (pageReadStore != null) {
+        val pageReader = pageReadStore.getPageReader(descriptor)
+        pageReader.readDictionaryPage() // consumed if present; a PLAIN chunk has none.
+        var rowOffset = globalRowOffset
+        var rawPage = pageReader.readPage()
+        while (rawPage != null) {
+          val valueCount = rawPage.getValueCount
+          if (valueCount > 0 && (rowOffset until rowOffset + valueCount).forall(isNullRow)) {
+            fullyNullPages += 1
+          }
+          rowOffset += valueCount
+          rawPage = pageReader.readPage()
+        }
+        globalRowOffset += pageReadStore.getRowCount.toInt
+        pageReadStore = reader.readNextRowGroup()
+      }
+      require(fullyNullPages > 0,
+        s"$file: expected at least one fully-null $columnName page (observed 0) -- this test fixture " +
+          "does not actually exercise the all-null-page shape it claims to")
+    } finally {
+      reader.close()
+    }
+  }
+
   private val GroupedExecKeyColumns = Seq("cat_key", "region_key")
   private val GroupedExecMeasureColumns = Seq("quantity", "amount")
 
@@ -1244,6 +1289,113 @@ object ParquetDecodeSmoke {
         else hadoopConf.unset("parquet.dictionary.page.size")
       }
       val overflowFile = singlePartFile(overflowPath)
+
+      // A third file, purpose-built to restore coverage of
+      // aggregateRowGroupOnCpu (the per-row-group CPU fallback) for a
+      // genuinely mixed-encoding key CHUNK: one row group whose cat_key
+      // column chunk carries a REAL dictionary page (decodeKeyColumn sees
+      // isPlain = false for the whole chunk) followed, mid-chunk, by a page
+      // that parquet-mr itself wrote as PLAIN (the dictionary overflowed
+      // partway through). decodeKeyColumn's per-page encoding assert then
+      // throws ("expected dictionary encoding, got PLAIN") on that later
+      // page -- exactly the check Task 6b added alongside its PLAIN-chunk
+      // path (see decodeKeyColumn) -- driving this row group through the
+      // per-row-group CPU fallback for a reason INDEPENDENT of Task 6b's own
+      // PLAIN-chunk recovery (that recovery is instead covered by
+      // "dictionary-overflow-plain-recovered-on-gpu" above, whose whole
+      // point is that a chunk with NO dictionary page at all now succeeds on
+      // the GPU).
+      //
+      // Getting a genuine dictionary-page-then-PLAIN-page split within ONE
+      // row group needs care: a column that is unique-valued from row 0 (the
+      // trick overflowFile/writeDictionaryOverflowDataset use) empirically
+      // abandons its dictionary before ever completing a first page, so no
+      // dictionary page is ever written at all -- which is why THIS dataset
+      // instead runs in two phases: the first 2,000 rows draw cat_key from
+      // the dimension's real, tiny key set (so a page checkpoint -- forced
+      // early by small parquet.page.size/parquet.page.row.count.limit
+      // overrides -- flushes at least one genuine dictionary-encoded page
+      // before anything can overflow), and the remaining rows are
+      // near-unique large values that reliably blow the (deliberately small)
+      // parquet.dictionary.page.size budget well before the row group ends.
+      // Verified empirically (see task-6b-report.md's fix-round addendum)
+      // that this produces ColumnChunkMetaData.getEncodingStats() with both
+      // hasDictionaryPages() and hasNonDictionaryEncodedPages() true, in
+      // exactly one row group, for this file's actual row count.
+      val midChunkFallbackPath = tempDir.resolve("data-mid-chunk-fallback").toString
+      spark.range(rows)
+        .selectExpr(
+          "id",
+          "CASE WHEN id < 2000 THEN CAST(pmod(id, 4) + 1 AS INT) " +
+            "ELSE CAST(id + 1000000 AS INT) END AS cat_key",
+          "CASE pmod(id, 4) WHEN 0 THEN 10 WHEN 1 THEN 20 WHEN 2 THEN 30 ELSE 40 END AS region_key")
+        .withColumn("quantity",
+          expr("CASE WHEN id % 11 = 0 THEN CAST(NULL AS INT) ELSE CAST(pmod(id, 20) + 1 AS INT) END"))
+        .withColumn("amount",
+          expr("CASE WHEN id % 13 = 0 THEN CAST(NULL AS INT) ELSE CAST(1000 + pmod(id, 50) AS INT) END"))
+        .drop("id")
+        .coalesce(1)
+        .write
+        .option("parquet.dictionary.page.size", "8000")
+        .option("parquet.page.size", "256")
+        .option("parquet.page.size.row.check.min", "10")
+        .option("parquet.page.row.count.limit", "100")
+        .option("parquet.block.size", (128L * 1024 * 1024).toString)
+        .mode("errorifexists").parquet(midChunkFallbackPath)
+      val midChunkFallbackFile = singlePartFile(midChunkFallbackPath)
+
+      // A fourth file: a NULLABLE PLAIN key column with a genuine,
+      // verified-present fully-null data page (Task 6b fix-round Important
+      // #3 -- the PLAIN-with-nulls key path had ZERO coverage before this,
+      // which is exactly why the Critical all-null-page bug (Important #1:
+      // the early return on a PLAIN page skipped the with-nulls branch
+      // whenever nonNullCount == 0, including a genuinely all-null page,
+      // leaving those rows at the row group's zero-fill -- ids = 0,
+      // validity = 0, i.e. silently "defined, key value 0") survived a
+      // fully-green suite). parquet.enable.dictionary=false forces every
+      // column PLAIN (deterministic -- no dictionary-overflow heuristics to
+      // get right, unlike midChunkFallbackFile above); region_key is null
+      // for the first `nullBand` rows and parquet.page.row.count.limit=50
+      // forces small, row-count-aligned pages, so `assertHasFullyNullPage`
+      // below can PROVE (from the file's own raw pages, not just an
+      // assumption) that at least one emitted page is entirely null before
+      // the exec ever touches it.
+      //
+      // regionDimZero (below, NOT the shared `regionDim`) deliberately
+      // includes region_key = 0 as a REAL member: this is what makes the
+      // bug actually observable as a wrong AGGREGATE, not just silently
+      // absorbed. The shared catDim/regionDim never contain key 0, so a
+      // leaked "key 0" row would coincidentally still be dropped as a
+      // non-member (codesByKey.getOrElse(0, -1) = -1) even with the bug
+      // present -- a false-negative test. With regionDimZero's key 0 a
+      // genuine member, a leaked null-as-0 row instead joins group 0 for
+      // real, inflating that group's sum/count -- a mismatch
+      // sparkReference's true inner join (which correctly drops null keys)
+      // will catch. cat_key is left ordinary (cycling the dimensions' real
+      // keys) so only region_key's nulls are under test.
+      val nullBand = 500
+      val nullablePlainKeyPath = tempDir.resolve("data-nullable-plain-key").toString
+      spark.range(rows)
+        .selectExpr(
+          "id",
+          "CAST(pmod(id, 4) + 1 AS INT) AS cat_key",
+          s"CASE WHEN id < $nullBand THEN CAST(NULL AS INT) " +
+            "ELSE CASE pmod(id, 4) WHEN 0 THEN 0 WHEN 1 THEN 20 WHEN 2 THEN 30 ELSE 40 END " +
+            "END AS region_key")
+        .withColumn("quantity",
+          expr("CASE WHEN id % 11 = 0 THEN CAST(NULL AS INT) ELSE CAST(pmod(id, 20) + 1 AS INT) END"))
+        .withColumn("amount",
+          expr("CASE WHEN id % 13 = 0 THEN CAST(NULL AS INT) ELSE CAST(1000 + pmod(id, 50) AS INT) END"))
+        .drop("id")
+        .coalesce(1)
+        .write
+        .option("parquet.enable.dictionary", "false")
+        .option("parquet.page.row.count.limit", "50")
+        .option("parquet.page.size.row.check.min", "10")
+        .mode("errorifexists").parquet(nullablePlainKeyPath)
+      val nullablePlainKeyFile = singlePartFile(nullablePlainKeyPath)
+      assertHasFullyNullPage(nullablePlainKeyFile, "region_key", row => row < nullBand)
+      val regionDimZero = Seq(0, 20, 20, 30).toDF("region_key")
 
       def buildExec(
           files: Seq[String],
@@ -1406,16 +1558,55 @@ object ParquetDecodeSmoke {
       // dimensions' real key range -- the other ~99% are non-members (raw
       // ids offset past dimMaxKey, or simply absent from codesByKey), and
       // must fall out via the kernel's existing bounds/sign checks, not a
-      // CPU recompute. (The per-row-group CPU fallback path itself --
-      // aggregateRowGroupOnCpu -- is still real code, reachable from other
-      // decode failures such as an unsupported page type; this dataset no
-      // longer forces it for a KEY column specifically. Coverage of the
-      // dictionary-required version of this same trick lives on in "exec"
-      // mode's identically-named case, which drives
+      // CPU recompute. (This dataset no longer forces the per-row-group CPU
+      // fallback for a KEY column via "whole chunk is PLAIN, no dictionary
+      // page at all" -- Case B2 below restores that coverage via a
+      // different, still-genuine trigger: a chunk that legitimately mixes a
+      // real dictionary page with a later PLAIN page. Coverage of the
+      // dictionary-required version of THIS case's original trick lives on
+      // in "exec" mode's identically-named case, which drives
       // MetalParquetMembershipCountExec -- a different operator whose key
       // decode Task 6b did not touch.)
       compare(
         "dictionary-overflow-plain-recovered-on-gpu", Seq(mainFile, overflowFile), catDim, regionDim,
+        exactCpuFallback = Some(0))
+
+      // Case B2: main + midChunkFallbackFile (see its construction above).
+      // midChunkFallbackFile's cat_key chunk carries a REAL dictionary page,
+      // so decodeKeyColumn takes the (unchanged) dictionary path for the
+      // whole chunk -- but a later page in that SAME chunk is actually
+      // PLAIN (parquet-mr's own dictionary overflowed mid-chunk), which
+      // decodeKeyColumn's per-page encoding assert rejects
+      // ("expected dictionary encoding, got PLAIN"), throwing and driving
+      // this row group through aggregateRowGroupOnCpu -- restoring this
+      // suite's only coverage of the grouped-aggregate operator's
+      // per-row-group CPU fallback (lost when Case B above stopped
+      // triggering it). requireGpuCpuMix proves this is a genuine mix
+      // (mainFile's row group still GPU-successful, not every row group
+      // silently falling back); the combined result must still be exact.
+      compare(
+        "mid-chunk-dictionary-to-plain-cpu-fallback", Seq(mainFile, midChunkFallbackFile), catDim, regionDim,
+        minCpuFallback = Some(1), requireGpuCpuMix = true)
+
+      // Case B3: nullablePlainKeyFile alone, joined against regionDimZero
+      // (NOT the shared regionDim -- see the file's own construction
+      // comment above for why key 0 must be a genuine member here).
+      // region_key is entirely PLAIN (parquet.enable.dictionary=false) and
+      // includes a verified (assertHasFullyNullPage, above) fully-null page
+      // among its nulls. exactCpuFallback = 0 both proves the PLAIN-with-
+      // nulls path ran on the GPU (not a fallback masking the bug) and,
+      // combined with the exact result_match check inside compare(),
+      // exercises the Critical fix (Important #1): before it, this case's
+      // leaked null rows would present as region_key = 0, a real member of
+      // regionDimZero, silently inflating that group's sum/count/avg --
+      // wrong without ever throwing or falling back, i.e. undetectable by
+      // any plan-shape or fallback-count check, only by comparing the exact
+      // aggregate values against sparkReference's true inner join. See
+      // task-6b-report.md's fix-round addendum for the RED evidence
+      // (git-stash ablation back to the pre-fix early return) that this
+      // case's mismatch check actually fails without the fix.
+      compare(
+        "nullable-plain-key-fully-null-page", Seq(nullablePlainKeyFile), catDim, regionDimZero,
         exactCpuFallback = Some(0))
 
       // Case C: cat_key = 1 appears TWICE in the (attributed) catDim with

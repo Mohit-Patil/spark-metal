@@ -175,8 +175,9 @@ case class MetalParquetGroupedAggregateExec(
     val domainViolation: Option[String] = keyDomains.zipWithIndex.collectFirst {
       case (Some((min, max)), index)
           if min < 0 || max > MetalParquetGroupedAggregateExec.MaxValueSpaceKey =>
-        s"key column ${keyColumnNames(index)}: join-key domain [$min, $max] falls outside the " +
-          s"value-space code table's supported range [0, ${MetalParquetGroupedAggregateExec.MaxValueSpaceKey}]"
+        s"value-space domain violation: key column ${keyColumnNames(index)}'s join-key domain " +
+          s"[$min, $max] falls outside the value-space code table's supported range " +
+          s"[0, ${MetalParquetGroupedAggregateExec.MaxValueSpaceKey}]"
     }
     // dimMaxKeys(k) sizes dimension k's PLAIN value-space table lazily, the
     // first time decodeKeyColumn actually encounters a PLAIN chunk for
@@ -221,7 +222,16 @@ case class MetalParquetGroupedAggregateExec(
           s"MetalParquetGroupedAggregateExec: GroupSpace.build rejected a dimension attribute type " +
             s"($reason) -- this should have been rejected at planning time, not reached construction")
       case Left(reason) =>
-        logWarning(s"MetalParquetGroupedAggregateExec: GroupSpace.build rejected the dimensions " +
+        // reason may come from three independent sources -- the value-space
+        // domain guard above (GroupSpace.build never even runs), the 64MB
+        // group-space memory estimate (GroupSpace.build DID succeed; the
+        // estimate check on its result rejected it), or GroupSpace.build
+        // itself (a duplicate key or oversized cross product) -- each
+        // already carries its own distinguishing prefix/detail, so this
+        // message states only what is true of all three: dense group-space
+        // execution is unavailable for this reason and this call is falling
+        // back.
+        logWarning(s"MetalParquetGroupedAggregateExec: cannot use the dense group-space GPU path " +
           s"($reason); falling back to a whole-operator CPU hash-join + hash-aggregate")
         executeWholeOperatorCpuFallback(
           dimensions, dimensionAttributeTypes, aggKinds, aggMeasureSlots, aggSlotMappings, occupancySlot)
@@ -1146,11 +1156,14 @@ private[sparkmetal] object MetalParquetGroupedAggregateExec {
 
   /**
    * Task 6b: the largest join-key value a PLAIN key column's value-space
-   * code table may need to hold, 4,194,303 (4M - 1) -- chosen so the table
-   * (`(dimMaxKey + 1)` int32s, doubled when a factor table is also needed)
-   * stays at or under 16MB per key column. `doExecute`'s domain guard rejects
-   * (routes to the whole-operator CPU fallback) any dimension whose actual
-   * join-key domain exceeds this, before `GroupSpace.build` even runs.
+   * code table may need to hold, 4,194,303 (4M - 1) -- chosen so ONE table
+   * (`(dimMaxKey + 1)` int32s) stays at or under 16MB; the codes table alone
+   * is at most 16MB, and the codes+factors PAIR together (a factor table is
+   * the SAME `dimMaxKey + 1` size, built only when the dimension has
+   * duplicate keys -- see `buildValueSpaceTables`) is at most 32MB per key
+   * column. `doExecute`'s domain guard rejects (routes to the
+   * whole-operator CPU fallback) any dimension whose actual join-key domain
+   * exceeds this, before `GroupSpace.build` even runs.
    */
   private[sparkmetal] val MaxValueSpaceKey: Int = 4194303
 

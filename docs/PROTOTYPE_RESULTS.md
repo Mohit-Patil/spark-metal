@@ -124,8 +124,33 @@ latest strict run processed 32 fact batches with `inputCopyFallbacks = 0`.
 - With adaptive execution enabled, the q96-shaped rule is verified to remain on
   the CPU rather than attempting an unsafe adaptive-plan replacement.
 
-## Remaining success gate
+## TPC-DS scale-factor-10 q96 result (2026-08-26)
 
-The project goal still requires an unmodified TPC-DS scale-factor-10 query with a
-correct result and at least a 10% median end-to-end improvement over vanilla
-Spark. No current result satisfies that gate.
+The licensed SF10 comparison (five warm-ups, eleven measured runs per
+configuration, identical Spark settings) after introducing streamed
+asynchronous submission, dictionary-aware membership tables, and the shared
+prepared-map cache:
+
+| Configuration | Median end-to-end time |
+|---|---:|
+| Vanilla Spark CPU | 206.4 ms |
+| Spark Metal | 135.7 ms |
+
+Observed end-to-end speedup: **1.52x**, with an exact result-hash, row-count,
+and schema match, `MetalFusedMembershipCount` in the executed plan,
+`numMetalCommands = 30` for 30 fact batches over 28,800,991 rows, and zero
+copy fallbacks. Raw data: `benchmark-results/comparison-20260826T084008Z`.
+
+Two findings invalidated the earlier near-tie measurements. First, Spark keeps
+these Parquet fact columns dictionary-encoded in the off-heap vectors, so the
+earlier address-based GPU path silently fell back to the CPU multiplicity loop
+while a metric bug reported the batches as Metal commands. Second, Spark
+reuses each partition's off-heap vector memory for the following batch, so
+zero-copy references held across `next()` read overwritten data; the streamed
+path therefore copies each batch into pooled Metal staging buffers at submit
+time.
+
+## Success gate
+
+The gate — an unmodified TPC-DS scale-factor-10 query with a correct result
+and at least a 10% median end-to-end improvement — **is met by q96 at 1.52x**.

@@ -1,7 +1,9 @@
 package io.github.mohitpatil.sparkmetal
 
+import java.util.UUID
 import java.util.concurrent.Executors
 
+import scala.collection.mutable
 import scala.concurrent.duration.Duration
 import scala.concurrent.{Await, ExecutionContext, Future}
 
@@ -13,6 +15,45 @@ import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.execution.vectorized.OnHeapColumnVector
 import org.apache.spark.sql.types.LongType
 import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnVector}
+
+/**
+ * Builds the native dense membership maps once per query execution and shares
+ * the prepared handle across every concurrently running partition task in this
+ * JVM. The last task to release the token frees the native maps and reports
+ * the accumulated copy fallbacks.
+ */
+private[sparkmetal] object PreparedMembershipCache {
+  private final class Entry(val handle: Long, var remaining: Int)
+  private val entries = mutable.HashMap.empty[String, Entry]
+
+  def acquire(
+      token: String,
+      keys: Seq[Array[Int]],
+      expectedUses: Int,
+      buildTime: SQLMetric): Long = synchronized {
+    val entry = entries.getOrElseUpdate(token, {
+      val started = System.nanoTime()
+      val handle = NativeBridge.prepareMembershipCount3(keys(0), keys(1), keys(2))
+      buildTime += (System.nanoTime() - started) / 1000000
+      new Entry(handle, expectedUses)
+    })
+    entry.handle
+  }
+
+  def release(token: String): Long = synchronized {
+    entries.get(token) match {
+      case Some(entry) =>
+        entry.remaining -= 1
+        if (entry.remaining <= 0) {
+          entries.remove(token)
+          val fallbacks = NativeBridge.membershipCount3CopyFallbacks(entry.handle)
+          NativeBridge.releaseMembershipCount3(entry.handle)
+          fallbacks
+        } else 0L
+      case None => 0L
+    }
+  }
+}
 
 case class MetalFusedMembershipCountExec(
     outputAttribute: Attribute,
@@ -33,10 +74,11 @@ case class MetalFusedMembershipCountExec(
   override lazy val metrics: Map[String, SQLMetric] = Map(
     "numInputRows" -> SQLMetrics.createMetric(sparkContext, "number of fact rows"),
     "numInputBatches" -> SQLMetrics.createMetric(sparkContext, "number of fact batches"),
+    "numMetalCommands" -> SQLMetrics.createMetric(sparkContext, "number of Metal command buffers"),
     "inputCopyFallbacks" -> SQLMetrics.createMetric(sparkContext, "Metal input copy fallbacks"),
     "dimensionTime" -> SQLMetrics.createTimingMetric(sparkContext, "dimension key collection time"),
     "membershipBuildTime" -> SQLMetrics.createTimingMetric(sparkContext, "membership map build time"),
-    "metalTime" -> SQLMetrics.createTimingMetric(sparkContext, "Metal membership and count time"))
+    "metalTime" -> SQLMetrics.createTimingMetric(sparkContext, "Metal submit and final wait time"))
 
   override protected def doExecute(): RDD[InternalRow] =
     throw new UnsupportedOperationException("MetalFusedMembershipCountExec is columnar-only")
@@ -49,7 +91,7 @@ case class MetalFusedMembershipCountExec(
       ExecutionContext.fromExecutor(keyExecutor)
     val keys = try {
       Await.result(Future.traverse(keyPlans) { plan =>
-        Future(plan.executeCollect().filterNot(_.isNullAt(0)).map(_.getInt(0)).sorted)
+        Future(plan.executeCollect().filterNot(_.isNullAt(0)).map(_.getInt(0)))
       }, Duration.Inf)
     } finally {
       keyExecutor.shutdown()
@@ -57,42 +99,136 @@ case class MetalFusedMembershipCountExec(
     dimensionTime += (System.nanoTime() - dimensionStarted) / 1000000
     val inputRows = longMetric("numInputRows")
     val inputBatches = longMetric("numInputBatches")
+    val metalCommands = longMetric("numMetalCommands")
     val inputCopyFallbacks = longMetric("inputCopyFallbacks")
     val membershipBuildTime = longMetric("membershipBuildTime")
     val metalTime = longMetric("metalTime")
-    val multiplicities = keys.map(_.groupMapReduce(identity)(_ => 1L)(_ + _))
     val denseDomains = keys.forall { values =>
-      values.nonEmpty && values.last.toLong - values.head.toLong + 1L <= 16L * 1024 * 1024
+      values.nonEmpty && {
+        var minimum = Int.MaxValue
+        var maximum = Int.MinValue
+        values.foreach { value =>
+          if (value < minimum) minimum = value
+          if (value > maximum) maximum = value
+        }
+        maximum.toLong - minimum.toLong + 1L <= 16L * 1024 * 1024
+      }
     }
-    factPlan.executeColumnar().mapPartitions { batches =>
+    val factBatches = factPlan.executeColumnar()
+    val prepareToken = UUID.randomUUID().toString
+    val prepareUses = factBatches.getNumPartitions
+    factBatches.mapPartitions { batches =>
       SparkMetalNative.ensureInitialized(nativeLibrary, metalLibrary)
-      var partitionCount = 0L
+      lazy val multiplicities = keys.map(_.groupMapReduce(identity)(_ => 1L)(_ + _))
+      lazy val allKeysUnique = multiplicities.forall(_.valuesIterator.forall(_ == 1L))
+      val presenceTables = new java.util.IdentityHashMap[AnyRef, Array[Byte]]()
+      val multiplicityTables = new java.util.IdentityHashMap[AnyRef, Array[Int]]()
       val preparedHandle = if (denseDomains) {
-        val started = System.nanoTime()
-        val handle = NativeBridge.prepareMembershipCount3(keys(0), keys(1), keys(2))
-        membershipBuildTime += (System.nanoTime() - started) / 1000000
-        handle
+        PreparedMembershipCache.acquire(prepareToken, keys, prepareUses, membershipBuildTime)
       } else 0L
+      var partitionCount = 0L
+      var metalNanos = 0L
       try {
-        while (batches.hasNext) {
-          val batch = batches.next()
-          val rowCount = batch.numRows()
-          inputRows += rowCount
-          inputBatches += 1
-          try {
+        val streamHandle =
+          if (preparedHandle != 0L) NativeBridge.membershipCount3StreamBegin(preparedHandle)
+          else 0L
+        var streamFinished = streamHandle == 0L
+        try {
+          while (batches.hasNext) {
+            val batch = batches.next()
+            val rowCount = batch.numRows()
+            inputRows += rowCount
+            inputBatches += 1
             val columns = factOrdinals.map(batch.column)
+            if (rowCount == 0) {
+              batch.closeIfFreeable()
+            } else if (streamHandle != 0L && columns.forall { column =>
+                OffHeapColumnVectorAccess.supportsIntAddress(column) ||
+                OffHeapColumnVectorAccess.supportsDictionaryIntAddress(column) }) {
+              val started = System.nanoTime()
+              def inputAddress(ordinal: Int): Long = {
+                val column = columns(ordinal)
+                if (OffHeapColumnVectorAccess.supportsIntAddress(column)) {
+                  OffHeapColumnVectorAccess.valueAddress(column)
+                } else {
+                  OffHeapColumnVectorAccess.dictionaryIdsAddress(column)
+                }
+              }
+              def presenceTable(ordinal: Int): Array[Byte] = {
+                val column = columns(ordinal)
+                if (OffHeapColumnVectorAccess.supportsIntAddress(column) || !allKeysUnique) null
+                else presenceTables.computeIfAbsent(
+                  OffHeapColumnVectorAccess.dictionary(column),
+                  _ => {
+                    val table = new Array[Byte](OffHeapColumnVectorAccess.dictionaryMaxId(column) + 1)
+                    var id = 0
+                    while (id < table.length) {
+                      if (multiplicities(ordinal).contains(
+                          OffHeapColumnVectorAccess.decodeDictionaryInt(column, id))) {
+                        table(id) = 1
+                      }
+                      id += 1
+                    }
+                    table
+                  })
+              }
+              def multiplicityTable(ordinal: Int): Array[Int] = {
+                val column = columns(ordinal)
+                if (OffHeapColumnVectorAccess.supportsIntAddress(column) || allKeysUnique) null
+                else multiplicityTables.computeIfAbsent(
+                  OffHeapColumnVectorAccess.dictionary(column),
+                  _ => {
+                    val table = new Array[Int](OffHeapColumnVectorAccess.dictionaryMaxId(column) + 1)
+                    var id = 0
+                    while (id < table.length) {
+                      table(id) = Math.toIntExact(multiplicities(ordinal).getOrElse(
+                        OffHeapColumnVectorAccess.decodeDictionaryInt(column, id), 0L))
+                      id += 1
+                    }
+                    table
+                  })
+              }
+              def nullAddress(ordinal: Int): Long =
+                if (columns(ordinal).hasNull()) OffHeapColumnVectorAccess.nullAddress(columns(ordinal))
+                else 0L
+              try {
+                NativeBridge.membershipCount3StreamSubmit(
+                  streamHandle,
+                  inputAddress(0), nullAddress(0), columns(0).hasNull(),
+                  presenceTable(0), multiplicityTable(0),
+                  inputAddress(1), nullAddress(1), columns(1).hasNull(),
+                  presenceTable(1), multiplicityTable(1),
+                  inputAddress(2), nullAddress(2), columns(2).hasNull(),
+                  presenceTable(2), multiplicityTable(2),
+                  rowCount)
+              } finally {
+                batch.closeIfFreeable()
+              }
+              metalNanos += System.nanoTime() - started
+              metalCommands += 1
+            } else {
+              try {
+                partitionCount += countOnCpu(columns, multiplicities, rowCount)
+              } finally {
+                batch.closeIfFreeable()
+              }
+            }
+          }
+          if (streamHandle != 0L) {
             val started = System.nanoTime()
-            partitionCount += executeBatch(
-              columns, multiplicities, rowCount, preparedHandle)
-            metalTime += (System.nanoTime() - started) / 1000000
-          } finally {
-            batch.closeIfFreeable()
+            partitionCount += NativeBridge.membershipCount3StreamFinish(streamHandle)
+            streamFinished = true
+            metalNanos += System.nanoTime() - started
+          }
+        } finally {
+          if (!streamFinished) {
+            NativeBridge.membershipCount3StreamAbort(streamHandle)
           }
         }
       } finally {
+        metalTime += metalNanos / 1000000
         if (preparedHandle != 0L) {
-          inputCopyFallbacks += NativeBridge.membershipCount3CopyFallbacks(preparedHandle)
-          NativeBridge.releaseMembershipCount3(preparedHandle)
+          inputCopyFallbacks += PreparedMembershipCache.release(prepareToken)
         }
       }
       val vector = new OnHeapColumnVector(1, LongType)
@@ -101,27 +237,12 @@ case class MetalFusedMembershipCountExec(
     }
   }
 
-  private def executeBatch(
+  private def countOnCpu(
       columns: Seq[ColumnVector],
       multiplicities: Seq[Map[Int, Long]],
-      rowCount: Int,
-      preparedHandle: Long): Long = {
+      rowCount: Int): Long = {
     if (multiplicities.exists(_.isEmpty)) {
       return 0L
-    }
-    if (preparedHandle != 0L && columns.forall(OffHeapColumnVectorAccess.supportsIntAddress)) {
-      return NativeBridge.membershipCount3PreparedAddress(
-        OffHeapColumnVectorAccess.valueAddress(columns(0)),
-        if (columns(0).hasNull()) OffHeapColumnVectorAccess.nullAddress(columns(0)) else 0L,
-        columns(0).hasNull(),
-        OffHeapColumnVectorAccess.valueAddress(columns(1)),
-        if (columns(1).hasNull()) OffHeapColumnVectorAccess.nullAddress(columns(1)) else 0L,
-        columns(1).hasNull(),
-        OffHeapColumnVectorAccess.valueAddress(columns(2)),
-        if (columns(2).hasNull()) OffHeapColumnVectorAccess.nullAddress(columns(2)) else 0L,
-        columns(2).hasNull(),
-        rowCount,
-        preparedHandle)
     }
     var count = 0L
     var row = 0

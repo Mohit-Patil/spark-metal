@@ -18,3 +18,4 @@ spark-events/
 .tools/
 spark-warehouse/
 metastore_db/
+/WORKING_SUMMARY.md

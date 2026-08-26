@@ -1,5 +1,6 @@
 #include <jni.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <limits>
 #include <sys/mman.h>
@@ -44,8 +45,43 @@ struct PreparedMembershipCount3 {
     int32_t keyMinimums[3];
     uint32_t keySpans[3];
     bool allKeysUnique = true;
-    uint64_t copyFallbacks = 0;
+    std::atomic<uint64_t> copyFallbacks{0};
 };
+
+// One in-flight partition worth of asynchronously committed command buffers.
+// Spark reuses each partition's off-heap vectors for the next batch, so every
+// submit copies its inputs into stream-owned staging buffers; a staging buffer
+// returns to the free pool once its command buffer completes. The prepared
+// handle may be shared by concurrent tasks, so a stream also owns its own
+// partial-count buffers.
+struct MembershipStream {
+    PreparedMembershipCount3 *prepared = nullptr;
+    std::vector<id<MTLCommandBuffer>> commandBuffers;
+    std::vector<std::pair<id<MTLBuffer>, id<MTLCommandBuffer>>> pendingStaging;
+    std::vector<id<MTLBuffer>> freeStaging;
+    std::vector<id<MTLBuffer>> partialBuffers;
+    std::vector<NSUInteger> partialGroupCounts;
+};
+
+id<MTLBuffer> acquireStagingBuffer(MembershipStream *stream, size_t length) {
+    for (auto pending = stream->pendingStaging.begin();
+         pending != stream->pendingStaging.end();) {
+        if (pending->second.status == MTLCommandBufferStatusCompleted) {
+            stream->freeStaging.push_back(pending->first);
+            pending = stream->pendingStaging.erase(pending);
+        } else {
+            ++pending;
+        }
+    }
+    for (auto free = stream->freeStaging.begin(); free != stream->freeStaging.end(); ++free) {
+        if ((*free).length >= length) {
+            id<MTLBuffer> buffer = *free;
+            stream->freeStaging.erase(free);
+            return buffer;
+        }
+    }
+    return [device newBufferWithLength:length options:MTLResourceStorageModeShared];
+}
 
 void throwRuntime(JNIEnv *environment, NSString *message) {
     jclass exceptionClass = environment->FindClass("java/lang/RuntimeException");
@@ -630,9 +666,422 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_membershipCount3PreparedAddres
             throwRuntime(environment, [NSString stringWithFormat:@"Metal command failed: %@", commandBuffer.error]);
             return 0;
         }
-        int64_t *partials = static_cast<int64_t *>(prepared->partialBuffer.contents);
         int64_t result = 0;
-        for (NSUInteger index = 0; index < groupCount; ++index) result += partials[index];
+        if (prepared->allKeysUnique) {
+            uint32_t *partials = static_cast<uint32_t *>(prepared->partialBuffer.contents);
+            for (NSUInteger index = 0; index < groupCount; ++index) result += partials[index];
+        } else {
+            int64_t *partials = static_cast<int64_t *>(prepared->partialBuffer.contents);
+            for (NSUInteger index = 0; index < groupCount; ++index) result += partials[index];
+        }
         return static_cast<jlong>(result);
+    }
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_io_github_mohitpatil_sparkmetal_NativeBridge_membershipCount3PreparedBatches(
+    JNIEnv *environment,
+    jclass,
+    jlongArray input0Addresses,
+    jlongArray null0Addresses,
+    jbooleanArray hasNull0,
+    jlongArray input1Addresses,
+    jlongArray null1Addresses,
+    jbooleanArray hasNull1,
+    jlongArray input2Addresses,
+    jlongArray null2Addresses,
+    jbooleanArray hasNull2,
+    jintArray counts,
+    jlong preparedHandle) {
+    @autoreleasepool {
+        if (membershipCountUniquePipeline == nil ||
+            membershipCountMultiplicityPipeline == nil || commandQueue == nil) {
+            throwRuntime(environment, @"NativeBridge.initialize must be called first");
+            return 0;
+        }
+        if (preparedHandle == 0 || counts == nullptr) {
+            throwRuntime(environment, @"Batched membership count requires a prepared handle");
+            return 0;
+        }
+        jsize batchCount = environment->GetArrayLength(counts);
+        if (batchCount <= 0 ||
+            environment->GetArrayLength(input0Addresses) != batchCount ||
+            environment->GetArrayLength(null0Addresses) != batchCount ||
+            environment->GetArrayLength(hasNull0) != batchCount ||
+            environment->GetArrayLength(input1Addresses) != batchCount ||
+            environment->GetArrayLength(null1Addresses) != batchCount ||
+            environment->GetArrayLength(hasNull1) != batchCount ||
+            environment->GetArrayLength(input2Addresses) != batchCount ||
+            environment->GetArrayLength(null2Addresses) != batchCount ||
+            environment->GetArrayLength(hasNull2) != batchCount) {
+            throwRuntime(environment, @"Batched membership arrays must have equal, non-zero lengths");
+            return 0;
+        }
+
+        std::vector<jint> rowCounts(static_cast<size_t>(batchCount));
+        std::vector<jlong> inputAddresses[3];
+        std::vector<jlong> nullAddresses[3];
+        std::vector<jboolean> nullFlags[3];
+        for (NSUInteger column = 0; column < 3; ++column) {
+            inputAddresses[column].resize(static_cast<size_t>(batchCount));
+            nullAddresses[column].resize(static_cast<size_t>(batchCount));
+            nullFlags[column].resize(static_cast<size_t>(batchCount));
+        }
+        environment->GetIntArrayRegion(counts, 0, batchCount, rowCounts.data());
+        jlongArray inputArrays[3] = {input0Addresses, input1Addresses, input2Addresses};
+        jlongArray nullArrays[3] = {null0Addresses, null1Addresses, null2Addresses};
+        jbooleanArray flagArrays[3] = {hasNull0, hasNull1, hasNull2};
+        for (NSUInteger column = 0; column < 3; ++column) {
+            environment->GetLongArrayRegion(
+                inputArrays[column], 0, batchCount, inputAddresses[column].data());
+            environment->GetLongArrayRegion(
+                nullArrays[column], 0, batchCount, nullAddresses[column].data());
+            environment->GetBooleanArrayRegion(
+                flagArrays[column], 0, batchCount, nullFlags[column].data());
+        }
+        if (environment->ExceptionCheck()) return 0;
+
+        constexpr NSUInteger threadsPerGroup = 256;
+        std::vector<NSUInteger> groupCounts(static_cast<size_t>(batchCount));
+        NSUInteger totalGroups = 0;
+        for (jsize batch = 0; batch < batchCount; ++batch) {
+            if (rowCounts[batch] <= 0) {
+                throwRuntime(environment, @"Batched membership count requires non-empty batches");
+                return 0;
+            }
+            NSUInteger groups =
+                (static_cast<NSUInteger>(rowCounts[batch]) + threadsPerGroup - 1) / threadsPerGroup;
+            groupCounts[static_cast<size_t>(batch)] = groups;
+            totalGroups += groups;
+        }
+
+        auto *prepared = reinterpret_cast<PreparedMembershipCount3 *>(
+            static_cast<uintptr_t>(preparedHandle));
+        if (prepared->partialCapacity < totalGroups) {
+            prepared->partialBuffer = [device
+                newBufferWithLength:totalGroups * sizeof(int64_t)
+                options:MTLResourceStorageModeShared];
+            prepared->partialCapacity = prepared->partialBuffer == nil ? 0 : totalGroups;
+        }
+        if (prepared->partialBuffer == nil) {
+            throwRuntime(environment, @"Cannot allocate batched Metal partial-count buffer");
+            return 0;
+        }
+
+        std::vector<MetalBufferSlice> inputs[3];
+        std::vector<MetalBufferSlice> nullBuffers[3];
+        for (NSUInteger column = 0; column < 3; ++column) {
+            inputs[column].reserve(static_cast<size_t>(batchCount));
+            nullBuffers[column].reserve(static_cast<size_t>(batchCount));
+        }
+        id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+        [encoder setComputePipelineState:prepared->allKeysUnique
+            ? membershipCountUniquePipeline
+            : membershipCountMultiplicityPipeline];
+        NSUInteger partialOffset = 0;
+        NSUInteger partialElementBytes = prepared->allKeysUnique
+            ? sizeof(uint32_t) : sizeof(int64_t);
+        for (jsize batch = 0; batch < batchCount; ++batch) {
+            size_t inputBytes = static_cast<size_t>(rowCounts[batch]) * sizeof(int32_t);
+            uint32_t nullMask = 0;
+            for (NSUInteger column = 0; column < 3; ++column) {
+                MetalBufferSlice input = bufferFromAddress(
+                    environment, inputAddresses[column][batch], inputBytes, @"batched input");
+                if (input.buffer == nil || environment->ExceptionCheck()) return 0;
+                inputs[column].push_back(input);
+                MetalBufferSlice nullBuffer;
+                if (nullFlags[column][batch] == JNI_TRUE) {
+                    nullMask |= 1u << column;
+                    nullBuffer = bufferFromAddress(
+                        environment, nullAddresses[column][batch],
+                        static_cast<size_t>(rowCounts[batch]), @"batched null mask");
+                } else {
+                    nullBuffer = {prepared->nullPlaceholder, 0, false};
+                }
+                if (nullBuffer.buffer == nil || environment->ExceptionCheck()) return 0;
+                nullBuffers[column].push_back(nullBuffer);
+                if (input.copied) prepared->copyFallbacks += 1;
+                if (nullBuffer.copied) prepared->copyFallbacks += 1;
+                [encoder setBuffer:input.buffer offset:input.offset atIndex:column];
+                [encoder setBuffer:nullBuffer.buffer offset:nullBuffer.offset atIndex:column + 3];
+                [encoder setBuffer:prepared->keyBuffers[column] offset:0 atIndex:column + 6];
+            }
+            MembershipCountParameters parameters = {
+                static_cast<uint32_t>(rowCounts[batch]), nullMask,
+                prepared->keyMinimums[0], prepared->keyMinimums[1], prepared->keyMinimums[2],
+                prepared->keySpans[0], prepared->keySpans[1], prepared->keySpans[2]
+            };
+            [encoder setBuffer:prepared->partialBuffer
+                    offset:partialOffset * partialElementBytes atIndex:9];
+            [encoder setBytes:&parameters length:sizeof(parameters) atIndex:10];
+            [encoder dispatchThreadgroups:MTLSizeMake(groupCounts[batch], 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+            partialOffset += groupCounts[batch];
+        }
+        [encoder endEncoding];
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
+        if (commandBuffer.status == MTLCommandBufferStatusError) {
+            throwRuntime(environment, [NSString stringWithFormat:@"Batched Metal command failed: %@", commandBuffer.error]);
+            return 0;
+        }
+        int64_t result = 0;
+        if (prepared->allKeysUnique) {
+            uint32_t *partials = static_cast<uint32_t *>(prepared->partialBuffer.contents);
+            for (NSUInteger index = 0; index < totalGroups; ++index) result += partials[index];
+        } else {
+            int64_t *partials = static_cast<int64_t *>(prepared->partialBuffer.contents);
+            for (NSUInteger index = 0; index < totalGroups; ++index) result += partials[index];
+        }
+        return static_cast<jlong>(result);
+    }
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_io_github_mohitpatil_sparkmetal_NativeBridge_membershipCount3StreamBegin(
+    JNIEnv *environment,
+    jclass,
+    jlong preparedHandle) {
+    if (membershipCountUniquePipeline == nil ||
+        membershipCountMultiplicityPipeline == nil || commandQueue == nil) {
+        throwRuntime(environment, @"NativeBridge.initialize must be called first");
+        return 0;
+    }
+    if (preparedHandle == 0) {
+        throwRuntime(environment, @"Streamed membership count requires a prepared handle");
+        return 0;
+    }
+    auto *stream = new MembershipStream();
+    stream->prepared = reinterpret_cast<PreparedMembershipCount3 *>(
+        static_cast<uintptr_t>(preparedHandle));
+    return static_cast<jlong>(reinterpret_cast<uintptr_t>(stream));
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_io_github_mohitpatil_sparkmetal_NativeBridge_membershipCount3StreamSubmit(
+    JNIEnv *environment,
+    jclass,
+    jlong streamHandle,
+    jlong input0Address,
+    jlong null0Address,
+    jboolean hasNull0,
+    jbyteArray dictPresence0,
+    jintArray dictMultiplicity0,
+    jlong input1Address,
+    jlong null1Address,
+    jboolean hasNull1,
+    jbyteArray dictPresence1,
+    jintArray dictMultiplicity1,
+    jlong input2Address,
+    jlong null2Address,
+    jboolean hasNull2,
+    jbyteArray dictPresence2,
+    jintArray dictMultiplicity2,
+    jint count) {
+    @autoreleasepool {
+        if (streamHandle == 0 || count <= 0) {
+            throwRuntime(environment, @"Streamed membership submit requires a stream and rows");
+            return;
+        }
+        auto *stream = reinterpret_cast<MembershipStream *>(
+            static_cast<uintptr_t>(streamHandle));
+        PreparedMembershipCount3 *prepared = stream->prepared;
+        size_t inputBytes = static_cast<size_t>(count) * sizeof(int32_t);
+        jlong inputAddresses[3] = {input0Address, input1Address, input2Address};
+        jlong nullAddresses[3] = {null0Address, null1Address, null2Address};
+        jboolean hasNulls[3] = {hasNull0, hasNull1, hasNull2};
+        jbyteArray presenceArrays[3] = {dictPresence0, dictPresence1, dictPresence2};
+        jintArray multiplicityArrays[3] = {dictMultiplicity0, dictMultiplicity1, dictMultiplicity2};
+
+        // Spark reuses the off-heap vectors for the following batch, so the
+        // inputs must be copied out before this call returns. Columns carrying
+        // dictionary ids test membership against a per-dictionary table
+        // (index space 0..maxId) instead of the prepared key-value map; the
+        // kernels are unchanged because both are dense maps.
+        std::vector<id<MTLBuffer>> usedStaging;
+        id<MTLBuffer> inputBuffers[3];
+        id<MTLBuffer> nullBuffers[3];
+        id<MTLBuffer> keyBuffers[3];
+        int32_t keyMinimums[3];
+        uint32_t keySpans[3];
+        uint32_t nullMask = 0;
+        for (NSUInteger index = 0; index < 3; ++index) {
+            if (inputAddresses[index] == 0) {
+                throwRuntime(environment, @"Invalid streamed input address");
+                return;
+            }
+            id<MTLBuffer> input = acquireStagingBuffer(stream, inputBytes);
+            if (input == nil) {
+                throwRuntime(environment, @"Cannot allocate streamed input staging buffer");
+                return;
+            }
+            memcpy(input.contents,
+                reinterpret_cast<void *>(static_cast<uintptr_t>(inputAddresses[index])),
+                inputBytes);
+            usedStaging.push_back(input);
+            inputBuffers[index] = input;
+
+            if (hasNulls[index] == JNI_TRUE) {
+                if (nullAddresses[index] == 0) {
+                    throwRuntime(environment, @"Invalid streamed null-mask address");
+                    return;
+                }
+                nullMask |= 1u << index;
+                id<MTLBuffer> nulls = acquireStagingBuffer(stream, static_cast<size_t>(count));
+                if (nulls == nil) {
+                    throwRuntime(environment, @"Cannot allocate streamed null-mask staging buffer");
+                    return;
+                }
+                memcpy(nulls.contents,
+                    reinterpret_cast<void *>(static_cast<uintptr_t>(nullAddresses[index])),
+                    static_cast<size_t>(count));
+                usedStaging.push_back(nulls);
+                nullBuffers[index] = nulls;
+            } else {
+                nullBuffers[index] = prepared->nullPlaceholder;
+            }
+
+            if (presenceArrays[index] != nullptr || multiplicityArrays[index] != nullptr) {
+                bool presence = presenceArrays[index] != nullptr;
+                if (presence != prepared->allKeysUnique) {
+                    throwRuntime(environment, @"Dictionary table type does not match the prepared kernel");
+                    return;
+                }
+                jsize length = presence
+                    ? environment->GetArrayLength(presenceArrays[index])
+                    : environment->GetArrayLength(multiplicityArrays[index]);
+                if (length <= 0) {
+                    throwRuntime(environment, @"Dictionary membership table must not be empty");
+                    return;
+                }
+                size_t elementBytes = presence ? sizeof(uint8_t) : sizeof(uint32_t);
+                id<MTLBuffer> table = acquireStagingBuffer(
+                    stream, static_cast<size_t>(length) * elementBytes);
+                if (table == nil) {
+                    throwRuntime(environment, @"Cannot allocate dictionary membership table");
+                    return;
+                }
+                if (presence) {
+                    environment->GetByteArrayRegion(
+                        presenceArrays[index], 0, length,
+                        static_cast<jbyte *>(table.contents));
+                } else {
+                    environment->GetIntArrayRegion(
+                        multiplicityArrays[index], 0, length,
+                        static_cast<jint *>(table.contents));
+                }
+                if (environment->ExceptionCheck()) return;
+                usedStaging.push_back(table);
+                keyBuffers[index] = table;
+                keyMinimums[index] = 0;
+                keySpans[index] = static_cast<uint32_t>(length);
+            } else {
+                keyBuffers[index] = prepared->keyBuffers[index];
+                keyMinimums[index] = prepared->keyMinimums[index];
+                keySpans[index] = prepared->keySpans[index];
+            }
+        }
+
+        constexpr NSUInteger threadsPerGroup = 256;
+        NSUInteger groupCount =
+            (static_cast<NSUInteger>(count) + threadsPerGroup - 1) / threadsPerGroup;
+        NSUInteger partialElementBytes = prepared->allKeysUnique
+            ? sizeof(uint32_t) : sizeof(int64_t);
+        id<MTLBuffer> partialBuffer = [device
+            newBufferWithLength:groupCount * partialElementBytes
+            options:MTLResourceStorageModeShared];
+        if (partialBuffer == nil) {
+            throwRuntime(environment, @"Cannot allocate streamed Metal partial-count buffer");
+            return;
+        }
+        MembershipCountParameters parameters = {
+            static_cast<uint32_t>(count), nullMask,
+            keyMinimums[0], keyMinimums[1], keyMinimums[2],
+            keySpans[0], keySpans[1], keySpans[2]
+        };
+        id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+        [encoder setComputePipelineState:prepared->allKeysUnique
+            ? membershipCountUniquePipeline
+            : membershipCountMultiplicityPipeline];
+        for (NSUInteger index = 0; index < 3; ++index) {
+            [encoder setBuffer:inputBuffers[index] offset:0 atIndex:index];
+            [encoder setBuffer:nullBuffers[index] offset:0 atIndex:index + 3];
+            [encoder setBuffer:keyBuffers[index] offset:0 atIndex:index + 6];
+        }
+        [encoder setBuffer:partialBuffer offset:0 atIndex:9];
+        [encoder setBytes:&parameters length:sizeof(parameters) atIndex:10];
+        [encoder dispatchThreadgroups:MTLSizeMake(groupCount, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+        [encoder endEncoding];
+        [commandBuffer commit];
+
+        stream->commandBuffers.push_back(commandBuffer);
+        for (id<MTLBuffer> buffer : usedStaging) {
+            stream->pendingStaging.push_back({buffer, commandBuffer});
+        }
+        stream->partialBuffers.push_back(partialBuffer);
+        stream->partialGroupCounts.push_back(groupCount);
+    }
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_io_github_mohitpatil_sparkmetal_NativeBridge_membershipCount3StreamFinish(
+    JNIEnv *environment,
+    jclass,
+    jlong streamHandle) {
+    @autoreleasepool {
+        if (streamHandle == 0) {
+            throwRuntime(environment, @"Invalid membership stream handle");
+            return 0;
+        }
+        auto *stream = reinterpret_cast<MembershipStream *>(
+            static_cast<uintptr_t>(streamHandle));
+        NSError *failure = nil;
+        for (id<MTLCommandBuffer> commandBuffer : stream->commandBuffers) {
+            [commandBuffer waitUntilCompleted];
+            if (commandBuffer.status == MTLCommandBufferStatusError && failure == nil) {
+                failure = commandBuffer.error;
+            }
+        }
+        int64_t result = 0;
+        if (failure == nil) {
+            bool allKeysUnique = stream->prepared->allKeysUnique;
+            for (size_t batch = 0; batch < stream->partialBuffers.size(); ++batch) {
+                NSUInteger groups = stream->partialGroupCounts[batch];
+                if (allKeysUnique) {
+                    uint32_t *partials =
+                        static_cast<uint32_t *>(stream->partialBuffers[batch].contents);
+                    for (NSUInteger index = 0; index < groups; ++index) result += partials[index];
+                } else {
+                    int64_t *partials =
+                        static_cast<int64_t *>(stream->partialBuffers[batch].contents);
+                    for (NSUInteger index = 0; index < groups; ++index) result += partials[index];
+                }
+            }
+        }
+        delete stream;
+        if (failure != nil) {
+            throwRuntime(environment, [NSString stringWithFormat:@"Streamed Metal command failed: %@", failure]);
+            return 0;
+        }
+        return static_cast<jlong>(result);
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_io_github_mohitpatil_sparkmetal_NativeBridge_membershipCount3StreamAbort(
+    JNIEnv *environment,
+    jclass,
+    jlong streamHandle) {
+    @autoreleasepool {
+        if (streamHandle == 0) return;
+        auto *stream = reinterpret_cast<MembershipStream *>(
+            static_cast<uintptr_t>(streamHandle));
+        for (id<MTLCommandBuffer> commandBuffer : stream->commandBuffers) {
+            [commandBuffer waitUntilCompleted];
+        }
+        delete stream;
     }
 }

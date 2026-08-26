@@ -26,17 +26,18 @@ inference, but are not substitutes for a Spark SQL execution engine.
 - OpenJDK 21 and Apache Spark 4.2.0: installed and ARM64 smoke-tested.
 - Two Spark 4.2 columnar plan replacements, a JNI bridge, and three Metal kernels: working.
 - Integer null semantics: validated through Spark and independently through JNI.
-- Controlled 32-million-row synthetic Spark comparison: correct but currently about 5% slower than CPU.
-- Exact q96-shaped three-join/count comparison over 33,554,432 fact rows:
-  repeated strict runs currently measure **1.10x–1.12x** end to end, with five
-  warm-ups and eleven measured runs per configuration.
-- The q96 operator reuses prepared dimension maps and partial-result buffers per
-  partition. Its latest run mapped every off-heap fact column into Metal shared
-  memory without a copy fallback.
+- **TPC-DS scale-factor-10 q96: 1.52x median end-to-end speedup** (CPU 206.4 ms
+  vs Metal 135.7 ms; five warm-ups, eleven measured runs per configuration)
+  with an exact result-hash, row-count, and schema match — the project's 1.10x
+  success gate is met.
+- The q96 operator streams each fact batch to the GPU asynchronously as the
+  Parquet reader produces it, resolves dictionary-encoded columns through
+  per-dictionary membership tables, and shares the prepared dimension maps
+  across all partition tasks.
+- Exact q96-shaped three-join/count comparison over 33,554,432 synthetic fact
+  rows: **1.41x** under the same protocol.
 - MLX 0.32.1 comparison: exact, but its GPU did not beat its compiled CPU path through 8.4 million rows.
 - Core ML 9.0 capability probe: CPU/GPU execution is possible, but the tested SQL-shaped graph cannot use the Neural Engine or produce Spark's required 64-bit sum.
-- TPC-DS scale-factor-10 data and official query result: not yet generated; the
-  kit remains behind its explicit licence-acceptance gate.
 
 ## Project principles
 

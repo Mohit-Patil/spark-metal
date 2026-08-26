@@ -33,6 +33,7 @@ fi
 git -C "${kit_root}" fetch --depth 1 origin "${tpcds_revision}"
 git -C "${kit_root}" checkout --detach "${tpcds_revision}"
 
+make -C "${kit_root}/tools" clean
 make -C "${kit_root}/tools" \
   OS=MACOS \
   MACOS_CFLAGS='-O3 -Wall -Wno-error=implicit-int -Wno-deprecated-non-prototype'

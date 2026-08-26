@@ -77,14 +77,18 @@ kernel void fused_membership_count_3_unique(
     device const uchar *keys_0 [[buffer(6)]],
     device const uchar *keys_1 [[buffer(7)]],
     device const uchar *keys_2 [[buffer(8)]],
-    device long *partial_counts [[buffer(9)]],
+    device uint *partial_counts [[buffer(9)]],
     constant MembershipCountParameters &parameters [[buffer(10)]],
     uint global_index [[thread_position_in_grid]],
-    uint local_index [[thread_index_in_threadgroup]],
+    uint simd_index [[thread_index_in_simdgroup]],
+    uint simdgroup_index [[simdgroup_index_in_threadgroup]],
     uint group_index [[threadgroup_position_in_grid]])
 {
-    threadgroup long scratch[256];
-    long contribution = 0;
+    // Apple GPUs execute 32-wide SIMD groups. Reduce inside each SIMD group,
+    // then reduce the eight SIMD totals, avoiding the eight barriers used by
+    // a conventional 256-thread tree reduction.
+    threadgroup uint simd_totals[8];
+    uint contribution = 0;
     if (global_index < parameters.count) {
         bool valid =
             ((parameters.null_mask & 1u) == 0u || nulls_0[global_index] == 0) &&
@@ -95,21 +99,20 @@ kernel void fused_membership_count_3_unique(
                 dense_contains(keys_0, parameters.key_min_0, parameters.key_span_0, input_0[global_index]) &&
                 dense_contains(keys_1, parameters.key_min_1, parameters.key_span_1, input_1[global_index]) &&
                 dense_contains(keys_2, parameters.key_min_2, parameters.key_span_2, input_2[global_index])
-                ? 1 : 0;
+                ? 1u : 0u;
         }
     }
-    scratch[local_index] = contribution;
+    uint simd_total = simd_sum(contribution);
+    if (simd_index == 0) {
+        simd_totals[simdgroup_index] = simd_total;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint stride = 128; stride > 0; stride >>= 1) {
-        if (local_index < stride) {
-            scratch[local_index] += scratch[local_index + stride];
+    if (simdgroup_index == 0) {
+        uint group_total = simd_sum(simd_index < 8 ? simd_totals[simd_index] : 0u);
+        if (simd_index == 0) {
+            partial_counts[group_index] = group_total;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    if (local_index == 0) {
-        partial_counts[group_index] = scratch[0];
     }
 }
 

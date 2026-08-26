@@ -18,11 +18,19 @@ if find "${output_dir}" -maxdepth 1 -name '*.dat' -print -quit 2>/dev/null | gre
 fi
 
 mkdir -p "${output_dir}"
+generator_dir="$(dirname "${generator}")"
+output_link="${generator_dir}/.spark-metal-output"
+if [[ -e "${output_link}" && ! -L "${output_link}" ]]; then
+  echo "Refusing to replace non-symlink generator path: ${output_link}" >&2
+  exit 1
+fi
+ln -sfn "${output_dir}" "${output_link}"
+trap 'unlink "${output_link}"' EXIT
 (
-  cd "$(dirname "${generator}")"
+  cd "${generator_dir}"
   ./dsdgen \
     -SCALE "${scale_factor}" \
-    -DIR "${output_dir}" \
+    -DIR .spark-metal-output \
     -FORCE Y
 )
 

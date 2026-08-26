@@ -11,6 +11,7 @@ data_dir="${TPCDS_PARQUET_DIR:-${repo_root}/benchmark-data/tpcds-sf10-parquet}"
 queries_dir="${repo_root}/.tools/spark-assets/sql/core/src/test/resources/tpcds"
 run_id="$(date -u '+%Y%m%dT%H%M%SZ')"
 output_dir="${TPCDS_RESULT_DIR:-${repo_root}/benchmark-results/metal-${run_id}}"
+spark_master="${TPCDS_MASTER:-local[8]}"
 
 if [[ ! -d "${data_dir}" ]]; then
   echo "TPC-DS SF10 Parquet data is missing: ${data_dir}" >&2
@@ -26,8 +27,9 @@ fi
 build_root="${repo_root}/build/spark-plugin"
 
 spark-submit \
-  --master 'local[8]' \
+  --master "${spark_master}" \
   --driver-memory 6g \
+  --jars "${build_root}/spark-metal-plugin.jar" \
   --conf spark.ui.enabled=false \
   --conf spark.sql.adaptive.enabled=false \
   --conf spark.sql.ansi.enabled=false \

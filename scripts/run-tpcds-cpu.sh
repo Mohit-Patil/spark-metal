@@ -11,6 +11,7 @@ data_dir="${TPCDS_PARQUET_DIR:-${repo_root}/benchmark-data/tpcds-sf10-parquet}"
 queries_dir="${repo_root}/.tools/spark-assets/sql/core/src/test/resources/tpcds"
 run_id="$(date -u '+%Y%m%dT%H%M%SZ')"
 output_dir="${TPCDS_RESULT_DIR:-${repo_root}/benchmark-results/cpu-${run_id}}"
+spark_master="${TPCDS_MASTER:-local[8]}"
 
 if [[ ! -d "${queries_dir}" ]]; then
   echo "Pinned Spark queries are missing. Run scripts/fetch-spark-tpcds-assets.sh." >&2
@@ -18,7 +19,7 @@ if [[ ! -d "${queries_dir}" ]]; then
 fi
 
 spark-submit \
-  --master 'local[8]' \
+  --master "${spark_master}" \
   --driver-memory 6g \
   --conf spark.ui.enabled=false \
   --conf spark.sql.adaptive.enabled=false \

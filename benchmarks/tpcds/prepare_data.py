@@ -77,8 +77,20 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--parquet-dir", required=True, type=Path)
     parser.add_argument("--ddl", required=True, type=Path)
     parser.add_argument("--tables", help="Comma-separated subset; default is every generated table")
+    parser.add_argument(
+        "--compression",
+        default="snappy",
+        choices=("snappy", "uncompressed", "zstd"),
+        help="Parquet codec recorded as part of the benchmark layout",
+    )
     parser.add_argument("--validate-schema-only", action="store_true")
     return parser.parse_args()
+
+
+def table_sources(raw_dir: Path, table_name: str) -> list[Path]:
+    """Match one table, including dsdgen parallel chunks, without prefix collisions."""
+    pattern = re.compile(rf"^{re.escape(table_name)}(?:_\d+_\d+)?\.dat$")
+    return sorted(path for path in raw_dir.iterdir() if pattern.fullmatch(path.name))
 
 
 def main() -> None:
@@ -94,7 +106,7 @@ def main() -> None:
         for table_name, schema in schemas.items():
             if table_name == "dbgen_version" or (requested and table_name not in requested):
                 continue
-            sources = sorted(args.raw_dir.glob(f"{table_name}*.dat"))
+            sources = table_sources(args.raw_dir, table_name)
             if not sources:
                 raise FileNotFoundError(f"No source files found for {table_name}")
             destination = args.parquet_dir / table_name
@@ -108,7 +120,11 @@ def main() -> None:
                 .option("dateFormat", "yyyy-MM-dd")
                 .csv([str(path) for path in sources])
             )
-            frame.write.mode("errorifexists").parquet(str(destination))
+            (
+                frame.write.mode("errorifexists")
+                .option("compression", args.compression)
+                .parquet(str(destination))
+            )
     finally:
         spark.stop()
 

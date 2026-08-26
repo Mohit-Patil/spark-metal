@@ -11,6 +11,27 @@ metal_root="${comparison_root}/metal"
 queries="${TPCDS_QUERIES:-q96}"
 warmups="${TPCDS_WARMUPS:-1}"
 runs="${TPCDS_RUNS:-5}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --queries)
+      queries="$2"
+      shift 2
+      ;;
+    --warmups)
+      warmups="$2"
+      shift 2
+      ;;
+    --runs)
+      runs="$2"
+      shift 2
+      ;;
+    *)
+      echo "Unknown comparison option: $1" >&2
+      exit 2
+      ;;
+  esac
+done
 mkdir -p "${comparison_root}"
 
 TPCDS_RESULT_DIR="${cpu_root}" "${script_dir}/run-tpcds-cpu.sh" \
@@ -47,6 +68,7 @@ for name, cpu_result in cpu["queries"].items():
         "metal_operator_present": "MetalFusedMembershipCount" in open(
             f"{sys.argv[2].rsplit('/', 1)[0]}/{name}-plan.txt", encoding="utf-8"
         ).read(),
+        "accelerator_metrics": metal_result.get("accelerator_metrics", {}),
     }
     comparison["all_results_match"] &= matches
 

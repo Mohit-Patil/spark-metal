@@ -55,4 +55,49 @@ public final class NativeBridge {
             int count,
             long preparedHandle);
 
+    public static native long membershipCount3PreparedBatches(
+            long[] input0Addresses,
+            long[] null0Addresses,
+            boolean[] hasNull0,
+            long[] input1Addresses,
+            long[] null1Addresses,
+            boolean[] hasNull1,
+            long[] input2Addresses,
+            long[] null2Addresses,
+            boolean[] hasNull2,
+            int[] counts,
+            long preparedHandle);
+
+    public static native long membershipCount3StreamBegin(long preparedHandle);
+
+    /**
+     * Submits one batch to the stream without waiting for the GPU. Per column
+     * the input address holds either decoded int32 values (both dictionary
+     * tables null) or Parquet dictionary ids, in which case exactly one of
+     * dictPresence (unique build keys) or dictMultiplicity (duplicate build
+     * keys) maps every dictionary id to its membership.
+     */
+    public static native void membershipCount3StreamSubmit(
+            long streamHandle,
+            long input0Address,
+            long null0Address,
+            boolean hasNull0,
+            byte[] dictPresence0,
+            int[] dictMultiplicity0,
+            long input1Address,
+            long null1Address,
+            boolean hasNull1,
+            byte[] dictPresence1,
+            int[] dictMultiplicity1,
+            long input2Address,
+            long null2Address,
+            boolean hasNull2,
+            byte[] dictPresence2,
+            int[] dictMultiplicity2,
+            int count);
+
+    public static native long membershipCount3StreamFinish(long streamHandle);
+
+    public static native void membershipCount3StreamAbort(long streamHandle);
+
 }

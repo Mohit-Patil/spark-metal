@@ -42,7 +42,28 @@ def select_queries(directory: Path, selection: str) -> list[Path]:
     return [available[name] for name in names]
 
 
-def execute(spark: SparkSession, sql_text: str) -> tuple[float, int, str, str, str]:
+def accelerator_metrics(plan) -> dict[str, dict[str, int]]:
+    observations: dict[str, dict[str, int]] = {}
+    pending = [plan]
+    while pending:
+        node = pending.pop()
+        node_name = str(node.nodeName())
+        if node_name.startswith("Metal"):
+            metrics: dict[str, int] = {}
+            iterator = node.metrics().iterator()
+            while iterator.hasNext():
+                entry = iterator.next()
+                metrics[str(entry._1())] = int(entry._2().value())
+            observations[node_name] = metrics
+        children = node.children().iterator()
+        while children.hasNext():
+            pending.append(children.next())
+    return observations
+
+
+def execute(
+    spark: SparkSession, sql_text: str
+) -> tuple[float, int, str, str, str, dict[str, dict[str, int]]]:
     started = time.perf_counter()
     frame = spark.sql(sql_text)
     rows = frame.collect()
@@ -53,8 +74,9 @@ def execute(spark: SparkSession, sql_text: str) -> tuple[float, int, str, str, s
     ]
     canonical = "\n".join(sorted(serialized)).encode("utf-8")
     digest = hashlib.sha256(canonical).hexdigest()
-    plan = frame._jdf.queryExecution().executedPlan().toString()
-    return elapsed, len(rows), digest, frame.schema.json(), plan
+    executed_plan = frame._jdf.queryExecution().executedPlan()
+    plan = executed_plan.toString()
+    return elapsed, len(rows), digest, frame.schema.json(), plan, accelerator_metrics(executed_plan)
 
 
 def main() -> None:
@@ -92,8 +114,16 @@ def main() -> None:
             observations: list[float] = []
             expected: tuple[int, str, str] | None = None
             final_plan = ""
+            final_accelerator_metrics: dict[str, dict[str, int]] = {}
             for _ in range(args.runs):
-                elapsed, row_count, digest, schema_json, final_plan = execute(spark, sql_text)
+                (
+                    elapsed,
+                    row_count,
+                    digest,
+                    schema_json,
+                    final_plan,
+                    final_accelerator_metrics,
+                ) = execute(spark, sql_text)
                 current = (row_count, digest, schema_json)
                 if expected is not None and current != expected:
                     raise RuntimeError(f"Non-deterministic result detected for {query_path.stem}")
@@ -107,6 +137,7 @@ def main() -> None:
                 "row_count": expected[0],
                 "sha256": expected[1],
                 "schema_json": expected[2],
+                "accelerator_metrics": final_accelerator_metrics,
             }
             (args.output_dir / "summary.json").write_text(
                 json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"

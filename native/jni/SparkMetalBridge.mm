@@ -53,6 +53,8 @@ struct PreparedMembershipCount3 {
     std::atomic<uint64_t> copyFallbacks{0};
 };
 
+struct ParquetRowGroup;  // forward declaration: MembershipStream tracks row groups by pointer.
+
 // One in-flight partition worth of asynchronously committed command buffers.
 // Spark reuses each partition's off-heap vectors for the next batch, so every
 // submit copies its inputs into stream-owned staging buffers; a staging buffer
@@ -66,6 +68,12 @@ struct MembershipStream {
     std::vector<id<MTLBuffer>> freeStaging;
     std::vector<id<MTLBuffer>> partialBuffers;
     std::vector<NSUInteger> partialGroupCounts;
+    // Parquet row groups allocated from this stream that have not yet been
+    // released. Registered at parquetRowGroupBegin, unregistered at
+    // parquetRowGroupRelease; any left behind when the stream is torn down
+    // (Finish/Abort) are deleted there so releasing a row group after its
+    // stream is gone can never dereference a dangling stream pointer.
+    std::vector<ParquetRowGroup *> rowGroups;
 };
 
 struct ExpandParams {
@@ -1113,6 +1121,15 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_membershipCount3StreamFinish(
                 }
             }
         }
+        // Reclaim any Parquet row groups the caller never released. Their
+        // planes are staging buffers owned by the row group itself (never
+        // pendingStaging), and the stream -- along with its freeStaging pool
+        // -- is being destroyed right below, so there's nothing to return
+        // them to; just delete the row groups (their id<MTLBuffer> fields
+        // release themselves via ARC).
+        for (ParquetRowGroup *rowGroup : stream->rowGroups) {
+            delete rowGroup;
+        }
         delete stream;
         if (failure != nil) {
             throwRuntime(environment, [NSString stringWithFormat:@"Streamed Metal command failed: %@", failure]);
@@ -1133,6 +1150,12 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_membershipCount3StreamAbort(
             static_cast<uintptr_t>(streamHandle));
         for (id<MTLCommandBuffer> commandBuffer : stream->commandBuffers) {
             [commandBuffer waitUntilCompleted];
+        }
+        // See membershipCount3StreamFinish: reclaim any row groups the
+        // caller never released before the stream (and its freeStaging
+        // pool) goes away.
+        for (ParquetRowGroup *rowGroup : stream->rowGroups) {
+            delete rowGroup;
         }
         delete stream;
     }
@@ -1175,7 +1198,14 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetRowGroupBegin(
             rowGroup->ids[column] = ids;
             rowGroup->validity[column] = validity;
             rowGroup->columnHasNulls[column] = false;
+            // Zero both planes: validity so unwritten rows read as "not
+            // null" (correct for allValid pages that never touch it), and
+            // ids so a null row -- whose id is otherwise never written --
+            // never carries a recycled staging-buffer id. Task 4 indexes a
+            // dictionary presence table by id, so a stale id would be an
+            // out-of-bounds read there.
             [blit fillBuffer:validity range:NSMakeRange(0, validityBytes) value:0];
+            [blit fillBuffer:ids range:NSMakeRange(0, idsBytes) value:0];
         }
         [blit endEncoding];
         if (allocationFailed) {
@@ -1185,6 +1215,7 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetRowGroupBegin(
         }
         [commandBuffer commit];
         stream->commandBuffers.push_back(commandBuffer);
+        stream->rowGroups.push_back(rowGroup);
         return static_cast<jlong>(reinterpret_cast<uintptr_t>(rowGroup));
     }
 }
@@ -1215,6 +1246,17 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetDecodePage(
             static_cast<uintptr_t>(streamHandle));
         auto *rowGroup = reinterpret_cast<ParquetRowGroup *>(
             static_cast<uintptr_t>(rowGroupHandle));
+
+        // Guard against writing past the ids/validity planes: a corrupt
+        // file, an unexpected writer, or a rowOffset accounting slip on the
+        // JVM side could otherwise turn into an unbounded GPU device-memory
+        // write in expand_value_runs/scatter_segments. int64 avoids overflow
+        // from the two int32 operands.
+        if (static_cast<int64_t>(rowOffset) + static_cast<int64_t>(valueCount) >
+            static_cast<int64_t>(rowGroup->rowCount)) {
+            throwRuntime(environment, @"Parquet page rowOffset + valueCount exceeds the row-group row count");
+            return;
+        }
 
         // pageLength + 4: expand_value_runs's 4-byte bit window may read up to
         // 3 bytes past the payload; the tail is zeroed so that read is inert.
@@ -1413,6 +1455,10 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetRowGroupRelease(
                 stream->freeStaging.push_back(rowGroup->ids[column]);
                 stream->freeStaging.push_back(rowGroup->validity[column]);
             }
+        }
+        if (stream != nullptr) {
+            auto &rowGroups = stream->rowGroups;
+            rowGroups.erase(std::remove(rowGroups.begin(), rowGroups.end(), rowGroup), rowGroups.end());
         }
         delete rowGroup;
     }

@@ -21,11 +21,17 @@ struct RowSegment {      // one threadgroup of scatter_segments
     uint32_t valid;       // 1 = rows carry values, 0 = rows are null
 };
 
+// Value section encoding of a V1 data page, supplied by the caller (it knows
+// this from the column chunk's dictionary page presence / the page's own
+// Encoding, neither of which this parser has visibility into).
+enum class PageValueEncoding { Dictionary, Plain };
+
 struct PageRuns {
     std::vector<ValueWorkItem> items;
     std::vector<RowSegment> segments;  // empty when allValid
     uint32_t bitWidth = 0;
-    uint32_t valueBytesOffset = 0;     // offset of the value hybrid payload in the page
+    uint32_t valueBytesOffset = 0;     // offset of the value hybrid payload in the page (Dictionary only)
+    uint32_t plainBytesOffset = 0;     // offset of the packed int32 value array (Plain only)
     uint32_t nonNullCount = 0;
     // Longest count of any item / segment. Both kernels map one threadgroup to
     // one item (or segment) and one thread to one of its values, so the
@@ -36,6 +42,11 @@ struct PageRuns {
     uint32_t maxItemCount = 0;
     uint32_t maxSegmentCount = 0;
     bool allValid = true;
+    // true for a PLAIN-encoded value section: items is always empty (there is
+    // no dictionary id to expand -- the values are literal packed int32s at
+    // plainBytesOffset) and segments still describe the row<->value mapping
+    // exactly as for a Dictionary page.
+    bool plain = false;
 };
 
 // Threadgroup width for a dispatch whose widest work item holds maxCount
@@ -47,9 +58,12 @@ inline uint32_t decodeThreadgroupWidth(uint32_t maxCount) {
 }
 
 // Parses one decompressed V1 data page. valueCount is the page's total row
-// count (nulls included). hasDefLevels is maxDefinitionLevel == 1.
+// count (nulls included). hasDefLevels is maxDefinitionLevel == 1. encoding
+// selects the value-section layout: Dictionary (1-byte bit width + RLE/
+// bit-packed hybrid stream of dictionary ids) or Plain (no bit-width byte --
+// a packed little-endian int32 array of the non-null values).
 // Returns false when the page uses anything outside the supported subset.
 bool parseDataPageV1(const uint8_t *page, size_t length, uint32_t valueCount,
-                     bool hasDefLevels, PageRuns &out);
+                     bool hasDefLevels, PageValueEncoding encoding, PageRuns &out);
 
 }  // namespace sparkmetal

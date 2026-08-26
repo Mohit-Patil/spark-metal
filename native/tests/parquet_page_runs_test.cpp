@@ -49,7 +49,7 @@ int main() {
     size_t pageLength = page.size(); pad(page);
 
     PageRuns runs;
-    assert(parseDataPageV1(page.data(), pageLength, 10, true, runs));
+    assert(parseDataPageV1(page.data(), pageLength, 10, true, PageValueEncoding::Dictionary, runs));
     assert(runs.bitWidth == 3 && !runs.allValid && runs.nonNullCount == 7);
     // Segments: rows 0-4 valid (values 0-4), rows 5-7 null, rows 8-9 valid (values 5-6).
     assert(runs.segments.size() == 3);
@@ -72,7 +72,7 @@ int main() {
     appendUleb(page2, (2 << 1) | 1); page2.push_back(0xAA); page2.push_back(0xAA);
     size_t page2Length = page2.size(); pad(page2);
     PageRuns runs2;
-    assert(parseDataPageV1(page2.data(), page2Length, 12, true, runs2));
+    assert(parseDataPageV1(page2.data(), page2Length, 12, true, PageValueEncoding::Dictionary, runs2));
     assert(runs2.allValid && runs2.segments.empty() && runs2.nonNullCount == 12);
     std::vector<int32_t> values2; expand(runs2, page2, values2);
     for (uint32_t i = 0; i < 12; ++i) assert(values2[i] == int32_t(i & 1));
@@ -98,7 +98,7 @@ int main() {
     appendUleb(page4, 62 << 1); page4.push_back(3);        // RLE 62 x id 3
     size_t page4Length = page4.size(); pad(page4);
     PageRuns runs4;
-    assert(parseDataPageV1(page4.data(), page4Length, 72, true, runs4));
+    assert(parseDataPageV1(page4.data(), page4Length, 72, true, PageValueEncoding::Dictionary, runs4));
     assert(!runs4.allValid && runs4.nonNullCount == 62);
     const uint32_t expectedRows[7]   = {0, 10, 11, 12, 13, 16, 24};
     const uint32_t expectedCounts[7] = {10, 1, 1, 1, 3, 8, 48};
@@ -116,10 +116,87 @@ int main() {
     std::vector<int32_t> values4; expand(runs4, page4, values4);
     for (uint32_t i = 0; i < 62; ++i) assert(values4[i] == 3);
 
+    // PLAIN page: same def-level layout as the very first case (10 rows,
+    // [1]x5 [0]x3 [1]x2 -> 7 non-null values, a null gap in the middle), but
+    // the value section is a packed little-endian int32 array with NO
+    // bit-width byte -- straight from the end of the definition-level
+    // section into 7 raw int32s.
+    std::vector<uint8_t> defPlain;
+    appendUleb(defPlain, 5 << 1); defPlain.push_back(1);
+    appendUleb(defPlain, 3 << 1); defPlain.push_back(0);
+    appendUleb(defPlain, 2 << 1); defPlain.push_back(1);
+    std::vector<uint8_t> pagePlain;
+    pagePlain.push_back(uint8_t(defPlain.size()));
+    pagePlain.push_back(0); pagePlain.push_back(0); pagePlain.push_back(0);
+    pagePlain.insert(pagePlain.end(), defPlain.begin(), defPlain.end());
+    // Layout check: this is the byte immediately following the def-level
+    // section -- a PLAIN page has no bit-width byte here (unlike the
+    // Dictionary page above, which reads one before its value stream).
+    const size_t expectedPlainBytesOffset = pagePlain.size();
+    const int32_t plainValues[7] = {100, 200, 300, 400, 500, -7, 999999};
+    for (int32_t v : plainValues) {
+        uint32_t bits = uint32_t(v);
+        pagePlain.push_back(uint8_t(bits & 0xFF));
+        pagePlain.push_back(uint8_t((bits >> 8) & 0xFF));
+        pagePlain.push_back(uint8_t((bits >> 16) & 0xFF));
+        pagePlain.push_back(uint8_t((bits >> 24) & 0xFF));
+    }
+    size_t pagePlainLength = pagePlain.size(); pad(pagePlain);
+
+    PageRuns runsPlain;
+    assert(parseDataPageV1(pagePlain.data(), pagePlainLength, 10, true,
+                            PageValueEncoding::Plain, runsPlain));
+    assert(runsPlain.plain && !runsPlain.allValid && runsPlain.nonNullCount == 7);
+    assert(runsPlain.plainBytesOffset == expectedPlainBytesOffset);
+    assert(runsPlain.items.empty());  // PLAIN pages never emit expand work items.
+    // Segments: identical row<->value mapping to the Dictionary case above,
+    // since both are driven purely by the same definition-level layout.
+    assert(runsPlain.segments.size() == 3);
+    assert(runsPlain.segments[0].rowStart == 0 && runsPlain.segments[0].count == 5 &&
+           runsPlain.segments[0].valid == 1);
+    assert(runsPlain.segments[1].rowStart == 5 && runsPlain.segments[1].count == 3 &&
+           runsPlain.segments[1].valid == 0);
+    assert(runsPlain.segments[2].rowStart == 8 && runsPlain.segments[2].valueStart == 5 &&
+           runsPlain.segments[2].count == 2 && runsPlain.segments[2].valid == 1);
+    // Reference expansion: PLAIN values are read directly at plainBytesOffset
+    // (no work-item indirection), so this is a straight memcmp against the
+    // literal values written above.
+    assert(std::memcmp(
+        pagePlain.data() + runsPlain.plainBytesOffset, plainValues, sizeof(plainValues)) == 0);
+
+    // PLAIN, all-valid (no def-level section at all): plainBytesOffset must
+    // land immediately after the page header with no bit-width byte in
+    // between, and nonNullCount must equal valueCount.
+    std::vector<uint8_t> pagePlainAllValid;
+    const int32_t plainAllValidValues[3] = {7, -1, 42};
+    for (int32_t v : plainAllValidValues) {
+        uint32_t bits = uint32_t(v);
+        pagePlainAllValid.push_back(uint8_t(bits & 0xFF));
+        pagePlainAllValid.push_back(uint8_t((bits >> 8) & 0xFF));
+        pagePlainAllValid.push_back(uint8_t((bits >> 16) & 0xFF));
+        pagePlainAllValid.push_back(uint8_t((bits >> 24) & 0xFF));
+    }
+    size_t pagePlainAllValidLength = pagePlainAllValid.size(); pad(pagePlainAllValid);
+    PageRuns runsPlainAllValid;
+    assert(parseDataPageV1(pagePlainAllValid.data(), pagePlainAllValidLength, 3, false,
+                            PageValueEncoding::Plain, runsPlainAllValid));
+    assert(runsPlainAllValid.plain && runsPlainAllValid.allValid &&
+           runsPlainAllValid.nonNullCount == 3 && runsPlainAllValid.plainBytesOffset == 0 &&
+           runsPlainAllValid.segments.empty() && runsPlainAllValid.items.empty());
+    assert(std::memcmp(pagePlainAllValid.data(), plainAllValidValues,
+                        sizeof(plainAllValidValues)) == 0);
+
+    // PLAIN page truncated before its declared value bytes must be rejected.
+    std::vector<uint8_t> pagePlainTruncated = pagePlain;
+    pagePlainTruncated.resize(expectedPlainBytesOffset + 4);  // only 1 of 7 values present
+    PageRuns runsPlainTruncated;
+    assert(!parseDataPageV1(pagePlainTruncated.data(), pagePlainTruncated.size(), 10, true,
+                            PageValueEncoding::Plain, runsPlainTruncated));
+
     // Unsupported: bit width > 24 must be rejected.
     std::vector<uint8_t> page3(page2); page3[4 + def2.size()] = 30;
     PageRuns runs3;
-    assert(!parseDataPageV1(page3.data(), page2Length, 12, true, runs3));
+    assert(!parseDataPageV1(page3.data(), page2Length, 12, true, PageValueEncoding::Dictionary, runs3));
 
     // Corrupted defLength that overflows the page: must be rejected.
     // Create a page with defLength > remaining buffer size.
@@ -130,7 +207,7 @@ int main() {
     size_t corruptedLength = pageCorrupted.size();
     pageCorrupted.resize(pageCorrupted.size() + 4, 0);  // pad for bit extraction
     PageRuns runsCorrupted;
-    assert(!parseDataPageV1(pageCorrupted.data(), corruptedLength, 10, true, runsCorrupted));
+    assert(!parseDataPageV1(pageCorrupted.data(), corruptedLength, 10, true, PageValueEncoding::Dictionary, runsCorrupted));
 
     std::puts("parquet_page_runs_test OK");
     return 0;

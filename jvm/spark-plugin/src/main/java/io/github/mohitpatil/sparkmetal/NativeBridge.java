@@ -104,6 +104,15 @@ public final class NativeBridge {
     // inside the stream, zero-fills validity via a blit, returns a handle.
     public static native long parquetRowGroupBegin(long streamHandle, int rowCount);
 
+    // Generalization of parquetRowGroupBegin (Task 2): allocates keyCount
+    // id/validity plane pairs (join-key columns, same layout as
+    // parquetRowGroupBegin) plus measureCount value/validity plane pairs
+    // (measure columns, decoded by parquetDecodeMeasurePage). All planes are
+    // zero/blit-initialized. parquetRowGroupBegin(stream, rowCount) is
+    // exactly parquetRowGroupBeginAggregate(stream, rowCount, 3, 0).
+    public static native long parquetRowGroupBeginAggregate(
+            long streamHandle, int rowCount, int keyCount, int measureCount);
+
     // Parses one decompressed V1 data page on the CPU and encodes its GPU
     // expansion into the stream (no wait). rowOffset is the first row of this
     // page within the row group for this column.
@@ -112,10 +121,34 @@ public final class NativeBridge {
             byte[] pageBytes, int pageLength, int valueCount, int rowOffset,
             boolean hasDefLevels);
 
+    // Stages a measure column's dictionary (the VALUES the dictionary ids
+    // point at) onto the row group; a null array means the column is
+    // PLAIN-encoded. Set at most once per (row group, slot), before that
+    // slot's first parquetDecodeMeasurePage call; the dictionary persists on
+    // the row group and is reused across that column's pages.
+    public static native void parquetSetMeasureDictionary(
+            long rowGroupHandle, int measureSlot, int[] dictionary);
+
+    // Decodes one V1 measure page into the row group's measure plane `slot`
+    // (allocated by parquetRowGroupBeginAggregate). PLAIN pages memcpy the
+    // packed values into value-space staging (all-valid: directly into the
+    // plane at rowOffset); dictionary pages expand ids and materialize
+    // through the slot's dictionary (parquetSetMeasureDictionary). Validity
+    // is written exactly as for key columns.
+    public static native void parquetDecodeMeasurePage(
+            long streamHandle, long rowGroupHandle, int measureSlot,
+            byte[] pageBytes, int pageLength, int valueCount, int rowOffset,
+            boolean hasDefLevels);
+
     // Debug/verification: blocks, then copies the decoded planes out.
     public static native void parquetRowGroupRead(
             long streamHandle, long rowGroupHandle, int column,
             int[] idsOut, byte[] validityOut);
+
+    // Debug/verification: blocks, then copies one decoded measure plane out.
+    public static native void parquetRowGroupReadMeasure(
+            long streamHandle, long rowGroupHandle, int measureSlot,
+            int[] valuesOut, byte[] validityOut);
 
     // Releases a row-group handle without running membership (used by the smoke
     // test and error paths). Task 4 adds the membership variant.

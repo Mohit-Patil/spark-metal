@@ -118,14 +118,21 @@ kernel void fused_membership_count_3_unique(
 
 struct ValueWorkItem { uint value_start; uint count; uint kind; uint payload; };
 struct RowSegment { uint row_start; uint value_start; uint count; uint valid; };
-struct ExpandParams { uint item_count; uint bit_width; uint value_bytes_offset; uint output_base; };
-struct ScatterParams { uint segment_count; uint row_base; };
+// materialize appended at the end of both params structs (rather than
+// reordering existing fields) so the C++ mirrors in SparkMetalBridge.mm stay
+// lockstep-compatible field-for-field with the pre-Task-2 layout.
+struct ExpandParams { uint item_count; uint bit_width; uint value_bytes_offset; uint output_base; uint materialize; };
+struct ScatterParams { uint segment_count; uint row_base; uint materialize; };
 
+// dictionary is read only when params.materialize != 0 (key-column callers
+// pass materialize = 0 and a small placeholder buffer that is never
+// dereferenced).
 kernel void expand_value_runs(
     device const uchar *page [[buffer(0)]],
     device const ValueWorkItem *items [[buffer(1)]],
     device int *output [[buffer(2)]],
     constant ExpandParams &params [[buffer(3)]],
+    device const int *dictionary [[buffer(4)]],
     uint group_index [[threadgroup_position_in_grid]],
     uint local_index [[thread_index_in_threadgroup]])
 {
@@ -144,15 +151,23 @@ kernel void expand_value_runs(
             | (uint(bytes[(bit >> 3) + 3]) << 24);
         value = int((window >> (bit & 7)) & ((1u << params.bit_width) - 1u));
     }
+    if (params.materialize != 0) {
+        value = dictionary[value];
+    }
     output[params.output_base + item.value_start + local_index] = value;
 }
 
+// dictionary is read only when params.materialize != 0. When materialize is
+// set, `values` holds raw dictionary ids (as written by expand_value_runs
+// with materialize = 0) and this kernel gathers dict[id] instead of id into
+// the output plane -- the measure-column with-nulls path.
 kernel void scatter_segments(
     device const int *values [[buffer(0)]],
     device const RowSegment *segments [[buffer(1)]],
     device int *ids [[buffer(2)]],
     device uchar *validity [[buffer(3)]],
     constant ScatterParams &params [[buffer(4)]],
+    device const int *dictionary [[buffer(5)]],
     uint group_index [[threadgroup_position_in_grid]],
     uint local_index [[thread_index_in_threadgroup]])
 {
@@ -161,7 +176,8 @@ kernel void scatter_segments(
     if (local_index >= segment.count) return;
     uint row = params.row_base + segment.row_start + local_index;
     if (segment.valid != 0) {
-        ids[row] = values[segment.value_start + local_index];
+        int value = values[segment.value_start + local_index];
+        ids[row] = params.materialize != 0 ? dictionary[value] : value;
     } else {
         validity[row] = 1;
     }

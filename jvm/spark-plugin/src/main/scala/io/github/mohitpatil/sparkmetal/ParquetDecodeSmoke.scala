@@ -30,6 +30,11 @@ object ParquetDecodeSmoke {
         "Usage: ParquetDecodeSmoke exec NATIVE_LIB METAL_LIB [ROWS]")
       val rows = if (arguments.length > 3) arguments(3).toInt else 100003
       runExecMode(arguments(1), arguments(2), rows)
+    } else if (arguments.nonEmpty && arguments(0) == "measure") {
+      require(arguments.length >= 3,
+        "Usage: ParquetDecodeSmoke measure NATIVE_LIB METAL_LIB [ROWS]")
+      val rows = if (arguments.length > 3) arguments(3).toInt else 100003
+      runMeasureMode(arguments(1), arguments(2), rows)
     } else {
       runDecodeAndCountMode(arguments)
     }
@@ -312,6 +317,238 @@ object ParquetDecodeSmoke {
     } finally {
       spark.stop()
     }
+  }
+
+  // Task 2: decode measure columns (PLAIN pages and dictionary pages whose
+  // VALUES -- not just ids -- must be materialized) into GPU value planes,
+  // via parquetRowGroupBeginAggregate/parquetSetMeasureDictionary/
+  // parquetDecodeMeasurePage. Two datasets exercise both value-section
+  // layouts for both an int32 column (quantity) and a decimal(7,2) column
+  // (price, compared against Spark's own read as its unscaled int): one
+  // low-cardinality (parquet-mr keeps the dictionary), one high-cardinality
+  // with a tiny parquet.dictionary.page.size (parquet-mr abandons the
+  // dictionary and falls back to PLAIN, same trick as
+  // writeDictionaryOverflowDataset above).
+  private val MeasureColumns = Seq("quantity", "price")
+
+  private def runMeasureMode(nativeLibrary: String, metalLibrary: String, rows: Int): Unit = {
+    val spark = SparkSession.builder().appName("spark-metal-parquet-measure-smoke").getOrCreate()
+    spark.sparkContext.setLogLevel("WARN")
+    val tempDir = Files.createTempDirectory("spark-metal-parquet-measure-smoke")
+    try {
+      SparkMetalNative.ensureInitialized(nativeLibrary, metalLibrary)
+
+      val pathDictFriendly = tempDir.resolve("data-measure-dict").toString
+      writeMeasureDataset(spark, pathDictFriendly, rows, highCardinality = false)
+      val dictFriendlyFile = singlePartFile(pathDictFriendly)
+
+      val pathForcedPlain = tempDir.resolve("data-measure-plain").toString
+      writeMeasureDataset(spark, pathForcedPlain, rows, highCardinality = true)
+      val forcedPlainFile = singlePartFile(pathForcedPlain)
+
+      checkMeasureDecode(spark, "dictionary-friendly", pathDictFriendly, dictFriendlyFile, rows,
+        expectDictionary = true)
+      checkMeasureDecode(spark, "forced-plain", pathForcedPlain, forcedPlainFile, rows,
+        expectDictionary = false)
+    } finally {
+      spark.stop()
+    }
+  }
+
+  private def checkMeasureDecode(
+      spark: SparkSession,
+      caseName: String,
+      path: String,
+      partFile: String,
+      rows: Int,
+      expectDictionary: Boolean): Unit = {
+    val decodedValues = Array.fill(MeasureColumns.length)(new Array[Int](rows))
+    val decodedIsNull = Array.fill(MeasureColumns.length)(new Array[Boolean](rows))
+    var coveredRows = 0
+    var sawDictionaryPage = false
+    var sawPlainPage = false
+
+    val preparedHandle = NativeBridge.prepareMembershipCount3(Array(1), Array(1), Array(1))
+    val reader = ParquetFileReader.open(HadoopInputFile.fromPath(new Path(partFile), new Configuration()))
+    try {
+      val descriptors = MeasureColumns.map { name =>
+        reader.getFooter.getFileMetaData.getSchema.getColumns.asScala
+          .find(_.getPath()(0) == name)
+          .getOrElse(throw new RuntimeException(s"Missing column $name"))
+      }
+      var pageReadStore = reader.readNextRowGroup()
+      while (pageReadStore != null) {
+        val rowGroupRows = pageReadStore.getRowCount.toInt
+        val streamHandle = NativeBridge.membershipCount3StreamBegin(preparedHandle)
+        val rowGroupHandle = NativeBridge.parquetRowGroupBeginAggregate(
+          streamHandle, rowGroupRows, 0, MeasureColumns.length)
+        try {
+          for (slot <- MeasureColumns.indices) {
+            val descriptor = descriptors(slot)
+            val pageReader = pageReadStore.getPageReader(descriptor)
+            val dictionaryPage = pageReader.readDictionaryPage()
+            if (dictionaryPage != null) {
+              sawDictionaryPage = true
+              val dictionaryBytes = dictionaryPage.getBytes.toByteArray
+              val dictionaryBuffer = ByteBuffer.wrap(dictionaryBytes).order(ByteOrder.LITTLE_ENDIAN)
+              val dictionaryValues = new Array[Int](dictionaryPage.getDictionarySize)
+              for (entry <- dictionaryValues.indices) {
+                dictionaryValues(entry) = dictionaryBuffer.getInt(entry * 4)
+              }
+              NativeBridge.parquetSetMeasureDictionary(rowGroupHandle, slot, dictionaryValues)
+            } else {
+              sawPlainPage = true
+            }
+
+            val hasDefLevels = descriptor.getMaxDefinitionLevel > 0
+            var rowOffset = 0
+            var rawPage = pageReader.readPage()
+            while (rawPage != null) {
+              val dataPage = rawPage match {
+                case v1: DataPageV1 => v1
+                case other => throw new RuntimeException(
+                  s"${MeasureColumns(slot)}: unsupported Parquet page type ${other.getClass}")
+              }
+              val encoding = dataPage.getValueEncoding
+              if (dictionaryPage != null) {
+                require(DictionaryEncodings.contains(encoding),
+                  s"${MeasureColumns(slot)}: expected dictionary encoding, got $encoding")
+              } else {
+                require(encoding == Encoding.PLAIN,
+                  s"${MeasureColumns(slot)}: expected PLAIN encoding, got $encoding")
+              }
+              val pageBytes = dataPage.getBytes.toByteArray
+              val valueCount = dataPage.getValueCount
+              NativeBridge.parquetDecodeMeasurePage(
+                streamHandle, rowGroupHandle, slot,
+                pageBytes, pageBytes.length, valueCount, rowOffset, hasDefLevels)
+              rowOffset += valueCount
+              rawPage = pageReader.readPage()
+            }
+            require(rowOffset == rowGroupRows,
+              s"${MeasureColumns(slot)}: pages covered $rowOffset rows, expected $rowGroupRows")
+
+            val valuesOut = new Array[Int](rowGroupRows)
+            val validityOut = new Array[Byte](rowGroupRows)
+            NativeBridge.parquetRowGroupReadMeasure(
+              streamHandle, rowGroupHandle, slot, valuesOut, validityOut)
+            for (row <- 0 until rowGroupRows) {
+              val globalRow = coveredRows + row
+              if (validityOut(row) == 0) {
+                decodedValues(slot)(globalRow) = valuesOut(row)
+              } else {
+                decodedIsNull(slot)(globalRow) = true
+              }
+            }
+          }
+        } finally {
+          NativeBridge.parquetRowGroupRelease(rowGroupHandle)
+          NativeBridge.membershipCount3StreamAbort(streamHandle)
+        }
+        coveredRows += rowGroupRows
+        pageReadStore = reader.readNextRowGroup()
+      }
+    } finally {
+      reader.close()
+    }
+    NativeBridge.releaseMembershipCount3(preparedHandle)
+    require(coveredRows == rows, s"$caseName: row groups covered $coveredRows rows, expected $rows")
+
+    val referenceRows = spark.read.parquet(path).select("quantity", "price").collect()
+    require(referenceRows.length == rows,
+      s"$caseName: reference row count ${referenceRows.length} did not match $rows")
+
+    var mismatches = 0
+    for (row <- 0 until rows) {
+      val sparkRow = referenceRows(row)
+      val expectedQuantityNull = sparkRow.isNullAt(0)
+      if (expectedQuantityNull != decodedIsNull(0)(row)) {
+        mismatches += 1
+      } else if (!expectedQuantityNull && sparkRow.getInt(0) != decodedValues(0)(row)) {
+        mismatches += 1
+      }
+      val expectedPriceNull = sparkRow.isNullAt(1)
+      if (expectedPriceNull != decodedIsNull(1)(row)) {
+        mismatches += 1
+      } else if (!expectedPriceNull) {
+        // decimal(7,2) is backed by an INT32 physical type; compare the raw
+        // unscaled integer both sides agree on rather than the decimal value,
+        // per the brief.
+        val expectedUnscaled = sparkRow.getDecimal(1).unscaledValue().intValue()
+        if (expectedUnscaled != decodedValues(1)(row)) mismatches += 1
+      }
+    }
+
+    val matched = mismatches == 0
+    println(
+      s"""{"mode":"measure","case":"$caseName","rows":$rows,"mismatches":$mismatches,""" +
+        s""""match":$matched,"sawDictionaryPage":$sawDictionaryPage,"sawPlainPage":$sawPlainPage}""")
+    if (!matched) sys.exit(1)
+    // Guard against the test silently degrading: each dataset is written to
+    // deterministically exercise one specific value-section layout for BOTH
+    // measure columns, so a run that never actually saw that layout would
+    // pass the match check above without having tested anything.
+    if (expectDictionary) {
+      require(sawDictionaryPage,
+        s"$caseName: expected at least one dictionary-encoded measure page, saw none")
+    } else {
+      require(sawPlainPage,
+        s"$caseName: expected at least one PLAIN-encoded measure page, saw none")
+      require(!sawDictionaryPage,
+        s"$caseName: expected every measure page to be PLAIN, but saw a dictionary page too")
+    }
+  }
+
+  /**
+   * @param highCardinality when false, quantity/price are low-cardinality
+   *                        (parquet-mr keeps the dictionary for both). When
+   *                        true, quantity is the strictly-increasing `id`
+   *                        and price is near-unique across `rows`, combined
+   *                        with a small parquet.dictionary.page.size (same
+   *                        trick as writeDictionaryOverflowDataset) so
+   *                        parquet-mr abandons the dictionary and both
+   *                        columns are written PLAIN.
+   */
+  private def writeMeasureDataset(
+      spark: SparkSession, path: String, rows: Int, highCardinality: Boolean): Unit = {
+    val hadoopConf = spark.sparkContext.hadoopConfiguration
+    val previousDictionarySize = hadoopConf.get("parquet.dictionary.page.size")
+    if (highCardinality) hadoopConf.setInt("parquet.dictionary.page.size", 4096)
+    try {
+      // quantity nulls every 13th row (per the brief); price nulls on a
+      // different modulus (11th row) so the two columns' segment boundaries
+      // don't line up, exercising more distinct null-gap shapes.
+      val quantityExpr =
+        if (highCardinality)
+          "CASE WHEN id % 13 = 0 THEN CAST(NULL AS INT) ELSE CAST(id AS INT) END AS quantity"
+        else
+          "CASE WHEN id % 13 = 0 THEN CAST(NULL AS INT) ELSE CAST(pmod(id, 50) + 1 AS INT) END AS quantity"
+      val priceExpr =
+        if (highCardinality)
+          "CASE WHEN id % 11 = 0 THEN CAST(NULL AS DECIMAL(7,2)) " +
+            "ELSE CAST(pmod(id, 99999) AS DECIMAL(7,2)) END AS price"
+        else
+          "CASE WHEN id % 11 = 0 THEN CAST(NULL AS DECIMAL(7,2)) " +
+            "ELSE CAST(pmod(id, 300) + 100 AS DECIMAL(7,2)) END AS price"
+      var writer = spark.range(rows)
+        .selectExpr(quantityExpr, priceExpr)
+        .coalesce(1)
+        .write
+        .option("parquet.page.size", "8192")
+      if (highCardinality) writer = writer.option("parquet.dictionary.page.size", "4096")
+      writer.mode("errorifexists").parquet(path)
+    } finally {
+      if (highCardinality) {
+        if (previousDictionarySize != null) hadoopConf.set("parquet.dictionary.page.size", previousDictionarySize)
+        else hadoopConf.unset("parquet.dictionary.page.size")
+      }
+    }
+  }
+
+  private def singlePartFile(path: String): String = {
+    val files = listParquetFiles(path)
+    require(files.length == 1, s"expected exactly 1 part file under $path, got $files")
+    files.head
   }
 
   // Task 5: drive MetalParquetMembershipCountExec directly (it is not yet

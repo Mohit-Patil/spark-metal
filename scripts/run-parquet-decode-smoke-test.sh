@@ -32,3 +32,15 @@ spark-submit \
   "${build_root}/libsparkmetal.dylib" \
   "${build_root}/kernels.metallib" \
   "${1:-100003}"
+
+spark-submit \
+  --master 'local[8]' \
+  --driver-memory 6g \
+  --conf spark.ui.enabled=false \
+  --conf spark.sql.adaptive.enabled=false \
+  --class io.github.mohitpatil.sparkmetal.ParquetDecodeSmoke \
+  "${build_root}/spark-metal-plugin.jar" \
+  measure \
+  "${build_root}/libsparkmetal.dylib" \
+  "${build_root}/kernels.metallib" \
+  "${1:-100003}"

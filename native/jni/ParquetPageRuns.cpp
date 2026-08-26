@@ -61,7 +61,7 @@ bool walkHybrid(ByteCursor &cursor, uint32_t bitWidth, uint32_t expectedValues, 
 }  // namespace
 
 bool parseDataPageV1(const uint8_t *page, size_t length, uint32_t valueCount,
-                     bool hasDefLevels, PageRuns &out) {
+                     bool hasDefLevels, PageValueEncoding encoding, PageRuns &out) {
     // Reset in place rather than `out = PageRuns{}`: assigning a fresh PageRuns
     // frees both vectors' storage, so every page re-grew them from nothing.
     // Callers reuse one PageRuns across a column chunk's pages, which keeps the
@@ -71,10 +71,12 @@ bool parseDataPageV1(const uint8_t *page, size_t length, uint32_t valueCount,
     out.segments.clear();
     out.bitWidth = 0;
     out.valueBytesOffset = 0;
+    out.plainBytesOffset = 0;
     out.nonNullCount = 0;
     out.maxItemCount = 0;
     out.maxSegmentCount = 0;
     out.allValid = true;
+    out.plain = encoding == PageValueEncoding::Plain;
     ByteCursor cursor{page, length};
 
     // Definition levels: 4-byte LE length, then a bitWidth-1 hybrid stream.
@@ -166,6 +168,19 @@ bool parseDataPageV1(const uint8_t *page, size_t length, uint32_t valueCount,
                 remaining -= chunk;
             }
         }
+    }
+
+    if (encoding == PageValueEncoding::Plain) {
+        // Plain values: no bit-width byte -- straight into a packed
+        // little-endian int32 array of the nonNull values. No work items are
+        // produced; the caller (CPU memcpy for an all-valid page, or a
+        // value-space memcpy ahead of scatter_segments for a page with
+        // nulls) reads the values directly from plainBytesOffset.
+        out.plainBytesOffset = uint32_t(cursor.offset);
+        if (nonNull == 0) return true;
+        size_t neededBytes = size_t(nonNull) * sizeof(int32_t);
+        if (cursor.offset + neededBytes > length) return false;
+        return true;
     }
 
     // Values: 1-byte bit width, then a hybrid stream of nonNull dictionary ids.

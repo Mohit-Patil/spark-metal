@@ -62,12 +62,25 @@ bool walkHybrid(ByteCursor &cursor, uint32_t bitWidth, uint32_t expectedValues, 
 
 bool parseDataPageV1(const uint8_t *page, size_t length, uint32_t valueCount,
                      bool hasDefLevels, PageRuns &out) {
-    out = PageRuns{};
+    // Reset in place rather than `out = PageRuns{}`: assigning a fresh PageRuns
+    // frees both vectors' storage, so every page re-grew them from nothing.
+    // Callers reuse one PageRuns across a column chunk's pages, which keeps the
+    // capacity (~80 items for a 20k-value page) and makes this allocation-free
+    // after the first page.
+    out.items.clear();
+    out.segments.clear();
+    out.bitWidth = 0;
+    out.valueBytesOffset = 0;
+    out.nonNullCount = 0;
+    out.allValid = true;
     ByteCursor cursor{page, length};
 
     // Definition levels: 4-byte LE length, then a bitWidth-1 hybrid stream.
     // Collected first as (count, defined) pairs, then folded into segments.
-    std::vector<std::pair<uint32_t, bool>> defRuns;
+    // thread_local for the same reason: one scratch vector per decoding thread,
+    // reused across pages. Cleared here, never read before it is written.
+    static thread_local std::vector<std::pair<uint32_t, bool>> defRuns;
+    defRuns.clear();
     if (hasDefLevels) {
         uint32_t defLength;
         if (!cursor.readLittleEndian(4, defLength)) return false;

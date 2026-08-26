@@ -6,6 +6,7 @@
 #include <limits>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 #import <Foundation/Foundation.h>
@@ -65,7 +66,13 @@ struct MembershipStream {
     PreparedMembershipCount3 *prepared = nullptr;
     std::vector<id<MTLCommandBuffer>> commandBuffers;
     std::vector<std::pair<id<MTLBuffer>, id<MTLCommandBuffer>>> pendingStaging;
-    std::vector<id<MTLBuffer>> freeStaging;
+    // Free buffers bucketed by their exact allocated length (see
+    // stagingBucketSize). A single flat free list served first-fit degenerates
+    // badly on the Parquet path: each page acquires a ~32KB page buffer and a
+    // ~1KB work-item buffer, and first fit hands the 1KB request the recycled
+    // 32KB buffer, leaving only 1KB buffers behind, so every page buffer had to
+    // be allocated fresh (~17us of the 37us each page cost).
+    std::unordered_map<size_t, std::vector<id<MTLBuffer>>> freeStaging;
     std::vector<id<MTLBuffer>> partialBuffers;
     std::vector<NSUInteger> partialGroupCounts;
     // Parquet row groups allocated from this stream that have not yet been
@@ -93,32 +100,124 @@ struct ScatterParams {
 // returned via pendingStaging after each submit -- the row group outlives
 // several command buffers, so they are only recycled by
 // parquetRowGroupRelease, once the caller is done reading them.
+//
+// A row group also owns ONE open command buffer and ONE open compute encoder
+// that every one of its pages encodes into. Committing per page cost ~120us of
+// CPU per page (5040 pages -> 605ms of the 663ms decode budget on the 33.5M-row
+// synthetic benchmark), so the whole row group is encoded once and committed
+// once, at parquetRowGroupCount / parquetRowGroupRead / parquetRowGroupRelease.
+// Ordering inside the row group is preserved because a compute encoder created
+// with -computeCommandEncoder uses MTLDispatchTypeSerial: every dispatch, page
+// N's expand and page N's scatter included, completes before the next starts.
+// Ordering across row groups is preserved because the one shared command queue
+// executes committed command buffers in order.
+//
+// pendingStaging holds the buffers this row group's dispatches read from. They
+// cannot be keyed to a command buffer at push time (the command buffer is not
+// committed yet, and acquireStagingBuffer only recycles buffers whose keyed
+// command buffer *completed* -- an uncommitted one never completes and would
+// wedge the pool), so they are held here and handed to the stream, keyed to the
+// row group's command buffer, at commit time.
 struct ParquetRowGroup {
     uint32_t rowCount = 0;
     id<MTLBuffer> ids[3];
     id<MTLBuffer> validity[3];
     bool columnHasNulls[3] = {false, false, false};
     MembershipStream *stream = nullptr;
+    id<MTLCommandBuffer> commandBuffer = nil;
+    id<MTLComputeCommandEncoder> encoder = nil;
+    id<MTLCommandBuffer> lastCommandBuffer = nil;
+    std::vector<id<MTLBuffer>> pendingStaging;
+    uint32_t pagesSinceCommit = 0;
 };
 
+// Pages encoded into one command buffer before it is committed and a fresh one
+// opened. One commit for the whole row group is not the optimum: a row group of
+// the 33.5M-row synthetic benchmark holds ~630 pages, and while its command
+// buffer stays open none of its page staging can be recycled (the pool only
+// reclaims buffers whose command buffer completed), so every page paid a fresh
+// newBufferWithLength. Committing in chunks lets the pool turn over and lets the
+// GPU chew on chunk N while the CPU encodes chunk N+1, at the cost of ~20 extra
+// commits per row group. Correctness is unaffected: the one shared command queue
+// runs committed command buffers in order, so chunk N still lands before N+1 and
+// all of them before parquetRowGroupCount's dispatch.
+constexpr uint32_t kPagesPerCommit = 32;
+
+// Every staging buffer is allocated at a 4KB-rounded size so buffers of
+// near-identical request sizes (the pages of one column chunk, say) share a
+// bucket and recycle into each other. 4KB granularity, rather than powers of
+// two, keeps the row-group planes -- tens of megabytes each -- from rounding up
+// to twice their size.
+size_t stagingBucketSize(size_t length) {
+    constexpr size_t granularity = 4096;
+    return ((length + granularity - 1) / granularity) * granularity;
+}
+
 id<MTLBuffer> acquireStagingBuffer(MembershipStream *stream, size_t length) {
-    for (auto pending = stream->pendingStaging.begin();
-         pending != stream->pendingStaging.end();) {
-        if (pending->second.status == MTLCommandBufferStatusCompleted) {
-            stream->freeStaging.push_back(pending->first);
-            pending = stream->pendingStaging.erase(pending);
-        } else {
-            ++pending;
-        }
+    // Reclaim only the completed *prefix* rather than rescanning the whole
+    // list. Entries are appended in command-buffer commit order and the one
+    // shared queue completes command buffers in that same order, so the first
+    // entry that is not yet complete is followed only by entries that are not
+    // yet complete either -- stopping there reclaims exactly as much, and never
+    // reclaims a buffer the GPU still reads. It matters because -[MTLCommandBuffer
+    // status] is a real property read, and the Parquet path calls this twice per
+    // page: a full rescan made it O(pages^2) status reads per row group.
+    size_t reclaimed = 0;
+    while (reclaimed < stream->pendingStaging.size() &&
+           stream->pendingStaging[reclaimed].second.status == MTLCommandBufferStatusCompleted) {
+        id<MTLBuffer> buffer = stream->pendingStaging[reclaimed].first;
+        stream->freeStaging[buffer.length].push_back(buffer);
+        ++reclaimed;
     }
-    for (auto free = stream->freeStaging.begin(); free != stream->freeStaging.end(); ++free) {
-        if ((*free).length >= length) {
-            id<MTLBuffer> buffer = *free;
-            stream->freeStaging.erase(free);
-            return buffer;
-        }
+    if (reclaimed > 0) {
+        stream->pendingStaging.erase(
+            stream->pendingStaging.begin(), stream->pendingStaging.begin() + reclaimed);
     }
-    return [device newBufferWithLength:length options:MTLResourceStorageModeShared];
+    size_t bucket = stagingBucketSize(length);
+    auto found = stream->freeStaging.find(bucket);
+    if (found != stream->freeStaging.end() && !found->second.empty()) {
+        id<MTLBuffer> buffer = found->second.back();
+        found->second.pop_back();
+        return buffer;
+    }
+    return [device newBufferWithLength:bucket options:MTLResourceStorageModeShared];
+}
+
+// Returns the row group's open compute encoder, opening a command buffer and/or
+// an encoder first if this is the first dispatch since the last commit. Returns
+// nil only if the command buffer or encoder could not be created.
+id<MTLComputeCommandEncoder> rowGroupEncoder(ParquetRowGroup *rowGroup) {
+    if (rowGroup->commandBuffer == nil) {
+        rowGroup->commandBuffer = [commandQueue commandBuffer];
+        if (rowGroup->commandBuffer == nil) return nil;
+    }
+    if (rowGroup->encoder == nil) {
+        rowGroup->encoder = [rowGroup->commandBuffer computeCommandEncoder];
+    }
+    return rowGroup->encoder;
+}
+
+// Closes the row group's encoder and commits its command buffer, registering it
+// with the stream and keying every staging buffer it read to it so the pool can
+// only recycle them once the GPU is finished. Safe to call when nothing is open.
+void commitRowGroup(ParquetRowGroup *rowGroup) {
+    if (rowGroup->encoder != nil) {
+        [rowGroup->encoder endEncoding];
+        rowGroup->encoder = nil;
+    }
+    id<MTLCommandBuffer> commandBuffer = rowGroup->commandBuffer;
+    if (commandBuffer == nil) return;
+    rowGroup->commandBuffer = nil;
+    [commandBuffer commit];
+    rowGroup->lastCommandBuffer = commandBuffer;
+    MembershipStream *stream = rowGroup->stream;
+    if (stream == nullptr) return;
+    stream->commandBuffers.push_back(commandBuffer);
+    for (id<MTLBuffer> buffer : rowGroup->pendingStaging) {
+        stream->pendingStaging.push_back({buffer, commandBuffer});
+    }
+    rowGroup->pendingStaging.clear();
+    rowGroup->pagesSinceCommit = 0;
 }
 
 void throwRuntime(JNIEnv *environment, NSString *message) {
@@ -1098,6 +1197,13 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_membershipCount3StreamFinish(
         }
         auto *stream = reinterpret_cast<MembershipStream *>(
             static_cast<uintptr_t>(streamHandle));
+        // Any row group the caller never Counted or Released still owns an open
+        // command buffer and encoder. Close and commit them before the wait so
+        // nothing is left half-encoded when the row groups are deleted below --
+        // and so the wait covers them.
+        for (ParquetRowGroup *rowGroup : stream->rowGroups) {
+            commitRowGroup(rowGroup);
+        }
         NSError *failure = nil;
         for (id<MTLCommandBuffer> commandBuffer : stream->commandBuffers) {
             [commandBuffer waitUntilCompleted];
@@ -1148,6 +1254,11 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_membershipCount3StreamAbort(
         if (streamHandle == 0) return;
         auto *stream = reinterpret_cast<MembershipStream *>(
             static_cast<uintptr_t>(streamHandle));
+        // See membershipCount3StreamFinish: close and commit any row group left
+        // mid-encode so nothing is deleted with an open encoder.
+        for (ParquetRowGroup *rowGroup : stream->rowGroups) {
+            commitRowGroup(rowGroup);
+        }
         for (id<MTLCommandBuffer> commandBuffer : stream->commandBuffers) {
             [commandBuffer waitUntilCompleted];
         }
@@ -1209,12 +1320,20 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetRowGroupBegin(
         }
         [blit endEncoding];
         if (allocationFailed) {
+            // Nothing was committed, so the command buffer is simply dropped
+            // (ARC releases it) along with whatever planes were acquired.
             delete rowGroup;
             throwRuntime(environment, @"Cannot allocate Parquet row-group planes");
             return 0;
         }
-        [commandBuffer commit];
-        stream->commandBuffers.push_back(commandBuffer);
+        // NOT committed here: this command buffer stays open so every page of
+        // this row group encodes into it. Encoders within one command buffer
+        // execute in the order they were created, so the zero-fill blit above
+        // is guaranteed to precede the compute encoder's dispatches. It is
+        // deliberately not pushed onto stream->commandBuffers yet either --
+        // Finish/Abort/Read call waitUntilCompleted on everything in there, and
+        // waiting on an uncommitted command buffer would hang.
+        rowGroup->commandBuffer = commandBuffer;
         stream->rowGroups.push_back(rowGroup);
         return static_cast<jlong>(reinterpret_cast<uintptr_t>(rowGroup));
     }
@@ -1275,7 +1394,9 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetDecodePage(
         if (environment->ExceptionCheck()) return;
         memset(pageContents + pageLength, 0, 4);
 
-        sparkmetal::PageRuns runs;
+        // One PageRuns per decoding thread, reused across pages: see
+        // parseDataPageV1, which resets it in place and so keeps its capacity.
+        static thread_local sparkmetal::PageRuns runs;
         bool parsed = sparkmetal::parseDataPageV1(
             pageContents, static_cast<size_t>(pageLength), static_cast<uint32_t>(valueCount),
             hasDefLevels == JNI_TRUE, runs);
@@ -1312,8 +1433,13 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetDecodePage(
         std::vector<id<MTLBuffer>> usedStaging = {pageStaging};
         if (itemsBuffer != nil) usedStaging.push_back(itemsBuffer);
 
-        id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
-        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+        // Encode into the row group's shared, still-open command buffer rather
+        // than creating and committing one per page.
+        id<MTLComputeCommandEncoder> encoder = rowGroupEncoder(rowGroup);
+        if (encoder == nil) {
+            throwRuntime(environment, @"Cannot open a Parquet row-group compute encoder");
+            return;
+        }
 
         if (runs.allValid) {
             // allValid implies nonNullCount == valueCount > 0, so items is
@@ -1337,7 +1463,13 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetDecodePage(
                 4, static_cast<size_t>(runs.nonNullCount) * sizeof(int32_t));
             id<MTLBuffer> valuesBuffer = acquireStagingBuffer(stream, valuesBytes);
             if (valuesBuffer == nil) {
-                [encoder endEncoding];
+                // Leave the encoder open: it belongs to the row group, and the
+                // caller's failure path (parquetRowGroupRelease, or
+                // Finish/Abort) closes and commits it. Hand over the staging
+                // already referenced by this page's dispatches so it is keyed
+                // to that commit rather than recycled early.
+                rowGroup->pendingStaging.insert(
+                    rowGroup->pendingStaging.end(), usedStaging.begin(), usedStaging.end());
                 throwRuntime(environment, @"Cannot allocate Parquet value-scratch staging buffer");
                 return;
             }
@@ -1362,7 +1494,8 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetDecodePage(
             id<MTLBuffer> segmentsBuffer = acquireStagingBuffer(
                 stream, runs.segments.size() * sizeof(sparkmetal::RowSegment));
             if (segmentsBuffer == nil) {
-                [encoder endEncoding];
+                rowGroup->pendingStaging.insert(
+                    rowGroup->pendingStaging.end(), usedStaging.begin(), usedStaging.end());
                 throwRuntime(environment, @"Cannot allocate Parquet segment staging buffer");
                 return;
             }
@@ -1384,12 +1517,13 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetDecodePage(
                      threadsPerThreadgroup:MTLSizeMake(sparkmetal::kDecodeChunk, 1, 1)];
         }
 
-        [encoder endEncoding];
-        [commandBuffer commit];
-
-        stream->commandBuffers.push_back(commandBuffer);
-        for (id<MTLBuffer> buffer : usedStaging) {
-            stream->pendingStaging.push_back({buffer, commandBuffer});
+        // No endEncoding / commit here: the encoder stays open for the next
+        // page. The staging this page's dispatches read is parked on the row
+        // group and keyed to its command buffer when commitRowGroup runs.
+        rowGroup->pendingStaging.insert(
+            rowGroup->pendingStaging.end(), usedStaging.begin(), usedStaging.end());
+        if (++rowGroup->pagesSinceCommit >= kPagesPerCommit) {
+            commitRowGroup(rowGroup);
         }
     }
 }
@@ -1417,6 +1551,12 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetRowGroupRead(
             throwRuntime(environment, @"Row group does not belong to the given stream");
             return;
         }
+        // The row group's own command buffer is still open at this point (see
+        // ParquetRowGroup): close and commit it, or the wait below would return
+        // before any of this row group's pages had run. A later
+        // parquetDecodePage on the same row group simply opens a fresh command
+        // buffer, which the queue still runs after this one.
+        commitRowGroup(rowGroup);
         for (id<MTLCommandBuffer> commandBuffer : stream->commandBuffers) {
             [commandBuffer waitUntilCompleted];
             if (commandBuffer.status == MTLCommandBufferStatusError) {
@@ -1451,17 +1591,23 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetRowGroupRelease(
         auto *rowGroup = reinterpret_cast<ParquetRowGroup *>(
             static_cast<uintptr_t>(rowGroupHandle));
         MembershipStream *stream = rowGroup->stream;
-        id<MTLCommandBuffer> lastCommandBuffer =
-            (stream != nullptr && !stream->commandBuffers.empty())
-                ? stream->commandBuffers.back()
-                : nil;
+        // Close and commit whatever this row group had encoded but not yet
+        // submitted (a partial encode from a page that threw, or a complete one
+        // the caller chose not to Count). That both frees the encoder and gives
+        // the planes below a command buffer to be keyed to.
+        commitRowGroup(rowGroup);
+        id<MTLCommandBuffer> lastCommandBuffer = rowGroup->lastCommandBuffer;
+        if (lastCommandBuffer == nil && stream != nullptr && !stream->commandBuffers.empty()) {
+            lastCommandBuffer = stream->commandBuffers.back();
+        }
         for (int column = 0; column < 3; ++column) {
             if (lastCommandBuffer != nil) {
                 stream->pendingStaging.push_back({rowGroup->ids[column], lastCommandBuffer});
                 stream->pendingStaging.push_back({rowGroup->validity[column], lastCommandBuffer});
             } else if (stream != nullptr) {
-                stream->freeStaging.push_back(rowGroup->ids[column]);
-                stream->freeStaging.push_back(rowGroup->validity[column]);
+                stream->freeStaging[rowGroup->ids[column].length].push_back(rowGroup->ids[column]);
+                stream->freeStaging[rowGroup->validity[column].length]
+                    .push_back(rowGroup->validity[column]);
             }
         }
         if (stream != nullptr) {
@@ -1579,8 +1725,15 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetRowGroupCount(
             keyMinimums[0], keyMinimums[1], keyMinimums[2],
             keySpans[0], keySpans[1], keySpans[2]
         };
-        id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
-        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+        // The count dispatch goes into the same encoder as this row group's
+        // page expansions. MTLDispatchTypeSerial guarantees every expand and
+        // scatter has completed before the count kernel reads the planes, so no
+        // extra command buffer, commit, or barrier is needed.
+        id<MTLComputeCommandEncoder> encoder = rowGroupEncoder(rowGroup);
+        if (encoder == nil) {
+            throwRuntime(environment, @"Cannot open a Parquet row-group compute encoder");
+            return;
+        }
         [encoder setComputePipelineState:prepared->allKeysUnique
             ? membershipCountUniquePipeline
             : membershipCountMultiplicityPipeline];
@@ -1593,25 +1746,19 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetRowGroupCount(
         [encoder setBytes:&parameters length:sizeof(parameters) atIndex:10];
         [encoder dispatchThreadgroups:MTLSizeMake(groupCount, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
-        [encoder endEncoding];
-        [commandBuffer commit];
 
-        stream->commandBuffers.push_back(commandBuffer);
-        // The dictionary-table staging is scoped to this call, so it returns
-        // to freeStaging once the command buffer completes, same as every
-        // other stream submit.
-        for (id<MTLBuffer> buffer : usedStaging) {
-            stream->pendingStaging.push_back({buffer, commandBuffer});
-        }
-        // The row group's own ids/validity planes outlive parquetDecodePage's
-        // per-page command buffers (they are never pendingStaging entries --
-        // see the ParquetRowGroup comment), so they must be pushed back
-        // explicitly here, keyed to this final command buffer, exactly as
-        // parquetRowGroupRelease does for the non-counting path.
+        // The dictionary-table staging is scoped to this call, and the row
+        // group's own ids/validity planes are never pendingStaging entries (see
+        // the ParquetRowGroup comment) -- both must be keyed to this row group's
+        // command buffer, which commitRowGroup does for everything parked here.
+        rowGroup->pendingStaging.insert(
+            rowGroup->pendingStaging.end(), usedStaging.begin(), usedStaging.end());
         for (int column = 0; column < 3; ++column) {
-            stream->pendingStaging.push_back({rowGroup->ids[column], commandBuffer});
-            stream->pendingStaging.push_back({rowGroup->validity[column], commandBuffer});
+            rowGroup->pendingStaging.push_back(rowGroup->ids[column]);
+            rowGroup->pendingStaging.push_back(rowGroup->validity[column]);
         }
+        commitRowGroup(rowGroup);
+
         stream->partialBuffers.push_back(partialBuffer);
         stream->partialGroupCounts.push_back(groupCount);
 

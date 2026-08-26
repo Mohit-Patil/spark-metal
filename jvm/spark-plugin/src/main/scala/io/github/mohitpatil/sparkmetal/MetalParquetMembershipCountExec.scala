@@ -66,6 +66,10 @@ case class MetalParquetMembershipCountExec(
     "numPagesDecoded" -> SQLMetrics.createMetric(sparkContext, "number of Parquet data pages decoded"),
     "cpuFallbackRowGroups" -> SQLMetrics.createMetric(sparkContext, "row groups counted on CPU"),
     "decodeParseTime" -> SQLMetrics.createTimingMetric(sparkContext, "page parse and GPU-encode time"),
+    "rowGroupReadTime" -> SQLMetrics.createTimingMetric(sparkContext, "Parquet row-group read and decompress time"),
+    "partitionTime" -> SQLMetrics.createTimingMetric(sparkContext, "total in-task time"),
+    "splitPlanTime" -> SQLMetrics.createTimingMetric(sparkContext, "driver-side split enumeration time"),
+    "pageSubmitTime" -> SQLMetrics.createTimingMetric(sparkContext, "native page-submit time"),
     "metalTime" -> SQLMetrics.createTimingMetric(sparkContext, "Metal count and final wait time"),
     "dimensionTime" -> SQLMetrics.createTimingMetric(sparkContext, "dimension key collection time"),
     "membershipBuildTime" -> SQLMetrics.createTimingMetric(sparkContext, "membership map build time"))
@@ -92,6 +96,8 @@ case class MetalParquetMembershipCountExec(
     val numPagesDecoded = longMetric("numPagesDecoded")
     val cpuFallbackRowGroups = longMetric("cpuFallbackRowGroups")
     val decodeParseTime = longMetric("decodeParseTime")
+    val rowGroupReadTime = longMetric("rowGroupReadTime")
+    val pageSubmitTime = longMetric("pageSubmitTime")
     val metalTime = longMetric("metalTime")
     val membershipBuildTime = longMetric("membershipBuildTime")
 
@@ -107,13 +113,18 @@ case class MetalParquetMembershipCountExec(
       }
     }
 
+    val splitPlanTime = longMetric("splitPlanTime")
+    val partitionTime = longMetric("partitionTime")
+    val splitPlanStarted = System.nanoTime()
     val splits = enumerateSplits()
+    splitPlanTime += (System.nanoTime() - splitPlanStarted) / 1000000
     val numPartitions = math.max(1, math.min(splits.length, sparkContext.defaultParallelism))
     val splitRDD = sparkContext.parallelize(splits, numPartitions)
     val prepareToken = UUID.randomUUID().toString
     val prepareUses = splitRDD.getNumPartitions
 
     splitRDD.mapPartitions { splitIterator =>
+      val partitionStarted = System.nanoTime()
       SparkMetalNative.ensureInitialized(nativeLibrary, metalLibrary)
       val splitsInPartition = splitIterator.toArray
       val multiplicities = keys.map(_.groupMapReduce(identity)(_ => 1L)(_ + _))
@@ -125,14 +136,16 @@ case class MetalParquetMembershipCountExec(
       var partitionCount = 0L
       var metalNanos = 0L
       var parseNanos = 0L
+      var readNanos = 0L
+      val submitNanos = new Array[Long](1)
       var localRowGroups = 0L
       var localPages = 0L
       var localFallbacks = 0L
       val readers = mutable.Map.empty[String, ParquetFileReader]
 
       def readerFor(file: String): ParquetFileReader =
-        readers.getOrElseUpdate(file, ParquetFileReader.open(
-          HadoopInputFile.fromPath(new Path(file), new Configuration())))
+        readers.getOrElseUpdate(file, ParquetFileReader.open(HadoopInputFile.fromPath(
+          new Path(file), MetalParquetMembershipCountExec.sharedConfiguration)))
 
       try {
         val streamHandle =
@@ -152,12 +165,13 @@ case class MetalParquetMembershipCountExec(
               try {
                 val parseStarted = System.nanoTime()
                 val pageReadStore = reader.readRowGroup(split.rowGroupIndex)
+                readNanos += System.nanoTime() - parseStarted
                 try {
                   rowGroupHandle = NativeBridge.parquetRowGroupBegin(streamHandle, split.rowCount.toInt)
                   val tables = descriptors.zipWithIndex.map { case (descriptor, ordinal) =>
                     decodeRowGroupColumn(
                       streamHandle, rowGroupHandle, ordinal, split, pageReadStore, descriptor,
-                      multiplicities(ordinal), allKeysUnique, () => localPages += 1)
+                      multiplicities(ordinal), allKeysUnique, () => localPages += 1, submitNanos)
                   }
                   parseNanos += System.nanoTime() - parseStarted
 
@@ -227,6 +241,8 @@ case class MetalParquetMembershipCountExec(
         readers.values.foreach(_.close())
         metalTime += metalNanos / 1000000
         decodeParseTime += parseNanos / 1000000
+        rowGroupReadTime += readNanos / 1000000
+        pageSubmitTime += submitNanos(0) / 1000000
         numRowGroups += localRowGroups
         numPagesDecoded += localPages
         cpuFallbackRowGroups += localFallbacks
@@ -235,6 +251,7 @@ case class MetalParquetMembershipCountExec(
         }
       }
 
+      partitionTime += (System.nanoTime() - partitionStarted) / 1000000
       val vector = new OnHeapColumnVector(1, LongType)
       vector.putLong(0, partitionCount)
       Iterator.single(new ColumnarBatch(Array[ColumnVector](vector), 1))
@@ -257,7 +274,8 @@ case class MetalParquetMembershipCountExec(
       descriptor: ColumnDescriptor,
       keys: Map[Int, Long],
       allKeysUnique: Boolean,
-      onPageDecoded: () => Unit): (Array[Byte], Array[Int]) = {
+      onPageDecoded: () => Unit,
+      submitNanos: Array[Long]): (Array[Byte], Array[Int]) = {
     val pageReader = pageReadStore.getPageReader(descriptor)
     val dictionaryPage = pageReader.readDictionaryPage()
     if (dictionaryPage == null) {
@@ -281,9 +299,11 @@ case class MetalParquetMembershipCountExec(
       }
       val pageBytes = dataPage.getBytes.toByteArray
       val valueCount = dataPage.getValueCount
+      val submitStarted = System.nanoTime()
       NativeBridge.parquetDecodePage(
         streamHandle, rowGroupHandle, ordinal,
         pageBytes, pageBytes.length, valueCount, rowOffset, hasDefLevels)
+      submitNanos(0) += System.nanoTime() - submitStarted
       onPageDecoded()
       rowOffset += valueCount
       rawPage = pageReader.readPage()
@@ -370,8 +390,34 @@ case class MetalParquetMembershipCountExec(
     count
   }
 
-  private def enumerateSplits(): Seq[ParquetMembershipSplit] = files.flatMap { file =>
-    val reader = ParquetFileReader.open(HadoopInputFile.fromPath(new Path(file), new Configuration()))
+  /**
+   * Reads every input file's footer to enumerate (file, row group) work units.
+   * Both the sharing of one [[Configuration]] and the parallel fan-out matter:
+   * a fresh `new Configuration()` per file re-walks Hadoop's default resource
+   * list, and the footer reads are pure I/O latency. Serially with a
+   * per-file Configuration this cost 35ms of driver time per execution on the
+   * 33.5M-row synthetic benchmark, against a ~190ms total query.
+   */
+  private def enumerateSplits(): Seq[ParquetMembershipSplit] = {
+    val configuration = MetalParquetMembershipCountExec.sharedConfiguration
+    if (files.length <= 1) {
+      return files.flatMap(footerSplits(_, configuration))
+    }
+    val executor = Executors.newFixedThreadPool(
+      math.min(files.length, Runtime.getRuntime.availableProcessors))
+    try {
+      implicit val context: ExecutionContext = ExecutionContext.fromExecutor(executor)
+      Await.result(
+        Future.traverse(files)(file => Future(footerSplits(file, configuration))),
+        Duration.Inf).flatten
+    } finally {
+      executor.shutdown()
+    }
+  }
+
+  private def footerSplits(
+      file: String, configuration: Configuration): Seq[ParquetMembershipSplit] = {
+    val reader = ParquetFileReader.open(HadoopInputFile.fromPath(new Path(file), configuration))
     try {
       reader.getFooter.getBlocks.asScala.zipWithIndex.map { case (block, index) =>
         ParquetMembershipSplit(file, index, block.getRowCount)
@@ -383,4 +429,16 @@ case class MetalParquetMembershipCountExec(
 
   override protected def withNewChildrenInternal(newChildren: IndexedSeq[SparkPlan]): SparkPlan =
     copy(keyPlans = newChildren)
+}
+
+private[sparkmetal] object MetalParquetMembershipCountExec {
+  /**
+   * One Hadoop [[Configuration]] per JVM, for the driver's footer scan and for
+   * each task's [[ParquetFileReader]]s. Constructing one is not free -- it
+   * re-reads Hadoop's default resource list -- and this operator would
+   * otherwise build a fresh one per file per execution. Configuration is not
+   * thread-safe for mutation, but nothing here mutates it, and parquet-mr only
+   * reads from it.
+   */
+  lazy val sharedConfiguration: Configuration = new Configuration()
 }

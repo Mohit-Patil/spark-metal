@@ -203,17 +203,20 @@ kernel void scatter_segments(
 // columns: a row survives only if every key column is non-null AND every key
 // column's code lookup yields a non-negative code.
 //
-// Codes: code_tables[k] is indexed in DICTIONARY-ID space -- the id plane's
-// int32 for column k, which is always a dictionary id because join-key columns
-// only ever arrive through parquetDecodePage and eligibility admits a key
-// column only when its chunk is dictionary-encoded. Each entry is either -1
-// (this key is not in the build side, so the row is dropped) or the column's
-// PREMULTIPLIED group component, so that group_id is simply the sum of the
-// per-column codes. Ids are therefore non-negative by construction: the
-// negative-identifier check below is a guard against a corrupt plane, NOT
-// support for value-space tables (raw column values, which may be negative,
-// are not a supported code-table index space). An index outside code_length[k]
-// is likewise treated as a non-member rather than read (a corrupt page or a
+// Codes: code_tables[k] is indexed by column k's id-plane int32, which is
+// either a dictionary id (a chunk decoded through parquetDecodePage's
+// dictionary path) or, since Task 6b, a raw non-negative key VALUE (a chunk
+// decoded through its PLAIN path) -- the kernel does not distinguish the two,
+// it just indexes. Each entry is either -1 (this key is not in the build
+// side, so the row is dropped) or the column's PREMULTIPLIED group component,
+// so that group_id is simply the sum of the per-column codes. This is safe
+// for value space with NO min offset: the JVM caller sizes code_tables[k] to
+// dimMaxKey + 1 and leaves every low, unpopulated entry -1, so a negative
+// fact-side value is still caught by the negative-identifier check below and
+// an out-of-domain fact-side value is still caught by the code_length[k]
+// bounds check next -- the same two guards that, for dictionary-id space,
+// defend only against a corrupt plane. An index outside code_length[k] is
+// likewise treated as a non-member rather than read (a corrupt page or a
 // mis-sized table must never read past the buffer).
 //
 // Factors: factor_tables[k], when factor_length[k] != 0, holds the

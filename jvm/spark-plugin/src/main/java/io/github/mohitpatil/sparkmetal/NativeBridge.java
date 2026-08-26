@@ -115,11 +115,20 @@ public final class NativeBridge {
 
     // Parses one decompressed V1 data page on the CPU and encodes its GPU
     // expansion into the stream (no wait). rowOffset is the first row of this
-    // page within the row group for this column.
+    // page within the row group for this column. isPlain (Task 6b) selects
+    // the value-section layout exactly as parquetDecodeMeasurePage infers
+    // Dictionary-vs-PLAIN from whether a dictionary was staged -- a key
+    // column has no staged dictionary state, so the caller (which already
+    // knows this chunk's dictionary-page presence) passes it explicitly:
+    // false decodes a dictionary-id hybrid stream into the key plane
+    // (dictionary-ID space, no materialization); true copies the page's
+    // literal packed int32 VALUES straight into the same key plane (value
+    // space). Either way the caller applies its own code table downstream,
+    // in parquetRowGroupAggregate, to whatever raw int32 lands here.
     public static native void parquetDecodePage(
             long streamHandle, long rowGroupHandle, int column,
             byte[] pageBytes, int pageLength, int valueCount, int rowOffset,
-            boolean hasDefLevels);
+            boolean hasDefLevels, boolean isPlain);
 
     // Stages a measure column's dictionary (the VALUES the dictionary ids
     // point at) onto the row group; a null array means the column is
@@ -177,19 +186,26 @@ public final class NativeBridge {
      * (parquetRowGroupRelease) or tear the whole stream down
      * (parquetAggregateStreamAbort), exactly as for parquetRowGroupCount.
      *
-     * <p>codes[k] is indexed in DICTIONARY-ID space: it maps column k's decoded
-     * int32 -- which is always a dictionary id, because join-key columns are
-     * only ever decoded by parquetDecodePage and ParquetEligibility admits a
-     * key column only when its chunk is dictionary-encoded -- to either -1,
-     * meaning the key is not a member and the row is dropped, or that column's
-     * PREMULTIPLIED group component, so the row's group id is the sum of the
-     * per-column codes. Value-space tables (a plane holding raw column values
-     * rather than ids) are NOT supported: dictionary ids are non-negative by
-     * construction, and the kernel treats a negative plane entry as a dropped
-     * row -- a defensive guard against a corrupt plane, not a value-space
-     * feature. factors[k] may be null (every key unique, multiplier 1) or an
-     * equally indexed table of POSITIVE duplicate-key multiplicities; the row's
-     * weight is the product across columns.
+     * <p>codes[k] is indexed in DICTIONARY-ID space, or in a dense
+     * NON-NEGATIVE VALUE space for a PLAIN-decoded key column (Task 6b): the
+     * kernel itself does not distinguish the two -- it simply indexes codes[k]
+     * by column k's decoded int32 (a dictionary id for a chunk decoded via
+     * parquetDecodePage's dictionary path, or the raw key value itself for a
+     * chunk decoded via its PLAIN path; see parquetDecodePage's isPlain
+     * argument) and maps that to either -1, meaning the key is not a member
+     * and the row is dropped, or that column's PREMULTIPLIED group component,
+     * so the row's group id is the sum of the per-column codes. This is safe
+     * for value space because the JVM caller sizes codes[k] to
+     * dimMaxKey + 1 (the dimension's own maximum join-key value) and never
+     * applies a min offset: a fact-side value below the table's populated
+     * range reads one of the -1-filled low entries, a fact-side value at or
+     * above dimMaxKey + 1 is caught by the kernel's existing
+     * `entry >= code_length` bounds check, and a negative fact-side value is
+     * caught by the kernel's existing sign check -- the same two guards that,
+     * for dictionary-id space, defend only against a corrupt plane. factors[k]
+     * may be null (every key unique, multiplier 1) or an equally indexed table
+     * of POSITIVE duplicate-key multiplicities; the row's weight is the
+     * product across columns.
      *
      * <p>aggKinds[a] is 0 for count(*), 1 for sum(measure), 2 for
      * count(measure); aggMeasureSlots[a] names the measure slot for kinds 1

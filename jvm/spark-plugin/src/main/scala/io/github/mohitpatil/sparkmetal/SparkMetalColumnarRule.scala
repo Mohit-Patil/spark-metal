@@ -57,9 +57,17 @@ final class SparkMetalColumnarRule(
    * structural matching (Task 1); this method is the eligibility gate on
    * top of a match: the feature flag, the kernel's join-count and internal-
    * aggregate-slot caps, [[GroupSpace]]'s supported group-key attribute
-   * types, and [[ParquetEligibility]] over both the join keys (dictionary
-   * required) and the measure columns (dictionary NOT required -- see
-   * `ParquetEligibility.checkMeasures`).
+   * types, and [[ParquetEligibility]] over both the join keys and the
+   * measure columns -- neither is required to be dictionary-encoded (Task
+   * 6b relaxed the join-key requirement to match the measure columns': PLAIN
+   * or dictionary, per chunk -- see `ParquetEligibility.checkKeys`/
+   * `checkMeasures`). A PLAIN join-key column carries one further
+   * obligation this planning-time gate cannot check: its dimension's
+   * join-key domain must fit the GPU decoder's value-space code table, a
+   * RUNTIME condition enforced by `MetalParquetGroupedAggregateExec.
+   * doExecute` once the dimension's rows are actually collected (violating
+   * it routes the whole operator through its CPU hash-join fallback, not a
+   * planning-time rejection).
    *
    * Ordered BEFORE [[replaceMembershipCount]]: `matchRegion` itself already
    * refuses a count-only, zero-group-key region (q96/q88/q90's shape), so
@@ -182,7 +190,7 @@ final class SparkMetalColumnarRule(
     }
     val files = region.scan.relation.location.inputFiles.toSeq
 
-    if (ParquetEligibility.check(files, keyColumnNames).isLeft) {
+    if (ParquetEligibility.checkKeys(files, keyColumnNames).isLeft) {
       return None
     }
     if (measureColumnNames.nonEmpty && ParquetEligibility.checkMeasures(files, measureColumnNames).isLeft) {

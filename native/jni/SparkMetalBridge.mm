@@ -1570,7 +1570,8 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetDecodePage(
     jint pageLength,
     jint valueCount,
     jint rowOffset,
-    jboolean hasDefLevels) {
+    jboolean hasDefLevels,
+    jboolean isPlain) {
     @autoreleasepool {
         if (expandValueRunsPipeline == nil || scatterSegmentsPipeline == nil || commandQueue == nil) {
             throwRuntime(environment, @"NativeBridge.initialize must be called first");
@@ -1606,7 +1607,8 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetDecodePage(
         }
 
         // pageLength + 4: expand_value_runs's 4-byte bit window may read up to
-        // 3 bytes past the payload; the tail is zeroed so that read is inert.
+        // 3 bytes past the payload (Dictionary pages only); the tail is
+        // zeroed so that read is inert. Harmless padding for Plain pages too.
         id<MTLBuffer> pageStaging = acquireStagingBuffer(stream, static_cast<size_t>(pageLength) + 4);
         if (pageStaging == nil) {
             throwRuntime(environment, @"Cannot allocate Parquet page staging buffer");
@@ -1618,18 +1620,45 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetDecodePage(
         if (environment->ExceptionCheck()) return;
         memset(pageContents + pageLength, 0, 4);
 
+        // Task 6b: isPlain selects the value-section layout exactly as
+        // parquetDecodeMeasurePage infers Dictionary-vs-PLAIN from whether a
+        // dictionary was staged -- a key column has no such staged state, so
+        // the JVM caller (which already knows this chunk's dictionary-page
+        // presence) passes it explicitly.
+        bool plain = isPlain == JNI_TRUE;
+        sparkmetal::PageValueEncoding encoding =
+            plain ? sparkmetal::PageValueEncoding::Plain : sparkmetal::PageValueEncoding::Dictionary;
+
         // One PageRuns per decoding thread, reused across pages: see
         // parseDataPageV1, which resets it in place and so keeps its capacity.
         static thread_local sparkmetal::PageRuns runs;
         bool parsed = sparkmetal::parseDataPageV1(
             pageContents, static_cast<size_t>(pageLength), static_cast<uint32_t>(valueCount),
-            hasDefLevels == JNI_TRUE, sparkmetal::PageValueEncoding::Dictionary, runs);
+            hasDefLevels == JNI_TRUE, encoding, runs);
         if (!parsed) {
             throwRuntime(environment, @"Unsupported Parquet page");
             return;
         }
-        if (runs.allValid && runs.items.empty()) {
-            // Zero-value page (valueCount == 0); nothing to expand.
+        // Structural sanity check, mirroring parquetDecodeMeasurePage's: this
+        // can only fail if the isPlain/encoding wiring above is broken by a
+        // future change, since runs.plain is set by parseDataPageV1 purely
+        // from `encoding`. It does NOT detect a column chunk that fell back
+        // from dictionary to PLAIN mid-chunk -- the JVM caller is responsible
+        // for checking each page's own Encoding against isPlain before
+        // calling this method (see MetalParquetGroupedAggregateExec.
+        // decodeKeyColumn).
+        if (runs.plain != plain) {
+            throwRuntime(environment, @"Parquet page encoding disagreement");
+            return;
+        }
+        if (!plain && runs.allValid && runs.items.empty()) {
+            // Zero-value Dictionary page (valueCount == 0); nothing to expand.
+            return;
+        }
+        if (plain && runs.nonNullCount == 0) {
+            // Zero-value PLAIN page: PLAIN pages never populate `items` (see
+            // ParquetPageRuns.h), so the Dictionary-only guard above cannot
+            // catch this case.
             return;
         }
         if (!runs.allValid && runs.segments.empty()) {
@@ -1639,125 +1668,221 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetDecodePage(
             return;
         }
 
-        // items can be empty here only when the whole page is null
-        // (nonNullCount == 0): scatter_segments still must run so the
-        // validity plane records those rows as null.
-        id<MTLBuffer> itemsBuffer = nil;
-        if (!runs.items.empty()) {
-            itemsBuffer = acquireStagingBuffer(
-                stream, runs.items.size() * sizeof(sparkmetal::ValueWorkItem));
-            if (itemsBuffer == nil) {
-                throwRuntime(environment, @"Cannot allocate Parquet work-item staging buffer");
-                return;
+        if (plain) {
+            // PLAIN key page: mirrors parquetDecodeMeasurePage's PLAIN branch
+            // exactly, targeting the KEY plane (rowGroup->ids/validity
+            // [column]) instead of a measure slot. A key column never
+            // materializes a dictionary at decode time -- the caller's code
+            // table (dictionary-id space OR, for a PLAIN chunk, value space)
+            // is applied downstream in parquetRowGroupAggregate to whatever
+            // raw int32 lands here -- so this never touches
+            // measureDictionary/dictionaryBuffer at all.
+            if (runs.allValid) {
+                // All-valid: the page already holds the literal packed int32
+                // values -- a blit copy on the row group's own command
+                // buffer, encoded strictly after beginRowGroupPlanes' pending
+                // zero-fill blit (a CPU memcpy here could race that
+                // still-uncommitted fill; see parquetDecodeMeasurePage's
+                // identical comment).
+                id<MTLBlitCommandEncoder> blit = rowGroupBlitEncoder(rowGroup);
+                if (blit == nil) {
+                    rowGroup->pendingStaging.push_back(pageStaging);
+                    throwRuntime(environment, @"Cannot open a Parquet row-group blit encoder");
+                    return;
+                }
+                [blit copyFromBuffer:pageStaging
+                         sourceOffset:runs.plainBytesOffset
+                             toBuffer:rowGroup->ids[column]
+                    destinationOffset:static_cast<NSUInteger>(rowOffset) * sizeof(int32_t)
+                                 size:static_cast<NSUInteger>(runs.nonNullCount) * sizeof(int32_t)];
+                [blit endEncoding];
+                rowGroup->pendingStaging.push_back(pageStaging);
+            } else {
+                rowGroup->columnHasNulls[column] = true;
+                size_t valuesBytes = std::max<size_t>(
+                    4, static_cast<size_t>(runs.nonNullCount) * sizeof(int32_t));
+                id<MTLBuffer> valuesBuffer = acquireStagingBuffer(stream, valuesBytes);
+                if (valuesBuffer == nil) {
+                    rowGroup->pendingStaging.push_back(pageStaging);
+                    throwRuntime(environment, @"Cannot allocate Parquet value-scratch staging buffer");
+                    return;
+                }
+                if (runs.nonNullCount > 0) {
+                    // The non-null values are already literal packed int32s
+                    // at plainBytesOffset -- copy them straight into
+                    // value-space scratch (CPU memcpy, no GPU decode needed);
+                    // scatter_segments below gathers them into row space
+                    // unmodified, exactly as for a Dictionary key column's
+                    // raw (non-materializing) ids.
+                    memcpy(valuesBuffer.contents, pageContents + runs.plainBytesOffset,
+                        static_cast<size_t>(runs.nonNullCount) * sizeof(int32_t));
+                }
+
+                id<MTLComputeCommandEncoder> encoder = rowGroupEncoder(rowGroup);
+                if (encoder == nil) {
+                    rowGroup->pendingStaging.push_back(pageStaging);
+                    rowGroup->pendingStaging.push_back(valuesBuffer);
+                    throwRuntime(environment, @"Cannot open a Parquet row-group compute encoder");
+                    return;
+                }
+
+                id<MTLBuffer> segmentsBuffer = acquireStagingBuffer(
+                    stream, runs.segments.size() * sizeof(sparkmetal::RowSegment));
+                if (segmentsBuffer == nil) {
+                    rowGroup->pendingStaging.push_back(pageStaging);
+                    rowGroup->pendingStaging.push_back(valuesBuffer);
+                    throwRuntime(environment, @"Cannot allocate Parquet segment staging buffer");
+                    return;
+                }
+                memcpy(segmentsBuffer.contents, runs.segments.data(),
+                    runs.segments.size() * sizeof(sparkmetal::RowSegment));
+
+                ScatterParams scatterParams = {
+                    static_cast<uint32_t>(runs.segments.size()),
+                    static_cast<uint32_t>(rowOffset),
+                    0u,
+                    0u
+                };
+                [encoder setComputePipelineState:scatterSegmentsPipeline];
+                [encoder setBuffer:valuesBuffer offset:0 atIndex:0];
+                [encoder setBuffer:segmentsBuffer offset:0 atIndex:1];
+                [encoder setBuffer:rowGroup->ids[column] offset:0 atIndex:2];
+                [encoder setBuffer:rowGroup->validity[column] offset:0 atIndex:3];
+                [encoder setBytes:&scatterParams length:sizeof(scatterParams) atIndex:4];
+                [encoder setBuffer:dummyDictionaryBuffer offset:0 atIndex:5];
+                [encoder dispatchThreadgroups:MTLSizeMake(runs.segments.size(), 1, 1)
+                         threadsPerThreadgroup:MTLSizeMake(
+                             sparkmetal::decodeThreadgroupWidth(runs.maxSegmentCount), 1, 1)];
+
+                rowGroup->pendingStaging.push_back(pageStaging);
+                rowGroup->pendingStaging.push_back(valuesBuffer);
+                rowGroup->pendingStaging.push_back(segmentsBuffer);
             }
-            memcpy(itemsBuffer.contents, runs.items.data(),
-                runs.items.size() * sizeof(sparkmetal::ValueWorkItem));
-        }
-
-        std::vector<id<MTLBuffer>> usedStaging = {pageStaging};
-        if (itemsBuffer != nil) usedStaging.push_back(itemsBuffer);
-
-        // Encode into the row group's shared, still-open command buffer rather
-        // than creating and committing one per page.
-        id<MTLComputeCommandEncoder> encoder = rowGroupEncoder(rowGroup);
-        if (encoder == nil) {
-            throwRuntime(environment, @"Cannot open a Parquet row-group compute encoder");
-            return;
-        }
-
-        if (runs.allValid) {
-            // allValid implies nonNullCount == valueCount > 0, so items is
-            // guaranteed non-empty by the guard above.
-            ExpandParams params = {
-                static_cast<uint32_t>(runs.items.size()),
-                runs.bitWidth,
-                runs.valueBytesOffset,
-                static_cast<uint32_t>(rowOffset),
-                0u,
-                0u
-            };
-            [encoder setComputePipelineState:expandValueRunsPipeline];
-            [encoder setBuffer:pageStaging offset:0 atIndex:0];
-            [encoder setBuffer:itemsBuffer offset:0 atIndex:1];
-            [encoder setBuffer:rowGroup->ids[column] offset:0 atIndex:2];
-            [encoder setBytes:&params length:sizeof(params) atIndex:3];
-            [encoder setBuffer:dummyDictionaryBuffer offset:0 atIndex:4];
-            [encoder dispatchThreadgroups:MTLSizeMake(runs.items.size(), 1, 1)
-                     threadsPerThreadgroup:MTLSizeMake(
-                         sparkmetal::decodeThreadgroupWidth(runs.maxItemCount), 1, 1)];
         } else {
-            rowGroup->columnHasNulls[column] = true;
-            size_t valuesBytes = std::max<size_t>(
-                4, static_cast<size_t>(runs.nonNullCount) * sizeof(int32_t));
-            id<MTLBuffer> valuesBuffer = acquireStagingBuffer(stream, valuesBytes);
-            if (valuesBuffer == nil) {
-                // Leave the encoder open: it belongs to the row group, and the
-                // caller's failure path (parquetRowGroupRelease, or
-                // Finish/Abort) closes and commits it. Hand over the staging
-                // already referenced by this page's dispatches so it is keyed
-                // to that commit rather than recycled early.
-                rowGroup->pendingStaging.insert(
-                    rowGroup->pendingStaging.end(), usedStaging.begin(), usedStaging.end());
-                throwRuntime(environment, @"Cannot allocate Parquet value-scratch staging buffer");
+            // Dictionary key page: unchanged from before Task 6b.
+
+            // items can be empty here only when the whole page is null
+            // (nonNullCount == 0): scatter_segments still must run so the
+            // validity plane records those rows as null.
+            id<MTLBuffer> itemsBuffer = nil;
+            if (!runs.items.empty()) {
+                itemsBuffer = acquireStagingBuffer(
+                    stream, runs.items.size() * sizeof(sparkmetal::ValueWorkItem));
+                if (itemsBuffer == nil) {
+                    throwRuntime(environment, @"Cannot allocate Parquet work-item staging buffer");
+                    return;
+                }
+                memcpy(itemsBuffer.contents, runs.items.data(),
+                    runs.items.size() * sizeof(sparkmetal::ValueWorkItem));
+            }
+
+            std::vector<id<MTLBuffer>> usedStaging = {pageStaging};
+            if (itemsBuffer != nil) usedStaging.push_back(itemsBuffer);
+
+            // Encode into the row group's shared, still-open command buffer
+            // rather than creating and committing one per page.
+            id<MTLComputeCommandEncoder> encoder = rowGroupEncoder(rowGroup);
+            if (encoder == nil) {
+                throwRuntime(environment, @"Cannot open a Parquet row-group compute encoder");
                 return;
             }
-            usedStaging.push_back(valuesBuffer);
 
-            if (itemsBuffer != nil) {
-                ExpandParams expandParams = {
+            if (runs.allValid) {
+                // allValid implies nonNullCount == valueCount > 0, so items is
+                // guaranteed non-empty by the guard above.
+                ExpandParams params = {
                     static_cast<uint32_t>(runs.items.size()),
                     runs.bitWidth,
                     runs.valueBytesOffset,
-                    0u,
+                    static_cast<uint32_t>(rowOffset),
                     0u,
                     0u
                 };
                 [encoder setComputePipelineState:expandValueRunsPipeline];
                 [encoder setBuffer:pageStaging offset:0 atIndex:0];
                 [encoder setBuffer:itemsBuffer offset:0 atIndex:1];
-                [encoder setBuffer:valuesBuffer offset:0 atIndex:2];
-                [encoder setBytes:&expandParams length:sizeof(expandParams) atIndex:3];
+                [encoder setBuffer:rowGroup->ids[column] offset:0 atIndex:2];
+                [encoder setBytes:&params length:sizeof(params) atIndex:3];
                 [encoder setBuffer:dummyDictionaryBuffer offset:0 atIndex:4];
                 [encoder dispatchThreadgroups:MTLSizeMake(runs.items.size(), 1, 1)
                          threadsPerThreadgroup:MTLSizeMake(
                              sparkmetal::decodeThreadgroupWidth(runs.maxItemCount), 1, 1)];
+            } else {
+                rowGroup->columnHasNulls[column] = true;
+                size_t valuesBytes = std::max<size_t>(
+                    4, static_cast<size_t>(runs.nonNullCount) * sizeof(int32_t));
+                id<MTLBuffer> valuesBuffer = acquireStagingBuffer(stream, valuesBytes);
+                if (valuesBuffer == nil) {
+                    // Leave the encoder open: it belongs to the row group, and
+                    // the caller's failure path (parquetRowGroupRelease, or
+                    // Finish/Abort) closes and commits it. Hand over the
+                    // staging already referenced by this page's dispatches so
+                    // it is keyed to that commit rather than recycled early.
+                    rowGroup->pendingStaging.insert(
+                        rowGroup->pendingStaging.end(), usedStaging.begin(), usedStaging.end());
+                    throwRuntime(environment, @"Cannot allocate Parquet value-scratch staging buffer");
+                    return;
+                }
+                usedStaging.push_back(valuesBuffer);
+
+                if (itemsBuffer != nil) {
+                    ExpandParams expandParams = {
+                        static_cast<uint32_t>(runs.items.size()),
+                        runs.bitWidth,
+                        runs.valueBytesOffset,
+                        0u,
+                        0u,
+                        0u
+                    };
+                    [encoder setComputePipelineState:expandValueRunsPipeline];
+                    [encoder setBuffer:pageStaging offset:0 atIndex:0];
+                    [encoder setBuffer:itemsBuffer offset:0 atIndex:1];
+                    [encoder setBuffer:valuesBuffer offset:0 atIndex:2];
+                    [encoder setBytes:&expandParams length:sizeof(expandParams) atIndex:3];
+                    [encoder setBuffer:dummyDictionaryBuffer offset:0 atIndex:4];
+                    [encoder dispatchThreadgroups:MTLSizeMake(runs.items.size(), 1, 1)
+                             threadsPerThreadgroup:MTLSizeMake(
+                                 sparkmetal::decodeThreadgroupWidth(runs.maxItemCount), 1, 1)];
+                }
+
+                id<MTLBuffer> segmentsBuffer = acquireStagingBuffer(
+                    stream, runs.segments.size() * sizeof(sparkmetal::RowSegment));
+                if (segmentsBuffer == nil) {
+                    rowGroup->pendingStaging.insert(
+                        rowGroup->pendingStaging.end(), usedStaging.begin(), usedStaging.end());
+                    throwRuntime(environment, @"Cannot allocate Parquet segment staging buffer");
+                    return;
+                }
+                memcpy(segmentsBuffer.contents, runs.segments.data(),
+                    runs.segments.size() * sizeof(sparkmetal::RowSegment));
+                usedStaging.push_back(segmentsBuffer);
+
+                ScatterParams scatterParams = {
+                    static_cast<uint32_t>(runs.segments.size()),
+                    static_cast<uint32_t>(rowOffset),
+                    0u,
+                    0u
+                };
+                [encoder setComputePipelineState:scatterSegmentsPipeline];
+                [encoder setBuffer:valuesBuffer offset:0 atIndex:0];
+                [encoder setBuffer:segmentsBuffer offset:0 atIndex:1];
+                [encoder setBuffer:rowGroup->ids[column] offset:0 atIndex:2];
+                [encoder setBuffer:rowGroup->validity[column] offset:0 atIndex:3];
+                [encoder setBytes:&scatterParams length:sizeof(scatterParams) atIndex:4];
+                [encoder setBuffer:dummyDictionaryBuffer offset:0 atIndex:5];
+                [encoder dispatchThreadgroups:MTLSizeMake(runs.segments.size(), 1, 1)
+                         threadsPerThreadgroup:MTLSizeMake(
+                             sparkmetal::decodeThreadgroupWidth(runs.maxSegmentCount), 1, 1)];
             }
 
-            id<MTLBuffer> segmentsBuffer = acquireStagingBuffer(
-                stream, runs.segments.size() * sizeof(sparkmetal::RowSegment));
-            if (segmentsBuffer == nil) {
-                rowGroup->pendingStaging.insert(
-                    rowGroup->pendingStaging.end(), usedStaging.begin(), usedStaging.end());
-                throwRuntime(environment, @"Cannot allocate Parquet segment staging buffer");
-                return;
-            }
-            memcpy(segmentsBuffer.contents, runs.segments.data(),
-                runs.segments.size() * sizeof(sparkmetal::RowSegment));
-            usedStaging.push_back(segmentsBuffer);
-
-            ScatterParams scatterParams = {
-                static_cast<uint32_t>(runs.segments.size()),
-                static_cast<uint32_t>(rowOffset),
-                0u,
-                0u
-            };
-            [encoder setComputePipelineState:scatterSegmentsPipeline];
-            [encoder setBuffer:valuesBuffer offset:0 atIndex:0];
-            [encoder setBuffer:segmentsBuffer offset:0 atIndex:1];
-            [encoder setBuffer:rowGroup->ids[column] offset:0 atIndex:2];
-            [encoder setBuffer:rowGroup->validity[column] offset:0 atIndex:3];
-            [encoder setBytes:&scatterParams length:sizeof(scatterParams) atIndex:4];
-            [encoder setBuffer:dummyDictionaryBuffer offset:0 atIndex:5];
-            [encoder dispatchThreadgroups:MTLSizeMake(runs.segments.size(), 1, 1)
-                     threadsPerThreadgroup:MTLSizeMake(
-                         sparkmetal::decodeThreadgroupWidth(runs.maxSegmentCount), 1, 1)];
+            // No endEncoding / commit here: the encoder stays open for the
+            // next page. The staging this page's dispatches read is parked on
+            // the row group and keyed to its command buffer when
+            // commitRowGroup runs.
+            rowGroup->pendingStaging.insert(
+                rowGroup->pendingStaging.end(), usedStaging.begin(), usedStaging.end());
         }
 
-        // No endEncoding / commit here: the encoder stays open for the next
-        // page. The staging this page's dispatches read is parked on the row
-        // group and keyed to its command buffer when commitRowGroup runs.
-        rowGroup->pendingStaging.insert(
-            rowGroup->pendingStaging.end(), usedStaging.begin(), usedStaging.end());
         if (++rowGroup->pagesSinceCommit >= kPagesPerCommit) {
             commitRowGroup(rowGroup);
         }

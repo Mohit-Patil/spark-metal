@@ -135,7 +135,7 @@ object ParquetDecodeSmoke {
 
                 NativeBridge.parquetDecodePage(
                   streamHandle, rowGroupHandle, columnIndex,
-                  pageBytes, pageBytes.length, valueCount, rowOffset, hasDefLevels)
+                  pageBytes, pageBytes.length, valueCount, rowOffset, hasDefLevels, /* isPlain = */ false)
 
                 rowOffset += valueCount
                 rawPage = pageReader.readPage()
@@ -293,7 +293,7 @@ object ParquetDecodeSmoke {
                 val valueCount = dataPage.getValueCount
                 NativeBridge.parquetDecodePage(
                   countStreamHandle, rowGroupHandle, columnIndex,
-                  pageBytes, pageBytes.length, valueCount, rowOffset, hasDefLevels)
+                  pageBytes, pageBytes.length, valueCount, rowOffset, hasDefLevels, /* isPlain = */ false)
                 rowOffset += valueCount
                 rawPage = pageReader.readPage()
               }
@@ -872,7 +872,8 @@ object ParquetDecodeSmoke {
                 val pageBytes = dataPage.getBytes.toByteArray
                 NativeBridge.parquetDecodePage(
                   streamHandle, rowGroupHandle, columnIndex,
-                  pageBytes, pageBytes.length, dataPage.getValueCount, rowOffset, hasDefLevels)
+                  pageBytes, pageBytes.length, dataPage.getValueCount, rowOffset, hasDefLevels,
+                  /* isPlain = */ false)
                 rowOffset += dataPage.getValueCount
                 rawPage = pageReader.readPage()
               }
@@ -1207,14 +1208,16 @@ object ParquetDecodeSmoke {
       // A second file whose cat_key is near-unique (raw id, offset well
       // past the dimension's real key range) for ~99% of rows -- same
       // trick as writeDictionaryOverflowDataset -- so parquet-mr abandons
-      // the dictionary for it. decodeKeyColumn's dictionaryPage == null
-      // check then throws for every row group of this file, driving it
-      // through the per-row-group CPU fallback. Every 100th row is
-      // deliberately a REAL match (cat_key/region_key both drawn from the
-      // dimensions' actual key sets) so aggregateRowGroupOnCpu's
-      // arithmetic (group id, factor, null-aware sum/count) is genuinely
-      // exercised on CPU -- not just its "every row is a non-member"
-      // branch, which a file that matches nothing at all would only cover.
+      // the dictionary for it. Before Task 6b, decodeKeyColumn's
+      // dictionaryPage == null check threw for every row group of this
+      // file, driving it through the per-row-group CPU fallback; Task 6b's
+      // PLAIN key path now decodes it on the GPU instead (see Case B below).
+      // Every 100th row is deliberately a REAL match (cat_key/region_key
+      // both drawn from the dimensions' actual key sets) so the GPU's
+      // value-space code table -- both its populated entries AND its
+      // -1-filled non-member entries for the other ~99% of (out-of-range)
+      // ids -- is genuinely exercised, not just a file that matches nothing
+      // at all.
       val overflowPath = tempDir.resolve("data-overflow").toString
       val hadoopConf = spark.sparkContext.hadoopConfiguration
       val previousDictionarySize = hadoopConf.get("parquet.dictionary.page.size")
@@ -1386,13 +1389,34 @@ object ParquetDecodeSmoke {
       // ran (not just that the final answer happened to match).
       compare("main", Seq(mainFile), catDim, regionDim, exactCpuFallback = Some(0))
 
-      // Case B: main + a dictionary-overflow file -- per-row-group CPU
-      // fallback (cpuFallbackRowGroups >= 1), combined result still exact.
-      // requireGpuCpuMix proves this is a genuine MIX (mainFile's row group
-      // still GPU-successful), not every row group silently falling back.
+      // Case B: main + a dictionary-overflow file. Before Task 6b, cat_key's
+      // dictionary-less chunk in overflowFile made decodeKeyColumn throw
+      // ("has no dictionary page"), driving that file's row group through
+      // the per-row-group CPU fallback while mainFile's stayed GPU-
+      // successful (a genuine mix). Task 6b's whole point is that this no
+      // longer happens: decodeKeyColumn now decodes a key column with no
+      // dictionary page via the PLAIN path into a dense VALUE-space code
+      // table, so overflowFile's row group ALSO succeeds on the GPU --
+      // exactCpuFallback = 0 proves exactly that (this is the operator-level
+      // analogue of the real q3/ss_item_sk recovery the TPC-DS smoke
+      // exercises). The combined result is still exact either way, but this
+      // now demonstrates the value-space table's own membership filtering
+      // genuinely running on the GPU: only every 100th row of overflowFile
+      // (id % 100 == 0) carries a cat_key/region_key drawn from the
+      // dimensions' real key range -- the other ~99% are non-members (raw
+      // ids offset past dimMaxKey, or simply absent from codesByKey), and
+      // must fall out via the kernel's existing bounds/sign checks, not a
+      // CPU recompute. (The per-row-group CPU fallback path itself --
+      // aggregateRowGroupOnCpu -- is still real code, reachable from other
+      // decode failures such as an unsupported page type; this dataset no
+      // longer forces it for a KEY column specifically. Coverage of the
+      // dictionary-required version of this same trick lives on in "exec"
+      // mode's identically-named case, which drives
+      // MetalParquetMembershipCountExec -- a different operator whose key
+      // decode Task 6b did not touch.)
       compare(
-        "dictionary-overflow-cpu-fallback", Seq(mainFile, overflowFile), catDim, regionDim,
-        minCpuFallback = Some(1), requireGpuCpuMix = true)
+        "dictionary-overflow-plain-recovered-on-gpu", Seq(mainFile, overflowFile), catDim, regionDim,
+        exactCpuFallback = Some(0))
 
       // Case C: cat_key = 1 appears TWICE in the (attributed) catDim with
       // DIFFERENT attribute tuples -- GroupSpace.build rejects this

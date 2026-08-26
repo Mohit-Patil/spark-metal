@@ -311,7 +311,7 @@ case class MetalParquetMembershipCountExec(
       val submitStarted = System.nanoTime()
       NativeBridge.parquetDecodePage(
         streamHandle, rowGroupHandle, ordinal,
-        pageBytes, pageBytes.length, valueCount, rowOffset, hasDefLevels)
+        pageBytes, pageBytes.length, valueCount, rowOffset, hasDefLevels, /* isPlain = */ false)
       submitNanos(0) += System.nanoTime() - submitStarted
       onPageDecoded()
       rowOffset += valueCount

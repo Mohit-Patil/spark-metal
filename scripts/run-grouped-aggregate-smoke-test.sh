@@ -7,32 +7,36 @@ repo_root="$(cd "${script_dir}/.." && pwd)"
 # shellcheck source=project-env.sh
 source "${script_dir}/project-env.sh"
 
-# Default grouped-aggregate query: q31 (partial Sum over a date_dim/
+# Default grouped-aggregate queries: q31 (partial Sum over a date_dim/
 # customer_address star-join, keyed on ss_addr_sk/ss_sold_date_sk, grouped on
-# dimension attributes). q96: the existing count-only, zero-group-key region
-# -- matchRegion rejects this shape outright, so it must keep planning
-# MetalParquetMembershipCount, never MetalParquetGroupedAggregate. Both sets
-# are run through the SAME CPU/Metal comparison so a single comparison.json
-# carries every result_match.
+# dimension attributes) and q3 (partial Sum over a date_dim/item star-join,
+# keyed on ss_sold_date_sk/ss_item_sk). q96: the existing count-only,
+# zero-group-key region -- matchRegion rejects this shape outright, so it
+# must keep planning MetalParquetMembershipCount, never
+# MetalParquetGroupedAggregate. Both sets are run through the SAME CPU/Metal
+# comparison so a single comparison.json carries every result_match.
 #
-# NOT q3/q52 (the task brief's originally-named demonstration queries):
-# both join store_sales to item on ss_item_sk, and ss_item_sk is PLAIN-
-# encoded -- not dictionary-encoded -- across every one of the 30
-# store_sales files in benchmark-data/tpcds-sf10-parquet (verified via
-# `scripts/inspect-parquet-encodings.sh "" ss_item_sk`; SF10's item table has
-# ~204K distinct values, enough to overflow a row group's dictionary page).
-# The native decoder requires join/group keys to be dictionary-encoded
-# (MetalParquetGroupedAggregateExec.decodeKeyColumn), so ParquetEligibility.
-# check() correctly and permanently rejects q3/q52 against this dataset --
-# NonFatal-safe fallback to a vanilla HashAggregateExec, not a bug. This is a
-# real data-generation characteristic of the current SF10 Parquet files, not
-# a planner defect: ss_addr_sk/ss_store_sk/ss_customer_sk/ss_sold_date_sk are
-# all dictionary-encoded across every file, which is why q31 (and other
-# non-item-joining star queries) still demonstrate the operator end-to-end.
-# Override via TPCDS_QUERIES to re-check q3/q52 once that is addressed
-# (regenerating the dataset with a larger dictionary page size, or relaxing
-# the native decoder's key-dictionary requirement) -- see task-6-report.md.
-grouped_queries="${TPCDS_QUERIES:-q31}"
+# q3 is the task brief's originally-named demonstration query, and was
+# excluded here until Task 6b: it joins store_sales to item on ss_item_sk,
+# and ss_item_sk is PLAIN-encoded -- not dictionary-encoded -- across every
+# one of the 30 store_sales files in benchmark-data/tpcds-sf10-parquet
+# (verified via `scripts/inspect-parquet-encodings.sh "" ss_item_sk`; SF10's
+# item table has ~204K distinct values, enough to overflow a row group's
+# dictionary page). Task 6 (see task-6-report.md) required join/group keys to
+# be dictionary-encoded, so this query permanently fell back to a vanilla
+# HashAggregateExec on this dataset. Task 6b (see task-6b-report.md) relaxed
+# that requirement to admit PLAIN key chunks via dense VALUE-space code
+# tables, recovering q3 (and, per Task 1's ELIGIBLE list, most of the other
+# item-keyed queries this tier targets): it is asserted below not just for
+# result_match and the operator's presence in the plan, but for
+# cpuFallbackRowGroups == 0 -- proof the PLAIN ss_item_sk chunks decoded and
+# aggregated entirely on the GPU, not via the operator's per-row-group CPU
+# fallback.
+grouped_queries="${TPCDS_QUERIES:-q31,q3}"
+# Grouped queries whose accelerator_metrics must show zero per-row-group CPU
+# fallback -- proof a PLAIN key chunk (not just a dictionary one) ran end to
+# end on the GPU. See the q3 comment above.
+zero_fallback_queries="${TPCDS_ZERO_FALLBACK_QUERIES:-q3}"
 # q96/q88/q90: all three are the existing count-only, zero-group-key shape
 # -- matchRegion rejects this shape outright (before any ParquetEligibility
 # work), so they must keep planning the existing membership operators, never
@@ -78,13 +82,14 @@ TPCDS_RESULT_DIR="${aqe_root}" \
   --queries "${grouped_queries}" --warmups "${warmups}" --runs "${runs}"
 
 python3 - "${comparison_root}/comparison.json" "${comparison_root}/cpu/summary.json" \
-  "${comparison_root}/metal" "${disabled_root}" "${aqe_root}" "${grouped_queries}" "${boundary_queries}" <<'PYTHON'
+  "${comparison_root}/metal" "${disabled_root}" "${aqe_root}" "${grouped_queries}" "${boundary_queries}" \
+  "${zero_fallback_queries}" <<'PYTHON'
 import json
 import sys
 from pathlib import Path
 
 (comparison_path, cpu_summary_path, metal_dir, disabled_dir, aqe_dir,
- grouped_csv, boundary_csv) = sys.argv[1:8]
+ grouped_csv, boundary_csv, zero_fallback_csv) = sys.argv[1:9]
 
 with open(comparison_path, encoding="utf-8") as source:
     comparison = json.load(source)
@@ -100,6 +105,7 @@ disabled_dir = Path(disabled_dir)
 aqe_dir = Path(aqe_dir)
 grouped_queries = [name for name in grouped_csv.split(",") if name]
 boundary_queries = [name for name in boundary_csv.split(",") if name]
+zero_fallback_queries = {name for name in zero_fallback_csv.split(",") if name}
 
 def result_key(summary, name):
     entry = summary["queries"][name]
@@ -152,6 +158,24 @@ for name in grouped_queries:
         "aqe_plan_is_vanilla": True,
         "aqe_result_matches_cpu": True,
     }
+
+    if name in zero_fallback_queries:
+        # Task 6b: proves a PLAIN-encoded key chunk (e.g. q3's ss_item_sk)
+        # decoded and aggregated entirely on the GPU, via the operator's own
+        # cpuFallbackRowGroups metric -- not just that the plan carries
+        # MetalParquetGroupedAggregate (which a plan running entirely via the
+        # per-row-group CPU fallback would also show).
+        # nodeName() strips the "Exec" suffix (same reason the plan-text
+        # checks above look for "MetalParquetGroupedAggregate", not
+        # "...Exec") -- accelerator_metrics is keyed the same way.
+        node_metrics = result.get("accelerator_metrics", {}).get("MetalParquetGroupedAggregate", {})
+        cpu_fallback_row_groups = node_metrics.get("cpuFallbackRowGroups")
+        if cpu_fallback_row_groups != 0:
+            raise SystemExit(
+                f"{name}: expected cpuFallbackRowGroups == 0 (PLAIN key decode entirely on the GPU), "
+                f"got {cpu_fallback_row_groups} (accelerator_metrics={result.get('accelerator_metrics')})"
+            )
+        report[name]["cpu_fallback_row_groups"] = cpu_fallback_row_groups
 
 for name in boundary_queries:
     result = comparison["queries"].get(name)

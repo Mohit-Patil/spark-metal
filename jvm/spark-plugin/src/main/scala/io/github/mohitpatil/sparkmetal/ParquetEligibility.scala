@@ -48,14 +48,17 @@ private[sparkmetal] final class BoundedCache[K, V](maxEntries: Int) {
 object ParquetEligibility {
   private val SupportedEncodings: Set[Encoding] = Set(
     Encoding.RLE, Encoding.BIT_PACKED, Encoding.PLAIN_DICTIONARY, Encoding.RLE_DICTIONARY)
-  // Measures (checkMeasures, requireDictionary = false) may additionally be
-  // PLAIN-encoded -- MetalParquetGroupedAggregateExec.decodeMeasureColumn
-  // explicitly supports a PLAIN value chunk for a measure column (no
-  // dictionary page at all), unlike a join/group key, which the GPU decode
-  // path always requires in dictionary-id space. Without this, a genuinely
-  // PLAIN-encoded measure chunk would fail the general encoding-support
-  // filter below even though `requireDictionary = false` was meant to admit
-  // exactly this case.
+  // requireDictionary = false (checkMeasures) columns may additionally be
+  // PLAIN-encoded. Originally added for grouped-aggregate MEASURE columns --
+  // MetalParquetGroupedAggregateExec.decodeMeasureColumn explicitly supports
+  // a PLAIN value chunk for a measure column (no dictionary page at all) --
+  // and extended by Task 6b to grouped-aggregate JOIN/GROUP-KEY columns too:
+  // decodeKeyColumn now decodes a PLAIN key chunk through the same
+  // mechanism, building a dense VALUE-space code table (indexed by raw key
+  // value, not dictionary id) instead of translating a dictionary. Without
+  // this, a genuinely PLAIN-encoded chunk would fail the general
+  // encoding-support filter below even though `requireDictionary = false`
+  // was meant to admit exactly this case.
   private val SupportedMeasureEncodings: Set[Encoding] = SupportedEncodings + Encoding.PLAIN
   private val SupportedCodecs: Set[CompressionCodecName] = Set(
     CompressionCodecName.SNAPPY, CompressionCodecName.UNCOMPRESSED)
@@ -114,13 +117,31 @@ object ParquetEligibility {
   /**
    * Relaxed variant for Task 6's grouped-aggregate MEASURE columns. A
    * measure column feeds the GPU decode path's PLAIN-or-dictionary measure
-   * decoder (unlike a join/group key, which the GPU path always decodes
-   * through a dictionary -- see `MetalParquetGroupedAggregateExec.
-   * decodeMeasureColumn`), so it is not required to be dictionary-encoded.
-   * Everything else `check` validates -- INT32 primitive type, nesting, and
-   * codec/encoding support -- still applies.
+   * decoder (see `MetalParquetGroupedAggregateExec.decodeMeasureColumn`), so
+   * it is not required to be dictionary-encoded. Everything else `check`
+   * validates -- INT32 primitive type, nesting, and codec/encoding support
+   * -- still applies.
    */
   def checkMeasures(paths: Seq[String], columnNames: Seq[String]): Either[String, Unit] =
+    checkColumns(paths, columnNames, requireDictionary = false)
+
+  /**
+   * Relaxed variant for Task 6b's grouped-aggregate JOIN/GROUP-KEY columns.
+   * `decodeKeyColumn` decodes a key chunk with no dictionary page through the
+   * same PLAIN mechanism `decodeMeasureColumn` uses, building a dense
+   * VALUE-space code table (raw key value -> code) instead of translating a
+   * dictionary -- so, exactly like a measure column, a key column is not
+   * required to be dictionary-encoded here. (A PLAIN key column carries one
+   * further runtime obligation this planning-time check cannot see: its
+   * dimension's join-key domain must fit the value-space table's bound --
+   * see `MetalParquetGroupedAggregateExec`'s domain guard, enforced in
+   * `doExecute` once the dimension's rows are actually collected.) Identical
+   * body to `checkMeasures` today -- kept as a separate, intention-revealing
+   * name for the two call sites (join keys vs. measures) rather than an
+   * alias, since the two columns kinds are conceptually distinct even though
+   * their encoding requirements currently coincide.
+   */
+  def checkKeys(paths: Seq[String], columnNames: Seq[String]): Either[String, Unit] =
     checkColumns(paths, columnNames, requireDictionary = false)
 
   private def checkColumns(

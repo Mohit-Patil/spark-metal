@@ -51,12 +51,17 @@ private[sparkmetal] case class AggSlotMapping(function: String, sumSlot: Int, co
 /**
  * Drives the GPU Parquet key+measure decode (Task 2) and the grouped
  * aggregation kernel (Task 3) per (file, row group), accumulating into one
- * per-partition partial table per [[GroupSpace]]-assigned group. Falls back
- * to a CPU parquet-mr aggregation for any row group the native decoder
- * rejects, and to a whole-operator CPU hash-join + hash-aggregate when
- * [[GroupSpace.build]] itself cannot represent the dimensions' cross product
- * (an oversized group space, or a duplicate join key in an attributed
- * dimension -- see `executeWholeOperatorCpuFallback`). Planned by
+ * per-partition partial table per [[GroupSpace]]-assigned group. Key columns
+ * decode either through a dictionary (dictionary-id-space code tables) or,
+ * since Task 6b, PLAIN (dense value-space code tables) -- per chunk, not per
+ * operator (see `decodeKeyColumn`). Falls back to a CPU parquet-mr
+ * aggregation for any row group the native decoder rejects, and to a
+ * whole-operator CPU hash-join + hash-aggregate when [[GroupSpace.build]]
+ * itself cannot represent the dimensions' cross product (an oversized group
+ * space, or a duplicate join key in an attributed dimension), or when a
+ * PLAIN-eligible dimension's join-key domain does not fit a value-space
+ * code table (`MaxValueSpaceKey`) -- see `doExecute`'s domain guard and
+ * `executeWholeOperatorCpuFallback`. Planned by
  * [[SparkMetalColumnarRule]] in place of a partial [[org.apache.spark.sql.execution.aggregate.HashAggregateExec]]
  * (Task 6); also driven directly by ParquetDecodeSmoke's "agg-exec" mode for
  * operator-level testing.
@@ -137,16 +142,62 @@ case class MetalParquetGroupedAggregateExec(
       s"outputAttributes has ${outputAttributes.length} columns, expected $expectedOutputColumns " +
         s"(${groupKeyDimensionIndex.length} group keys + ${aggSpecs.length} aggregates)")
 
-    val builtEither: Either[String, GroupSpace.Built] =
-      GroupSpace.build(dimensions, maxGroups = 1 << 20).flatMap { built =>
-        val estimatedBytes = built.groupCount.toLong * internalAggCount.toLong * 16L
-        if (estimatedBytes > 64L * 1024 * 1024) {
-          Left(s"group space memory estimate $estimatedBytes bytes (groups=${built.groupCount}, " +
-            s"internalAggs=$internalAggCount) exceeds the 64MB budget")
-        } else {
-          Right(built)
+    // Task 6b: a PLAIN-decoded key chunk decodes straight into VALUE space
+    // (decodeKeyColumn) -- the JVM builds that dimension's code/factor tables
+    // sized `dimMaxKey + 1` and indexed by the raw join-key value itself, with
+    // NO min offset (see NativeBridge.parquetRowGroupAggregate's Javadoc: a
+    // fact value below the table's populated range simply reads one of the
+    // -1-filled low entries). That is only safe/bounded when every dimension's
+    // join-key domain is non-negative and small enough to keep the table
+    // within the kernel's practical size budget -- checked here, once, from
+    // the SAME collected rows `GroupSpace.build` is about to consume, for
+    // EVERY dimension (not just ones a footer inspection would show as
+    // PLAIN today: a column can be dictionary-encoded in some files and
+    // PLAIN in others -- see decodeKeyColumn -- so the bound must hold
+    // whenever a dimension's chunk MIGHT decode through the PLAIN path).
+    // Violating it is a runtime data condition, not a planning defect (the
+    // rule's eligibility gate has no access to these rows), so -- exactly
+    // like GroupSpace.build itself failing -- it routes the whole operator
+    // through the CPU hash-join fallback below rather than throwing.
+    val keyDomains: Seq[Option[(Int, Int)]] = dimensions.map { dimension =>
+      if (dimension.rows.isEmpty) {
+        None
+      } else {
+        var min = Int.MaxValue
+        var max = Int.MinValue
+        dimension.rows.foreach { case (key, _) =>
+          if (key < min) min = key
+          if (key > max) max = key
         }
+        Some((min, max))
       }
+    }
+    val domainViolation: Option[String] = keyDomains.zipWithIndex.collectFirst {
+      case (Some((min, max)), index)
+          if min < 0 || max > MetalParquetGroupedAggregateExec.MaxValueSpaceKey =>
+        s"key column ${keyColumnNames(index)}: join-key domain [$min, $max] falls outside the " +
+          s"value-space code table's supported range [0, ${MetalParquetGroupedAggregateExec.MaxValueSpaceKey}]"
+    }
+    // dimMaxKeys(k) sizes dimension k's PLAIN value-space table lazily, the
+    // first time decodeKeyColumn actually encounters a PLAIN chunk for
+    // column k (executeWithGroupSpace); -1 for an empty dimension (never
+    // dereferenced -- GroupSpace.build already fails a truly empty dimension
+    // before this would matter).
+    val dimMaxKeys: Array[Int] = keyDomains.map(_.map(_._2).getOrElse(-1)).toArray
+
+    val builtEither: Either[String, GroupSpace.Built] = domainViolation match {
+      case Some(reason) => Left(reason)
+      case None =>
+        GroupSpace.build(dimensions, maxGroups = 1 << 20).flatMap { built =>
+          val estimatedBytes = built.groupCount.toLong * internalAggCount.toLong * 16L
+          if (estimatedBytes > 64L * 1024 * 1024) {
+            Left(s"group space memory estimate $estimatedBytes bytes (groups=${built.groupCount}, " +
+              s"internalAggs=$internalAggCount) exceeds the 64MB budget")
+          } else {
+            Right(built)
+          }
+        }
+    }
 
     val numGroups = longMetric("numGroups")
 
@@ -154,8 +205,8 @@ case class MetalParquetGroupedAggregateExec(
       case Right(built) =>
         numGroups += built.groupCount
         executeWithGroupSpace(
-          built, dimensionAttributeTypes, aggKinds, aggMeasureSlots, aggSlotMappings, occupancySlot,
-          internalAggCount)
+          built, dimensionAttributeTypes, dimMaxKeys, aggKinds, aggMeasureSlots, aggSlotMappings,
+          occupancySlot, internalAggCount)
       // An unsupported dimension attribute type is a planning defect, not a
       // runtime data condition: GroupedAggregateShape/Task 6's matcher is
       // expected to reject any such region before this operator is ever
@@ -241,6 +292,7 @@ case class MetalParquetGroupedAggregateExec(
   private def executeWithGroupSpace(
       built: GroupSpace.Built,
       dimensionAttributeTypes: Seq[Seq[DataType]],
+      dimMaxKeys: Array[Int],
       aggKinds: Array[Int],
       aggMeasureSlots: Array[Int],
       aggSlotMappings: Seq[AggSlotMapping],
@@ -272,6 +324,17 @@ case class MetalParquetGroupedAggregateExec(
             allColumnDescriptors(file, opened.getFooter.getFileMetaData.getSchema).asJava)
           opened
         })
+
+      // PLAIN value-space code/factor tables (Task 6b), one slot per key
+      // column, built lazily by decodeKeyColumn the first time this
+      // partition actually decodes a PLAIN chunk for that column, and reused
+      // for every subsequent row group: unlike a dictionary chunk's
+      // per-row-group translation (which depends on THAT file's dictionary),
+      // a PLAIN column's value-space table depends only on the dimension's
+      // own data (built.codesByKey(k)/factorsByKey(k), fixed for the whole
+      // operator), so building it once per partition avoids repeating a
+      // dimMaxKeys(k)-sized allocation and fill for every row group.
+      val plainValueSpaceTables = new Array[(Array[Int], Array[Int])](keyColumnNames.length)
 
       var localRowGroups = 0L
       var localPages = 0L
@@ -321,7 +384,8 @@ case class MetalParquetGroupedAggregateExec(
                 for (k <- keyColumnNames.indices) {
                   val (codes, factors) = decodeKeyColumn(
                     streamHandle, rowGroupHandle, k, split, pageReadStore, keyDescriptors(k),
-                    built.codesByKey(k), built.factorsByKey(k), () => localPages += 1)
+                    built.codesByKey(k), built.factorsByKey(k), dimMaxKeys(k), plainValueSpaceTables,
+                    () => localPages += 1)
                   codeTables(k) = codes
                   factorTables(k) = factors
                 }
@@ -443,13 +507,29 @@ case class MetalParquetGroupedAggregateExec(
   }
 
   /**
-   * Per-(row group, key column): resolves the dictionary, throws if absent
-   * (join-key columns are only ever decoded via `parquetDecodePage`, which
-   * requires dictionary-id-space planes -- see
-   * `NativeBridge.parquetRowGroupAggregate`'s Javadoc), translates
-   * [[GroupSpace.Built]]'s VALUE-keyed code/factor maps into dictionary-id-
-   * indexed tables for this row group's dictionary, then walks and decodes
-   * every V1 data page.
+   * Per-(row group, key column): dispatches on whether this row group's
+   * chunk has a dictionary page (Task 6b -- a column may be dictionary in
+   * one file and PLAIN in another, so this is decided per chunk, not once
+   * for the whole operator):
+   *
+   *  - Dictionary chunk (unchanged from before Task 6b): translates
+   *    [[GroupSpace.Built]]'s VALUE-keyed code/factor maps into
+   *    dictionary-id-indexed tables for THIS row group's own dictionary,
+   *    then decodes every page via `NativeBridge.parquetDecodePage`'s
+   *    dictionary path (`isPlain = false`).
+   *  - PLAIN chunk (no dictionary page at all): reuses (building once per
+   *    partition, in `plainValueSpaceTables(ordinal)`) a dense VALUE-space
+   *    table sized `dimMaxKey + 1` and indexed directly by raw key value --
+   *    [[GroupSpace.Built]]'s code/factor maps are ALREADY value-keyed, so
+   *    this is a direct array-fill, not a translation -- then decodes every
+   *    page via `parquetDecodePage`'s PLAIN path (`isPlain = true`), which
+   *    writes literal packed int32 values straight into the key plane (see
+   *    `NativeBridge.parquetRowGroupAggregate`'s Javadoc for why the fact
+   *    side needs no min offset or extra bounds handling here).
+   *
+   * `dimMaxKey` and `plainValueSpaceTables` are only ever touched on the
+   * PLAIN path; a dimension that always turns out to be dictionary-encoded
+   * across every file this partition reads never allocates one.
    */
   private def decodeKeyColumn(
       streamHandle: Long,
@@ -460,16 +540,26 @@ case class MetalParquetGroupedAggregateExec(
       descriptor: ColumnDescriptor,
       codesByKey: Map[Int, Int],
       factorsByKey: Map[Int, Int],
+      dimMaxKey: Int,
+      plainValueSpaceTables: Array[(Array[Int], Array[Int])],
       onPageDecoded: () => Unit): (Array[Int], Array[Int]) = {
     val pageReader = pageReadStore.getPageReader(descriptor)
     val dictionaryPage = pageReader.readDictionaryPage()
-    if (dictionaryPage == null) {
-      throw new RuntimeException(s"${split.file}: ${keyColumnNames(ordinal)} has no dictionary page")
-    }
-    val dictionaryValues = decodeDictionary(dictionaryPage)
-    val codeTable = dictionaryValues.map(value => codesByKey.getOrElse(value, -1))
-    val factorTable =
-      if (factorsByKey.isEmpty) null else dictionaryValues.map(value => factorsByKey.getOrElse(value, 1))
+    val isPlain = dictionaryPage == null
+    val (codeTable, factorTable) =
+      if (!isPlain) {
+        val dictionaryValues = decodeDictionary(dictionaryPage)
+        val codes = dictionaryValues.map(value => codesByKey.getOrElse(value, -1))
+        val factors =
+          if (factorsByKey.isEmpty) null else dictionaryValues.map(value => factorsByKey.getOrElse(value, 1))
+        (codes, factors)
+      } else {
+        if (plainValueSpaceTables(ordinal) == null) {
+          plainValueSpaceTables(ordinal) =
+            MetalParquetGroupedAggregateExec.buildValueSpaceTables(dimMaxKey, codesByKey, factorsByKey)
+        }
+        plainValueSpaceTables(ordinal)
+      }
 
     val hasDefLevels = descriptor.getMaxDefinitionLevel > 0
     var rowOffset = 0
@@ -481,14 +571,21 @@ case class MetalParquetGroupedAggregateExec(
           throw new RuntimeException(
             s"${split.file}: ${keyColumnNames(ordinal)} unsupported Parquet page type ${other.getClass}")
       }
-      if (!DictionaryEncodings.contains(dataPage.getValueEncoding)) {
+      val encoding = dataPage.getValueEncoding
+      if (isPlain) {
+        if (encoding != Encoding.PLAIN) {
+          throw new RuntimeException(
+            s"${split.file}: ${keyColumnNames(ordinal)} expected PLAIN encoding, got $encoding")
+        }
+      } else if (!DictionaryEncodings.contains(encoding)) {
         throw new RuntimeException(
-          s"${split.file}: ${keyColumnNames(ordinal)} unsupported value encoding ${dataPage.getValueEncoding}")
+          s"${split.file}: ${keyColumnNames(ordinal)} unsupported value encoding $encoding")
       }
       val pageBytes = dataPage.getBytes.toByteArray
       val valueCount = dataPage.getValueCount
       NativeBridge.parquetDecodePage(
-        streamHandle, rowGroupHandle, ordinal, pageBytes, pageBytes.length, valueCount, rowOffset, hasDefLevels)
+        streamHandle, rowGroupHandle, ordinal, pageBytes, pageBytes.length, valueCount, rowOffset, hasDefLevels,
+        isPlain)
       onPageDecoded()
       rowOffset += valueCount
       rawPage = pageReader.readPage()
@@ -1046,6 +1143,43 @@ private[sparkmetal] object MetalParquetGroupedAggregateExec {
 
   private[sparkmetal] val splitsByFile =
     new BoundedCache[FileVersion, Seq[ParquetGroupedAggregateSplit]](ParquetEligibility.MaxCachedFiles)
+
+  /**
+   * Task 6b: the largest join-key value a PLAIN key column's value-space
+   * code table may need to hold, 4,194,303 (4M - 1) -- chosen so the table
+   * (`(dimMaxKey + 1)` int32s, doubled when a factor table is also needed)
+   * stays at or under 16MB per key column. `doExecute`'s domain guard rejects
+   * (routes to the whole-operator CPU fallback) any dimension whose actual
+   * join-key domain exceeds this, before `GroupSpace.build` even runs.
+   */
+  private[sparkmetal] val MaxValueSpaceKey: Int = 4194303
+
+  /**
+   * Builds one dimension's PLAIN value-space code/factor tables: size
+   * `dimMaxKey + 1`, `-1`-filled (code) / `1`-filled (factor) by default, then
+   * overwritten at every key value `codesByKey`/`factorsByKey` actually maps
+   * -- no min offset (see `NativeBridge.parquetRowGroupAggregate`'s Javadoc):
+   * every index below the dimension's smallest join key is left `-1`, exactly
+   * like any other non-member slot, rather than treated specially. Called at
+   * most once per (partition, key column) by `decodeKeyColumn`, since the
+   * result depends only on the dimension's own (fixed, driver-collected)
+   * data, not on any particular row group.
+   */
+  private[sparkmetal] def buildValueSpaceTables(
+      dimMaxKey: Int, codesByKey: Map[Int, Int], factorsByKey: Map[Int, Int]): (Array[Int], Array[Int]) = {
+    val size = dimMaxKey + 1
+    val codes = Array.fill(size)(-1)
+    codesByKey.foreach { case (value, code) => if (value >= 0 && value < size) codes(value) = code }
+    val factors =
+      if (factorsByKey.isEmpty) {
+        null
+      } else {
+        val table = Array.fill(size)(1)
+        factorsByKey.foreach { case (value, factor) => if (value >= 0 && value < size) table(value) = factor }
+        table
+      }
+    (codes, factors)
+  }
 
   /**
    * Expands `aggSpecs` into the kernel's flat internal aggregate arrays

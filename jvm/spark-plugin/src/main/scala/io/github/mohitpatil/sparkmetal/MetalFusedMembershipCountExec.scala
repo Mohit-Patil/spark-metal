@@ -154,39 +154,23 @@ case class MetalFusedMembershipCountExec(
                   OffHeapColumnVectorAccess.dictionaryIdsAddress(column)
                 }
               }
+              def dictionaryArray(column: ColumnVector): Array[Int] = {
+                val maxId = OffHeapColumnVectorAccess.dictionaryMaxId(column)
+                Array.tabulate(maxId + 1)(id => OffHeapColumnVectorAccess.decodeDictionaryInt(column, id))
+              }
               def presenceTable(ordinal: Int): Array[Byte] = {
                 val column = columns(ordinal)
                 if (OffHeapColumnVectorAccess.supportsIntAddress(column) || !allKeysUnique) null
                 else presenceTables.computeIfAbsent(
                   OffHeapColumnVectorAccess.dictionary(column),
-                  _ => {
-                    val table = new Array[Byte](OffHeapColumnVectorAccess.dictionaryMaxId(column) + 1)
-                    var id = 0
-                    while (id < table.length) {
-                      if (multiplicities(ordinal).contains(
-                          OffHeapColumnVectorAccess.decodeDictionaryInt(column, id))) {
-                        table(id) = 1
-                      }
-                      id += 1
-                    }
-                    table
-                  })
+                  _ => MembershipTables.presence(dictionaryArray(column), multiplicities(ordinal)))
               }
               def multiplicityTable(ordinal: Int): Array[Int] = {
                 val column = columns(ordinal)
                 if (OffHeapColumnVectorAccess.supportsIntAddress(column) || allKeysUnique) null
                 else multiplicityTables.computeIfAbsent(
                   OffHeapColumnVectorAccess.dictionary(column),
-                  _ => {
-                    val table = new Array[Int](OffHeapColumnVectorAccess.dictionaryMaxId(column) + 1)
-                    var id = 0
-                    while (id < table.length) {
-                      table(id) = Math.toIntExact(multiplicities(ordinal).getOrElse(
-                        OffHeapColumnVectorAccess.decodeDictionaryInt(column, id), 0L))
-                      id += 1
-                    }
-                    table
-                  })
+                  _ => MembershipTables.multiplicity(dictionaryArray(column), multiplicities(ordinal)))
               }
               def nullAddress(ordinal: Int): Long =
                 if (columns(ordinal).hasNull()) OffHeapColumnVectorAccess.nullAddress(columns(ordinal))
@@ -216,8 +200,12 @@ case class MetalFusedMembershipCountExec(
           }
           if (streamHandle != 0L) {
             val started = System.nanoTime()
-            partitionCount += NativeBridge.membershipCount3StreamFinish(streamHandle)
+            // Set the flag before calling Finish: Finish deletes the native
+            // stream even when it throws (e.g. a GPU command failure), so
+            // the finally-block's Abort must never fire afterward -- it
+            // would touch an already-deleted stream.
             streamFinished = true
+            partitionCount += NativeBridge.membershipCount3StreamFinish(streamHandle)
             metalNanos += System.nanoTime() - started
           }
         } finally {

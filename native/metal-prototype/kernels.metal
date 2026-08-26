@@ -118,15 +118,22 @@ kernel void fused_membership_count_3_unique(
 
 struct ValueWorkItem { uint value_start; uint count; uint kind; uint payload; };
 struct RowSegment { uint row_start; uint value_start; uint count; uint valid; };
-// materialize appended at the end of both params structs (rather than
-// reordering existing fields) so the C++ mirrors in SparkMetalBridge.mm stay
-// lockstep-compatible field-for-field with the pre-Task-2 layout.
-struct ExpandParams { uint item_count; uint bit_width; uint value_bytes_offset; uint output_base; uint materialize; };
-struct ScatterParams { uint segment_count; uint row_base; uint materialize; };
+// materialize and dictionary_count appended at the end of both params
+// structs (rather than reordering existing fields) so the C++ mirrors in
+// SparkMetalBridge.mm stay lockstep-compatible field-for-field with the
+// pre-Task-2 layout.
+struct ExpandParams { uint item_count; uint bit_width; uint value_bytes_offset; uint output_base; uint materialize; uint dictionary_count; };
+struct ScatterParams { uint segment_count; uint row_base; uint materialize; uint dictionary_count; };
 
 // dictionary is read only when params.materialize != 0 (key-column callers
 // pass materialize = 0 and a small placeholder buffer that is never
-// dereferenced).
+// dereferenced). An out-of-range id -- bitWidth = ceil(log2(dictSize))
+// permits ids up to 2^bitWidth-1, which can exceed dictionary_count-1 for a
+// non-power-of-two dictionary, and a corrupt page could encode an
+// out-of-range id directly -- materializes to 0 rather than reading past the
+// dictionary buffer. A garbage id on a row the caller has already marked
+// valid is corrupt input; 0 is a safe, deterministic placeholder consistent
+// with the zero-filled-plane convention used everywhere else in this file.
 kernel void expand_value_runs(
     device const uchar *page [[buffer(0)]],
     device const ValueWorkItem *items [[buffer(1)]],
@@ -152,7 +159,8 @@ kernel void expand_value_runs(
         value = int((window >> (bit & 7)) & ((1u << params.bit_width) - 1u));
     }
     if (params.materialize != 0) {
-        value = dictionary[value];
+        uint id = uint(value);
+        value = id < params.dictionary_count ? dictionary[id] : 0;
     }
     output[params.output_base + item.value_start + local_index] = value;
 }
@@ -160,7 +168,9 @@ kernel void expand_value_runs(
 // dictionary is read only when params.materialize != 0. When materialize is
 // set, `values` holds raw dictionary ids (as written by expand_value_runs
 // with materialize = 0) and this kernel gathers dict[id] instead of id into
-// the output plane -- the measure-column with-nulls path.
+// the output plane -- the measure-column with-nulls path. Out-of-range ids
+// are handled the same way as expand_value_runs above: materialize to 0
+// instead of reading past the dictionary buffer.
 kernel void scatter_segments(
     device const int *values [[buffer(0)]],
     device const RowSegment *segments [[buffer(1)]],
@@ -177,7 +187,11 @@ kernel void scatter_segments(
     uint row = params.row_base + segment.row_start + local_index;
     if (segment.valid != 0) {
         int value = values[segment.value_start + local_index];
-        ids[row] = params.materialize != 0 ? dictionary[value] : value;
+        if (params.materialize != 0) {
+            uint id = uint(value);
+            value = id < params.dictionary_count ? dictionary[id] : 0;
+        }
+        ids[row] = value;
     } else {
         validity[row] = 1;
     }

@@ -329,7 +329,27 @@ object ParquetDecodeSmoke {
   // with a tiny parquet.dictionary.page.size (parquet-mr abandons the
   // dictionary and falls back to PLAIN, same trick as
   // writeDictionaryOverflowDataset above).
-  private val MeasureColumns = Seq("quantity", "price")
+  // line_total has NO null pattern at all (every row non-null): the only
+  // column exercising the all-valid decode path for both value-section
+  // layouts -- PLAIN all-valid (a GPU blit copy, not a CPU memcpy -- see the
+  // CRITICAL fix in parquetDecodeMeasurePage) and Dictionary all-valid
+  // (expand_value_runs with materialize=1 against a real staged dictionary).
+  // quantity/price null on every 13th/11th row, so neither ever lands a
+  // fully-non-null PAGE in practice (the periodic null pattern touches every
+  // page) -- line_total is what actually exercises those two paths.
+  //
+  // Ordered FIRST (slot 0), decoded before quantity/price: the row group's
+  // shared pagesSinceCommit counter (kPagesPerCommit = 32) triggers an
+  // automatic mid-decode commit, and once ANY commit has happened the
+  // row-group-begin zero-fill blit that the CRITICAL fix guards against has
+  // already executed -- a CPU-memcpy bug decoding line_total AFTER that
+  // point would go undetected by coincidence, not because it was fixed.
+  // Decoding line_total's ~10 pages first (rows / dictionary size puts it
+  // well under the 32-page threshold) guarantees its all-valid pages are
+  // decoded while that very first zero-fill blit is still pending, so the
+  // bug reproduces deterministically rather than by luck of column order.
+  private val MeasureColumns = Seq("line_total", "quantity", "price")
+  private val MeasureIsDecimal = Seq(false, false, true)
 
   private def runMeasureMode(nativeLibrary: String, metalLibrary: String, rows: Int): Unit = {
     val spark = SparkSession.builder().appName("spark-metal-parquet-measure-smoke").getOrCreate()
@@ -427,7 +447,19 @@ object ParquetDecodeSmoke {
             }
             require(rowOffset == rowGroupRows,
               s"${MeasureColumns(slot)}: pages covered $rowOffset rows, expected $rowGroupRows")
+          }
 
+          // Read back only AFTER every slot's pages are decoded, not
+          // interleaved per-slot: parquetRowGroupReadMeasure forces a commit
+          // (see its native implementation), and reading a slot back
+          // immediately after that slot's own pages would commit -- and so
+          // flush the row-group-begin zero-fill blit -- before a LATER
+          // slot's pages are ever decoded, silently sidestepping the
+          // CRITICAL fix's hazard window instead of exercising it. This
+          // mirrors how a real consumer (Task 3's aggregation kernel) reads
+          // the planes too: after every measure column for the row group has
+          // been decoded, not column-by-column.
+          for (slot <- MeasureColumns.indices) {
             val valuesOut = new Array[Int](rowGroupRows)
             val validityOut = new Array[Byte](rowGroupRows)
             NativeBridge.parquetRowGroupReadMeasure(
@@ -454,28 +486,27 @@ object ParquetDecodeSmoke {
     NativeBridge.releaseMembershipCount3(preparedHandle)
     require(coveredRows == rows, s"$caseName: row groups covered $coveredRows rows, expected $rows")
 
-    val referenceRows = spark.read.parquet(path).select("quantity", "price").collect()
+    val referenceRows =
+      spark.read.parquet(path).select(MeasureColumns.head, MeasureColumns.tail: _*).collect()
     require(referenceRows.length == rows,
       s"$caseName: reference row count ${referenceRows.length} did not match $rows")
 
     var mismatches = 0
     for (row <- 0 until rows) {
       val sparkRow = referenceRows(row)
-      val expectedQuantityNull = sparkRow.isNullAt(0)
-      if (expectedQuantityNull != decodedIsNull(0)(row)) {
-        mismatches += 1
-      } else if (!expectedQuantityNull && sparkRow.getInt(0) != decodedValues(0)(row)) {
-        mismatches += 1
-      }
-      val expectedPriceNull = sparkRow.isNullAt(1)
-      if (expectedPriceNull != decodedIsNull(1)(row)) {
-        mismatches += 1
-      } else if (!expectedPriceNull) {
-        // decimal(7,2) is backed by an INT32 physical type; compare the raw
-        // unscaled integer both sides agree on rather than the decimal value,
-        // per the brief.
-        val expectedUnscaled = sparkRow.getDecimal(1).unscaledValue().intValue()
-        if (expectedUnscaled != decodedValues(1)(row)) mismatches += 1
+      for (columnIndex <- MeasureColumns.indices) {
+        val expectedNull = sparkRow.isNullAt(columnIndex)
+        if (expectedNull != decodedIsNull(columnIndex)(row)) {
+          mismatches += 1
+        } else if (!expectedNull) {
+          // decimal(7,2) is backed by an INT32 physical type; compare the raw
+          // unscaled integer both sides agree on rather than the decimal
+          // value, per the brief.
+          val expectedValue =
+            if (MeasureIsDecimal(columnIndex)) sparkRow.getDecimal(columnIndex).unscaledValue().intValue()
+            else sparkRow.getInt(columnIndex)
+          if (expectedValue != decodedValues(columnIndex)(row)) mismatches += 1
+        }
       }
     }
 
@@ -530,8 +561,16 @@ object ParquetDecodeSmoke {
         else
           "CASE WHEN id % 11 = 0 THEN CAST(NULL AS DECIMAL(7,2)) " +
             "ELSE CAST(pmod(id, 300) + 100 AS DECIMAL(7,2)) END AS price"
+      // line_total: no CASE WHEN NULL branch at all -- every row non-null, so
+      // every page of this column is all-valid. Low-cardinality for the
+      // dictionary-friendly write (dictionary all-valid path); the
+      // strictly-increasing id for the forced-PLAIN write (PLAIN all-valid
+      // path, the same overflow trick as quantity/price above).
+      val lineTotalExpr =
+        if (highCardinality) "CAST(id AS INT) AS line_total"
+        else "CAST(pmod(id, 40) + 1 AS INT) AS line_total"
       var writer = spark.range(rows)
-        .selectExpr(quantityExpr, priceExpr)
+        .selectExpr(quantityExpr, priceExpr, lineTotalExpr)
         .coalesce(1)
         .write
         .option("parquet.page.size", "8192")

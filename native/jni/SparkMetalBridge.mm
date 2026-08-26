@@ -23,6 +23,13 @@ id<MTLComputePipelineState> membershipCountUniquePipeline;
 id<MTLComputePipelineState> membershipCountMultiplicityPipeline;
 id<MTLComputePipelineState> expandValueRunsPipeline;
 id<MTLComputePipelineState> scatterSegmentsPipeline;
+id<MTLComputePipelineState> groupedAggregatePipeline;
+// Bound as fused_grouped_aggregate's factor table for every key column that
+// has no factor table of its own (factor_length = 0, so the kernel never
+// dereferences it) and for every unused key/measure buffer slot. Holds the
+// single value 1 so that even a binding that is somehow reached contributes a
+// neutral multiplier rather than garbage.
+id<MTLBuffer> unitFactorBuffer;
 // Bound as the `dictionary` argument whenever materialize == 0 (every
 // key-column dispatch, and the raw-id half of a measure-column dispatch with
 // nulls). Never dereferenced in that case (see kernels.metal), so a single
@@ -61,6 +68,26 @@ struct PreparedMembershipCount3 {
     std::atomic<uint64_t> copyFallbacks{0};
 };
 
+// Mirrors kernels.metal's GroupedAggParams field-for-field (all uint32, so
+// both sides lay out identically). Task 3 caps: at most 4 key columns, 4
+// measure slots, 8 aggregates -- parquetRowGroupAggregate throws on excess.
+constexpr uint32_t kMaxAggregateKeyColumns = 4;
+constexpr uint32_t kMaxAggregateMeasureSlots = 4;
+constexpr uint32_t kMaxAggregates = 8;
+
+struct GroupedAggParams {
+    uint32_t rowCount;
+    uint32_t keyCount;
+    uint32_t aggCount;
+    uint32_t groupCount;
+    uint32_t keyNullMask;
+    uint32_t measureNullMask;
+    uint32_t codeLength[kMaxAggregateKeyColumns];
+    uint32_t factorLength[kMaxAggregateKeyColumns];
+    uint32_t aggMeasure[kMaxAggregates];
+    uint32_t aggKind[kMaxAggregates];
+};
+
 struct ParquetRowGroup;  // forward declaration: MembershipStream tracks row groups by pointer.
 
 // One in-flight partition worth of asynchronously committed command buffers.
@@ -88,6 +115,17 @@ struct MembershipStream {
     // (Finish/Abort) are deleted there so releasing a row group after its
     // stream is gone can never dereference a dangling stream pointer.
     std::vector<ParquetRowGroup *> rowGroups;
+    // Task 3: the grouped-aggregate partial table, one (lo, hi) uint pair per
+    // (group, aggregate) accumulator. Allocated lazily by the first
+    // parquetRowGroupAggregate on this stream and NOT taken from the staging
+    // pool: every row group of the partition accumulates into this one buffer
+    // (32-bit atomics make that safe across command buffers on the serial
+    // queue), so it must outlive them all and is only released when the stream
+    // is destroyed. aggregateGroupCount / aggregateAggCount pin the shape every
+    // later call has to agree with.
+    id<MTLBuffer> aggregatePartials = nil;
+    uint32_t aggregateGroupCount = 0;
+    uint32_t aggregateAggCount = 0;
 };
 
 // Mirrors kernels.metal's ExpandParams/ScatterParams field-for-field.
@@ -548,7 +586,26 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_initialize(
             [device newComputePipelineStateWithFunction:scatterSegmentsFunction error:&error];
         if (scatterSegmentsPipeline == nil) {
             throwRuntime(environment, [NSString stringWithFormat:@"Cannot build scatter-segments pipeline: %@", error]);
+            return;
         }
+        id<MTLFunction> groupedAggregateFunction = [library newFunctionWithName:@"fused_grouped_aggregate"];
+        if (groupedAggregateFunction == nil) {
+            throwRuntime(environment, @"Kernel fused_grouped_aggregate was not found");
+            return;
+        }
+        groupedAggregatePipeline =
+            [device newComputePipelineStateWithFunction:groupedAggregateFunction error:&error];
+        if (groupedAggregatePipeline == nil) {
+            throwRuntime(environment, [NSString stringWithFormat:@"Cannot build grouped-aggregate pipeline: %@", error]);
+            return;
+        }
+        unitFactorBuffer = [device newBufferWithLength:sizeof(uint32_t)
+            options:MTLResourceStorageModeShared];
+        if (unitFactorBuffer == nil) {
+            throwRuntime(environment, @"Cannot allocate unit factor buffer");
+            return;
+        }
+        *static_cast<uint32_t *>(unitFactorBuffer.contents) = 1u;
     }
 }
 
@@ -1368,8 +1425,19 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_membershipCount3StreamFinish(
                 failure = commandBuffer.error;
             }
         }
+        // A stream that ran grouped aggregation carries its results in the
+        // per-stream partial table, which only parquetAggregateStreamFinish
+        // knows how to fold; the membership partials this function sums are
+        // unrelated and would silently return a meaningless count. Refuse --
+        // but still tear the stream down first, because this function's
+        // contract is that the handle is consumed even when it throws (callers
+        // set their "finished" flag before calling and never abort afterward).
+        NSString *usageError = stream->aggregatePartials != nil
+            ? @"Streamed membership finish called on a grouped-aggregate stream; "
+               "use parquetAggregateStreamFinish instead"
+            : nil;
         int64_t result = 0;
-        if (failure == nil) {
+        if (failure == nil && usageError == nil) {
             bool allKeysUnique = stream->prepared->allKeysUnique;
             for (size_t batch = 0; batch < stream->partialBuffers.size(); ++batch) {
                 NSUInteger groups = stream->partialGroupCounts[batch];
@@ -1396,6 +1464,10 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_membershipCount3StreamFinish(
         delete stream;
         if (failure != nil) {
             throwRuntime(environment, [NSString stringWithFormat:@"Streamed Metal command failed: %@", failure]);
+            return 0;
+        }
+        if (usageError != nil) {
+            throwRuntime(environment, usageError);
             return 0;
         }
         return static_cast<jlong>(result);
@@ -2366,5 +2438,392 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetRowGroupCount(
         auto &rowGroups = stream->rowGroups;
         rowGroups.erase(std::remove(rowGroups.begin(), rowGroups.end(), rowGroup), rowGroups.end());
         delete rowGroup;
+    }
+}
+
+namespace {
+
+// Shared prologue for both aggregate-stream endpoints, mirroring
+// membershipCount3StreamFinish's ordering exactly: any row group the caller
+// never aggregated or released still owns an open command buffer and encoder,
+// so close and commit those first (nothing is left half-encoded when they are
+// deleted, and the wait below covers them), then wait on every command buffer
+// the stream ever committed and report the first GPU error.
+NSError *drainStreamCommandBuffers(MembershipStream *stream) {
+    for (ParquetRowGroup *rowGroup : stream->rowGroups) {
+        commitRowGroup(rowGroup);
+    }
+    NSError *failure = nil;
+    for (id<MTLCommandBuffer> commandBuffer : stream->commandBuffers) {
+        [commandBuffer waitUntilCompleted];
+        if (commandBuffer.status == MTLCommandBufferStatusError && failure == nil) {
+            failure = commandBuffer.error;
+        }
+    }
+    return failure;
+}
+
+}  // namespace
+
+// Runs the grouped-aggregation kernel over one row group's decoded key and
+// measure planes and releases the row-group handle -- the same lifecycle as
+// parquetRowGroupCount (encode into the row group's own encoder, hand every
+// buffer this call read to pendingStaging keyed to the committed command
+// buffer, unregister, delete; commits without waiting).
+//
+// Unlike parquetRowGroupCount, the result does NOT become another entry in
+// stream->partialBuffers: every row group of the partition atomically
+// accumulates into one per-stream partial table, folded by
+// parquetAggregateStreamFinish.
+extern "C" JNIEXPORT void JNICALL
+Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetRowGroupAggregate(
+    JNIEnv *environment,
+    jclass,
+    jlong streamHandle,
+    jlong rowGroupHandle,
+    jobjectArray codes,
+    jobjectArray factors,
+    jint groupCount,
+    jintArray aggMeasureSlots,
+    jintArray aggKinds) {
+    @autoreleasepool {
+        if (groupedAggregatePipeline == nil || commandQueue == nil) {
+            throwRuntime(environment, @"NativeBridge.initialize must be called first");
+            return;
+        }
+        if (streamHandle == 0 || rowGroupHandle == 0) {
+            throwRuntime(environment, @"Row-group aggregate requires a stream and a row group");
+            return;
+        }
+        if (codes == nullptr || aggMeasureSlots == nullptr || aggKinds == nullptr) {
+            throwRuntime(environment, @"Row-group aggregate requires code tables and aggregate descriptors");
+            return;
+        }
+        auto *stream = reinterpret_cast<MembershipStream *>(
+            static_cast<uintptr_t>(streamHandle));
+        auto *rowGroup = reinterpret_cast<ParquetRowGroup *>(
+            static_cast<uintptr_t>(rowGroupHandle));
+        if (rowGroup->stream != stream) {
+            throwRuntime(environment, @"Row group does not belong to the given stream");
+            return;
+        }
+        uint32_t keyCount = rowGroup->keyCount;
+        uint32_t measureCount = rowGroup->measureCount;
+        if (keyCount == 0 || keyCount > kMaxAggregateKeyColumns) {
+            throwRuntime(environment, @"Grouped aggregation supports 1 to 4 key columns");
+            return;
+        }
+        if (measureCount > kMaxAggregateMeasureSlots) {
+            throwRuntime(environment, @"Grouped aggregation supports at most 4 measure slots");
+            return;
+        }
+        if (groupCount <= 0) {
+            throwRuntime(environment, @"Grouped aggregation requires a positive group count");
+            return;
+        }
+        if (static_cast<uint32_t>(environment->GetArrayLength(codes)) != keyCount) {
+            throwRuntime(environment, @"Grouped aggregation needs one code table per key column");
+            return;
+        }
+        if (factors != nullptr &&
+            static_cast<uint32_t>(environment->GetArrayLength(factors)) != keyCount) {
+            throwRuntime(environment, @"Grouped aggregation needs one factor table slot per key column");
+            return;
+        }
+        jsize aggCount = environment->GetArrayLength(aggKinds);
+        if (aggCount <= 0 || static_cast<uint32_t>(aggCount) > kMaxAggregates) {
+            throwRuntime(environment, @"Grouped aggregation supports 1 to 8 aggregates");
+            return;
+        }
+        if (environment->GetArrayLength(aggMeasureSlots) != aggCount) {
+            throwRuntime(environment, @"Aggregate kinds and measure slots must have the same length");
+            return;
+        }
+
+        GroupedAggParams params = {};
+        params.rowCount = rowGroup->rowCount;
+        params.keyCount = keyCount;
+        params.aggCount = static_cast<uint32_t>(aggCount);
+        params.groupCount = static_cast<uint32_t>(groupCount);
+
+        jint kinds[kMaxAggregates];
+        jint slots[kMaxAggregates];
+        environment->GetIntArrayRegion(aggKinds, 0, aggCount, kinds);
+        environment->GetIntArrayRegion(aggMeasureSlots, 0, aggCount, slots);
+        if (environment->ExceptionCheck()) return;
+        for (jsize aggregate = 0; aggregate < aggCount; ++aggregate) {
+            if (kinds[aggregate] < 0 || kinds[aggregate] > 2) {
+                throwRuntime(environment, @"Aggregate kind must be 0 (count-star), 1 (sum) or 2 (count-col)");
+                return;
+            }
+            // The measure slot is only read for sum/count(col); count(*)
+            // ignores it, so an unset (or out-of-range) slot is legal there.
+            if (kinds[aggregate] != 0 &&
+                (slots[aggregate] < 0 ||
+                 static_cast<uint32_t>(slots[aggregate]) >= measureCount)) {
+                throwRuntime(environment, @"Aggregate measure slot exceeds the row group's measure count");
+                return;
+            }
+            params.aggKind[aggregate] = static_cast<uint32_t>(kinds[aggregate]);
+            params.aggMeasure[aggregate] =
+                kinds[aggregate] == 0 ? 0u : static_cast<uint32_t>(slots[aggregate]);
+        }
+
+        // The per-stream partial table: allocated on first use, sized by this
+        // call's group/aggregate shape, and pinned to it afterward.
+        if (stream->aggregatePartials == nil) {
+            size_t partialBytes = static_cast<size_t>(groupCount) *
+                static_cast<size_t>(aggCount) * 2 * sizeof(uint32_t);
+            id<MTLBuffer> partials = [device newBufferWithLength:partialBytes
+                options:MTLResourceStorageModeShared];
+            if (partials == nil) {
+                throwRuntime(environment, @"Cannot allocate the grouped-aggregate partial table");
+                return;
+            }
+            id<MTLCommandBuffer> zeroFill = [commandQueue commandBuffer];
+            id<MTLBlitCommandEncoder> blit = [zeroFill blitCommandEncoder];
+            [blit fillBuffer:partials range:NSMakeRange(0, partialBytes) value:0];
+            [blit endEncoding];
+            [zeroFill commit];
+            // Committed HERE, immediately -- ahead of this row group's still
+            // open command buffer and every later one. The single shared
+            // command queue executes committed command buffers in order, so
+            // the fill is guaranteed to land before any aggregation dispatch
+            // touches the table. Registering it on the stream also makes
+            // Finish/Abort wait for it even if nothing else ever ran.
+            stream->commandBuffers.push_back(zeroFill);
+            stream->aggregatePartials = partials;
+            stream->aggregateGroupCount = static_cast<uint32_t>(groupCount);
+            stream->aggregateAggCount = static_cast<uint32_t>(aggCount);
+        } else if (stream->aggregateGroupCount != static_cast<uint32_t>(groupCount) ||
+                   stream->aggregateAggCount != static_cast<uint32_t>(aggCount)) {
+            throwRuntime(environment,
+                @"Every grouped aggregation on one stream must use the same group and aggregate counts");
+            return;
+        }
+
+        // Code and factor tables are scoped to this call: staged like the
+        // dictionary tables in parquetRowGroupCount and recycled once this row
+        // group's command buffer completes.
+        std::vector<id<MTLBuffer>> usedStaging;
+        id<MTLBuffer> codeBuffers[kMaxAggregateKeyColumns];
+        id<MTLBuffer> factorBuffers[kMaxAggregateKeyColumns];
+        for (uint32_t column = 0; column < keyCount; ++column) {
+            auto codeTable = static_cast<jintArray>(
+                environment->GetObjectArrayElement(codes, static_cast<jsize>(column)));
+            if (codeTable == nullptr) {
+                throwRuntime(environment, @"Grouped aggregation requires a code table for every key column");
+                return;
+            }
+            jsize codeLength = environment->GetArrayLength(codeTable);
+            if (codeLength <= 0) {
+                environment->DeleteLocalRef(codeTable);
+                throwRuntime(environment, @"A grouped-aggregation code table must not be empty");
+                return;
+            }
+            id<MTLBuffer> codeBuffer = acquireStagingBuffer(
+                stream, static_cast<size_t>(codeLength) * sizeof(int32_t));
+            if (codeBuffer == nil) {
+                environment->DeleteLocalRef(codeTable);
+                throwRuntime(environment, @"Cannot allocate a grouped-aggregation code table");
+                return;
+            }
+            environment->GetIntArrayRegion(
+                codeTable, 0, codeLength, static_cast<jint *>(codeBuffer.contents));
+            environment->DeleteLocalRef(codeTable);
+            if (environment->ExceptionCheck()) return;
+            usedStaging.push_back(codeBuffer);
+            codeBuffers[column] = codeBuffer;
+            params.codeLength[column] = static_cast<uint32_t>(codeLength);
+
+            jintArray factorTable = nullptr;
+            if (factors != nullptr) {
+                factorTable = static_cast<jintArray>(
+                    environment->GetObjectArrayElement(factors, static_cast<jsize>(column)));
+            }
+            if (factorTable == nullptr) {
+                // No duplicate build keys in this column: the kernel skips the
+                // lookup entirely (factorLength 0) and this binding is never
+                // dereferenced.
+                factorBuffers[column] = unitFactorBuffer;
+                params.factorLength[column] = 0;
+                continue;
+            }
+            jsize factorLength = environment->GetArrayLength(factorTable);
+            if (factorLength != codeLength) {
+                environment->DeleteLocalRef(factorTable);
+                throwRuntime(environment,
+                    @"A factor table must be indexed exactly like its column's code table");
+                return;
+            }
+            id<MTLBuffer> factorBuffer = acquireStagingBuffer(
+                stream, static_cast<size_t>(factorLength) * sizeof(int32_t));
+            if (factorBuffer == nil) {
+                environment->DeleteLocalRef(factorTable);
+                throwRuntime(environment, @"Cannot allocate a grouped-aggregation factor table");
+                return;
+            }
+            environment->GetIntArrayRegion(
+                factorTable, 0, factorLength, static_cast<jint *>(factorBuffer.contents));
+            environment->DeleteLocalRef(factorTable);
+            if (environment->ExceptionCheck()) return;
+            usedStaging.push_back(factorBuffer);
+            factorBuffers[column] = factorBuffer;
+            params.factorLength[column] = static_cast<uint32_t>(factorLength);
+        }
+
+        for (uint32_t column = 0; column < keyCount; ++column) {
+            if (rowGroup->columnHasNulls[column]) params.keyNullMask |= 1u << column;
+        }
+        for (uint32_t slot = 0; slot < measureCount; ++slot) {
+            if (rowGroup->measureHasNulls[slot]) params.measureNullMask |= 1u << slot;
+        }
+
+        // Encoded into the row group's own compute encoder, exactly like
+        // parquetRowGroupCount: MTLDispatchTypeSerial guarantees every page's
+        // expand/scatter has completed before this kernel reads the planes.
+        id<MTLComputeCommandEncoder> encoder = rowGroupEncoder(rowGroup);
+        if (encoder == nil) {
+            throwRuntime(environment, @"Cannot open a Parquet row-group compute encoder");
+            return;
+        }
+        [encoder setComputePipelineState:groupedAggregatePipeline];
+        // Every one of the kernel's fixed buffer slots is bound, used or not:
+        // an unused slot gets the shared 4-byte placeholder (the kernel's key/
+        // measure loops are bounded by key_count/measure slot validation, so
+        // it is never dereferenced) because leaving an argument unbound is
+        // undefined behaviour in Metal.
+        for (uint32_t column = 0; column < kMaxAggregateKeyColumns; ++column) {
+            bool used = column < keyCount;
+            [encoder setBuffer:(used ? rowGroup->ids[column] : dummyDictionaryBuffer)
+                offset:0 atIndex:column];
+            [encoder setBuffer:(used ? rowGroup->validity[column] : dummyDictionaryBuffer)
+                offset:0 atIndex:column + 4];
+            [encoder setBuffer:(used ? codeBuffers[column] : dummyDictionaryBuffer)
+                offset:0 atIndex:column + 8];
+            [encoder setBuffer:(used ? factorBuffers[column] : unitFactorBuffer)
+                offset:0 atIndex:column + 12];
+        }
+        for (uint32_t slot = 0; slot < kMaxAggregateMeasureSlots; ++slot) {
+            bool used = slot < measureCount;
+            [encoder setBuffer:(used ? rowGroup->measureValues[slot] : dummyDictionaryBuffer)
+                offset:0 atIndex:slot + 16];
+            [encoder setBuffer:(used ? rowGroup->measureValidity[slot] : dummyDictionaryBuffer)
+                offset:0 atIndex:slot + 20];
+        }
+        [encoder setBuffer:stream->aggregatePartials offset:0 atIndex:24];
+        [encoder setBytes:&params length:sizeof(params) atIndex:25];
+        constexpr NSUInteger threadsPerGroup = 256;
+        NSUInteger threadgroups =
+            (static_cast<NSUInteger>(rowGroup->rowCount) + threadsPerGroup - 1) / threadsPerGroup;
+        [encoder dispatchThreadgroups:MTLSizeMake(threadgroups, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+
+        // See parquetRowGroupCount: this call's staging and the row group's own
+        // planes (never pendingStaging entries themselves) all have to be keyed
+        // to this row group's command buffer, which commitRowGroup does for
+        // everything parked here. The measure dictionaries staged by
+        // parquetSetMeasureDictionary go back too -- the row group is deleted
+        // below and would otherwise drop them out of the pool.
+        rowGroup->pendingStaging.insert(
+            rowGroup->pendingStaging.end(), usedStaging.begin(), usedStaging.end());
+        for (uint32_t column = 0; column < keyCount; ++column) {
+            rowGroup->pendingStaging.push_back(rowGroup->ids[column]);
+            rowGroup->pendingStaging.push_back(rowGroup->validity[column]);
+        }
+        for (uint32_t slot = 0; slot < measureCount; ++slot) {
+            rowGroup->pendingStaging.push_back(rowGroup->measureValues[slot]);
+            rowGroup->pendingStaging.push_back(rowGroup->measureValidity[slot]);
+            if (rowGroup->measureDictionary[slot] != nil) {
+                rowGroup->pendingStaging.push_back(rowGroup->measureDictionary[slot]);
+            }
+        }
+        commitRowGroup(rowGroup);
+
+        auto &rowGroups = stream->rowGroups;
+        rowGroups.erase(std::remove(rowGroups.begin(), rowGroups.end(), rowGroup), rowGroups.end());
+        delete rowGroup;
+    }
+}
+
+// Waits for the whole stream, folds the per-stream partial table's (lo, hi)
+// uint pairs into signed 64-bit accumulators, and destroys the stream.
+//
+// The stream is destroyed even when this throws -- exactly like
+// membershipCount3StreamFinish, and for the same reason: callers set their
+// "stream finished" flag BEFORE calling so a finally-block Abort can never run
+// against an already-deleted stream.
+extern "C" JNIEXPORT jlongArray JNICALL
+Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetAggregateStreamFinish(
+    JNIEnv *environment,
+    jclass,
+    jlong streamHandle) {
+    @autoreleasepool {
+        if (streamHandle == 0) {
+            throwRuntime(environment, @"Invalid membership stream handle");
+            return nullptr;
+        }
+        auto *stream = reinterpret_cast<MembershipStream *>(
+            static_cast<uintptr_t>(streamHandle));
+        NSError *failure = drainStreamCommandBuffers(stream);
+
+        // Folded into host memory before the stream (which owns the device
+        // buffer) is destroyed. (long)((ulong)hi << 32 | lo) is sign-correct by
+        // construction: the two halves accumulated the low and high 32 bits of
+        // one modulo-2^64 sum, so reassembling them reproduces the exact signed
+        // total -- see aggregate_add_int64 in kernels.metal.
+        std::vector<int64_t> results;
+        if (failure == nil && stream->aggregatePartials != nil) {
+            size_t accumulators = static_cast<size_t>(stream->aggregateGroupCount) *
+                static_cast<size_t>(stream->aggregateAggCount);
+            const uint32_t *partials =
+                static_cast<const uint32_t *>(stream->aggregatePartials.contents);
+            results.resize(accumulators);
+            for (size_t index = 0; index < accumulators; ++index) {
+                uint64_t low = partials[2 * index];
+                uint64_t high = partials[2 * index + 1];
+                results[index] = static_cast<int64_t>((high << 32) | low);
+            }
+        }
+        // See membershipCount3StreamFinish: row groups the caller never
+        // aggregated or released hold planes that belong to a freeStaging pool
+        // that is about to disappear, so just delete them.
+        for (ParquetRowGroup *rowGroup : stream->rowGroups) {
+            delete rowGroup;
+        }
+        delete stream;
+        if (failure != nil) {
+            throwRuntime(environment,
+                [NSString stringWithFormat:@"Streamed Metal command failed: %@", failure]);
+            return nullptr;
+        }
+        jlongArray output = environment->NewLongArray(static_cast<jsize>(results.size()));
+        if (output == nullptr) return nullptr;
+        if (!results.empty()) {
+            environment->SetLongArrayRegion(
+                output, 0, static_cast<jsize>(results.size()),
+                reinterpret_cast<const jlong *>(results.data()));
+        }
+        return output;
+    }
+}
+
+// Waits, reclaims and destroys the stream without folding a result -- the
+// error path counterpart of parquetAggregateStreamFinish, mirroring
+// membershipCount3StreamAbort.
+extern "C" JNIEXPORT void JNICALL
+Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetAggregateStreamAbort(
+    JNIEnv *,
+    jclass,
+    jlong streamHandle) {
+    @autoreleasepool {
+        if (streamHandle == 0) return;
+        auto *stream = reinterpret_cast<MembershipStream *>(
+            static_cast<uintptr_t>(streamHandle));
+        drainStreamCommandBuffers(stream);
+        for (ParquetRowGroup *rowGroup : stream->rowGroups) {
+            delete rowGroup;
+        }
+        delete stream;
     }
 }

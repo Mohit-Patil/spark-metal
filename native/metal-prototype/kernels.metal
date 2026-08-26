@@ -197,6 +197,150 @@ kernel void scatter_segments(
     }
 }
 
+// Task 3 (grouped aggregate). One thread per row of a decoded row group.
+//
+// Gating is exactly the membership kernels' rule, generalized to key_count
+// columns: a row survives only if every key column is non-null AND every key
+// column's code lookup yields a non-negative code.
+//
+// Codes: code_tables[k] is indexed by the id/value plane's int32 for column k
+// (dictionary-id space for a dictionary-decoded column, value space
+// otherwise) and holds either -1 (this key is not in the build side, so the
+// row is dropped) or the column's PREMULTIPLIED group component, so that
+// group_id is simply the sum of the per-column codes. An index outside
+// code_length[k] is treated as a non-member rather than read (a corrupt page
+// or a mis-sized table must never read past the buffer).
+//
+// Factors: factor_tables[k], when factor_length[k] != 0, holds the
+// duplicate-build-key multiplicity for that key (1 for unique keys); the row's
+// factor is the product across columns. A column with factor_length[k] == 0
+// contributes 1 and its factor buffer is never dereferenced (the JNI side
+// binds a shared one-element placeholder there).
+//
+// Accumulation: each aggregate's int64 contribution is added into
+// partials[(group_id * agg_count + a) * 2] as a (lo, hi) uint pair, using two
+// relaxed 32-bit atomics plus an explicit carry. Metal has no device-wide
+// 64-bit atomic add; splitting one into two 32-bit adds is exact for signed
+// 64-bit values -- including negative ones -- because two's-complement
+// addition is addition modulo 2^64, and lo/hi accumulate the low and high
+// halves of that same modular sum (the carry out of the low half is recovered
+// from the value the low add returned). Reading the pair back as
+// (long)((ulong)hi << 32 | lo) therefore reproduces the exact signed total,
+// independent of the order threads or command buffers accumulated in.
+struct GroupedAggParams {
+    uint row_count;
+    uint key_count;
+    uint agg_count;
+    uint group_count;
+    uint key_null_mask;
+    uint measure_null_mask;
+    uint code_length[4];
+    uint factor_length[4];
+    uint agg_measure[8];
+    uint agg_kind[8];
+};
+
+inline void aggregate_add_int64(device atomic_uint *partials, uint index, long value)
+{
+    ulong bits = ulong(value);
+    uint low = uint(bits & 0xFFFFFFFFul);
+    uint high = uint(bits >> 32);
+    uint previous = atomic_fetch_add_explicit(&partials[2u * index], low, memory_order_relaxed);
+    uint carry = previous > (0xFFFFFFFFu - low) ? 1u : 0u;
+    atomic_fetch_add_explicit(&partials[2u * index + 1u], high + carry, memory_order_relaxed);
+}
+
+kernel void fused_grouped_aggregate(
+    device const int *key_ids_0 [[buffer(0)]],
+    device const int *key_ids_1 [[buffer(1)]],
+    device const int *key_ids_2 [[buffer(2)]],
+    device const int *key_ids_3 [[buffer(3)]],
+    device const uchar *key_nulls_0 [[buffer(4)]],
+    device const uchar *key_nulls_1 [[buffer(5)]],
+    device const uchar *key_nulls_2 [[buffer(6)]],
+    device const uchar *key_nulls_3 [[buffer(7)]],
+    device const int *code_table_0 [[buffer(8)]],
+    device const int *code_table_1 [[buffer(9)]],
+    device const int *code_table_2 [[buffer(10)]],
+    device const int *code_table_3 [[buffer(11)]],
+    device const uint *factor_table_0 [[buffer(12)]],
+    device const uint *factor_table_1 [[buffer(13)]],
+    device const uint *factor_table_2 [[buffer(14)]],
+    device const uint *factor_table_3 [[buffer(15)]],
+    device const int *measure_values_0 [[buffer(16)]],
+    device const int *measure_values_1 [[buffer(17)]],
+    device const int *measure_values_2 [[buffer(18)]],
+    device const int *measure_values_3 [[buffer(19)]],
+    device const uchar *measure_nulls_0 [[buffer(20)]],
+    device const uchar *measure_nulls_1 [[buffer(21)]],
+    device const uchar *measure_nulls_2 [[buffer(22)]],
+    device const uchar *measure_nulls_3 [[buffer(23)]],
+    device atomic_uint *partials [[buffer(24)]],
+    constant GroupedAggParams &params [[buffer(25)]],
+    uint global_index [[thread_position_in_grid]])
+{
+    if (global_index >= params.row_count) return;
+
+    device const int *key_ids[4] = {key_ids_0, key_ids_1, key_ids_2, key_ids_3};
+    device const uchar *key_nulls[4] = {key_nulls_0, key_nulls_1, key_nulls_2, key_nulls_3};
+    device const int *code_tables[4] = {code_table_0, code_table_1, code_table_2, code_table_3};
+    device const uint *factor_tables[4] =
+        {factor_table_0, factor_table_1, factor_table_2, factor_table_3};
+    device const int *measure_values[4] =
+        {measure_values_0, measure_values_1, measure_values_2, measure_values_3};
+    device const uchar *measure_nulls[4] =
+        {measure_nulls_0, measure_nulls_1, measure_nulls_2, measure_nulls_3};
+
+    uint group = 0u;
+    uint factor = 1u;
+    for (uint column = 0u; column < params.key_count && column < 4u; ++column) {
+        if ((params.key_null_mask & (1u << column)) != 0u &&
+            key_nulls[column][global_index] != 0) {
+            return;
+        }
+        int identifier = key_ids[column][global_index];
+        if (identifier < 0) return;
+        uint entry = uint(identifier);
+        if (entry >= params.code_length[column]) return;
+        int code = code_tables[column][entry];
+        if (code < 0) return;
+        group += uint(code);
+        uint factor_length = params.factor_length[column];
+        if (factor_length != 0u) {
+            if (entry >= factor_length) return;
+            factor *= factor_tables[column][entry];
+        }
+    }
+    // Defensive: a well-formed set of code tables can only sum to a group id
+    // inside the space the caller sized the partial table for, but a bad table
+    // must not turn into an out-of-bounds device write.
+    if (group >= params.group_count) return;
+
+    for (uint aggregate = 0u; aggregate < params.agg_count && aggregate < 8u; ++aggregate) {
+        uint kind = params.agg_kind[aggregate];
+        long contribution;
+        if (kind == 0u) {
+            // count(*): every surviving row contributes its factor.
+            contribution = long(factor);
+        } else {
+            uint slot = params.agg_measure[aggregate];
+            if (slot >= 4u) continue;
+            if ((params.measure_null_mask & (1u << slot)) != 0u &&
+                measure_nulls[slot][global_index] != 0) {
+                continue;
+            }
+            if (kind == 1u) {
+                // sum(column)
+                contribution = long(measure_values[slot][global_index]) * long(factor);
+            } else {
+                // count(column): non-null measures only, weighted by factor.
+                contribution = long(factor);
+            }
+        }
+        aggregate_add_int64(partials, group * params.agg_count + aggregate, contribution);
+    }
+}
+
 kernel void fused_membership_count_3_multiplicity(
     device const int *input_0 [[buffer(0)]],
     device const int *input_1 [[buffer(1)]],

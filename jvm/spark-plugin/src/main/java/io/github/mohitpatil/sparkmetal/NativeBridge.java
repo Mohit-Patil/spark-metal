@@ -167,4 +167,50 @@ public final class NativeBridge {
             byte[] dictPresence1, int[] dictMultiplicity1,
             byte[] dictPresence2, int[] dictMultiplicity2);
 
+    /**
+     * Encodes the grouped-aggregation kernel over one row group's decoded key
+     * and measure planes and consumes the row-group handle (same lifecycle as
+     * parquetRowGroupCount: commits without waiting, then releases the handle
+     * -- the caller must not touch it again).
+     *
+     * <p>codes[k] maps column k's decoded int32 (dictionary-id space for a
+     * dictionary-decoded column, value space otherwise) to either -1, meaning
+     * the key is not a member and the row is dropped, or that column's
+     * PREMULTIPLIED group component, so the row's group id is the sum of the
+     * per-column codes. factors[k] may be null (every key unique, multiplier
+     * 1) or an equally indexed table of duplicate-key multiplicities; the
+     * row's weight is the product across columns.
+     *
+     * <p>aggKinds[a] is 0 for count(*), 1 for sum(measure), 2 for
+     * count(measure); aggMeasureSlots[a] names the measure slot for kinds 1
+     * and 2 and is ignored for kind 0. At most 4 key columns, 4 measure slots
+     * and 8 aggregates are supported.
+     *
+     * <p>Results do NOT flow into membershipCount3StreamFinish. They
+     * accumulate into a per-STREAM partial table allocated on the first call
+     * (so every row group of the partition adds into the same table) and are
+     * read back by parquetAggregateStreamFinish. Every call on one stream must
+     * pass the same groupCount and the same number of aggregates.
+     */
+    public static native void parquetRowGroupAggregate(
+            long streamHandle, long rowGroupHandle,
+            int[][] codes, int[][] factors, int groupCount,
+            int[] aggMeasureSlots, int[] aggKinds);
+
+    /**
+     * Waits for every command buffer on the stream, folds the aggregate
+     * partial table into long[groupCount * aggCount] (row-major: group-major,
+     * aggregate-minor) and destroys the stream. Returns a zero-length array if
+     * no row group was ever aggregated on this stream.
+     *
+     * <p>The stream is destroyed even when this throws, exactly like
+     * membershipCount3StreamFinish: callers must set their
+     * "stream already finished" flag BEFORE calling, so a finally-block Abort
+     * can never run against an already-deleted stream.
+     */
+    public static native long[] parquetAggregateStreamFinish(long streamHandle);
+
+    /** Waits, reclaims and destroys the stream without producing a result. */
+    public static native void parquetAggregateStreamAbort(long streamHandle);
+
 }

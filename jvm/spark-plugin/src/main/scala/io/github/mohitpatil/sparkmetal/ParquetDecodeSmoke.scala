@@ -35,6 +35,11 @@ object ParquetDecodeSmoke {
         "Usage: ParquetDecodeSmoke measure NATIVE_LIB METAL_LIB [ROWS]")
       val rows = if (arguments.length > 3) arguments(3).toInt else 100003
       runMeasureMode(arguments(1), arguments(2), rows)
+    } else if (arguments.nonEmpty && arguments(0) == "aggregate") {
+      require(arguments.length >= 3,
+        "Usage: ParquetDecodeSmoke aggregate NATIVE_LIB METAL_LIB [ROWS]")
+      val rows = if (arguments.length > 3) arguments(3).toInt else 100003
+      runAggregateMode(arguments(1), arguments(2), rows)
     } else {
       runDecodeAndCountMode(arguments)
     }
@@ -581,6 +586,306 @@ object ParquetDecodeSmoke {
         if (previousDictionarySize != null) hadoopConf.set("parquet.dictionary.page.size", previousDictionarySize)
         else hadoopConf.unset("parquet.dictionary.page.size")
       }
+    }
+  }
+
+  // --- Task 3: grouped aggregation on the GPU --------------------------------
+  //
+  // Two join-key columns spanning a 3 x 4 = 12 group space (g0 contributes the
+  // PREMULTIPLIED component value * 4, g1 the component itself, so the group id
+  // is the plain sum of the two codes) and three measure columns. g0 carries a
+  // fourth value (3) that is deliberately NOT a member -- its code is -1 -- so
+  // the kernel's code-gate is exercised alongside the null-gate, and g1 carries
+  // a duplicate-build-key factor of 2 for value 1.
+  private val AggregateKeyColumns = Seq("g0", "g1")
+  private val AggregateMeasureColumns = Seq("quantity", "price", "amount")
+  private val AggregateMeasureIsDecimal = Seq(false, true, false)
+  private val AggregateRadix = 4
+  private val AggregateGroupCount = 12
+  // count(*), sum(quantity), sum(price_unscaled), sum(amount), count(quantity)
+  // -- all three aggregate kinds (0 = count-star, 1 = sum, 2 = count-col).
+  private val AggregateKinds = Array(0, 1, 1, 1, 2)
+  private val AggregateSlots = Array(0, 0, 1, 2, 0)
+  // (g0 = 2, g1 = 3) is never written (see writeAggregateDataset), so this
+  // group must come back all zeros.
+  private val AggregateEmptyGroup = 2 * AggregateRadix + 3
+
+  /** -1 for a non-member key, else the column's premultiplied group component. */
+  private def aggregateCode(column: Int, value: Int): Int =
+    if (column == 0) { if (value >= 0 && value <= 2) value * AggregateRadix else -1 }
+    else { if (value >= 0 && value <= 3) value else -1 }
+
+  /** Duplicate-build-key multiplicity; only g1 has one (2 for key value 1). */
+  private def aggregateFactor(column: Int, value: Int): Int =
+    if (column == 1 && value == 1) 2 else 1
+
+  private def runAggregateMode(nativeLibrary: String, metalLibrary: String, rows: Int): Unit = {
+    val spark = SparkSession.builder().appName("spark-metal-parquet-aggregate-smoke").getOrCreate()
+    spark.sparkContext.setLogLevel("WARN")
+    val tempDir = Files.createTempDirectory("spark-metal-parquet-aggregate-smoke")
+    try {
+      SparkMetalNative.ensureInitialized(nativeLibrary, metalLibrary)
+      val path = tempDir.resolve("data-aggregate").toString
+      writeAggregateDataset(spark, path, rows)
+      val partFile = singlePartFile(path)
+
+      val aggregateCount = AggregateKinds.length
+      val projection = AggregateKeyColumns ++ AggregateMeasureColumns
+      val referenceRows = spark.read.parquet(path).select(projection.head, projection.tail: _*).collect()
+      require(referenceRows.length == rows,
+        s"reference row count ${referenceRows.length} did not match $rows")
+
+      // Reference: the same gate (both keys non-null AND both codes >= 0), the
+      // same factor product, and the same per-aggregate null policy the kernel
+      // applies, computed entirely in Scala over Spark's own read.
+      val expected = new Array[Long](AggregateGroupCount * aggregateCount)
+      for (sparkRow <- referenceRows) {
+        if (!sparkRow.isNullAt(0) && !sparkRow.isNullAt(1)) {
+          val code0 = aggregateCode(0, sparkRow.getInt(0))
+          val code1 = aggregateCode(1, sparkRow.getInt(1))
+          if (code0 >= 0 && code1 >= 0) {
+            val group = code0 + code1
+            val factor =
+              aggregateFactor(0, sparkRow.getInt(0)).toLong * aggregateFactor(1, sparkRow.getInt(1))
+            for (aggregate <- 0 until aggregateCount) {
+              val index = group * aggregateCount + aggregate
+              if (AggregateKinds(aggregate) == 0) {
+                expected(index) += factor
+              } else {
+                val columnIndex = AggregateKeyColumns.length + AggregateSlots(aggregate)
+                if (!sparkRow.isNullAt(columnIndex)) {
+                  if (AggregateKinds(aggregate) == 1) {
+                    val value =
+                      if (AggregateMeasureIsDecimal(AggregateSlots(aggregate)))
+                        sparkRow.getDecimal(columnIndex).unscaledValue().intValue()
+                      else sparkRow.getInt(columnIndex)
+                    expected(index) += value.toLong * factor
+                  } else {
+                    expected(index) += factor
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // The dataset only earns its keep if it actually reaches the cases this
+      // task is about; assert that on the reference totals, before ever
+      // comparing them to the GPU's.
+      require((0 until aggregateCount).forall(a => expected(AggregateEmptyGroup * aggregateCount + a) == 0L),
+        s"group $AggregateEmptyGroup was expected to receive no rows, got " +
+          (0 until aggregateCount).map(a => expected(AggregateEmptyGroup * aggregateCount + a)).mkString(","))
+      val quantitySums = (0 until AggregateGroupCount).map(g => expected(g * aggregateCount + 1))
+      require(quantitySums.exists(_ < 0L),
+        s"expected at least one negative per-group sum(quantity), got $quantitySums")
+      val amountSums = (0 until AggregateGroupCount).map(g => expected(g * aggregateCount + 3))
+      require(amountSums.exists(_ > 4294967296L),
+        s"expected a per-group sum(amount) above 2^32, got $amountSums")
+      require(amountSums.exists(_ < -4294967296L),
+        s"expected a per-group sum(amount) below -2^32, got $amountSums")
+
+      var rowGroups = 0
+      var coveredRows = 0
+      val preparedHandle = NativeBridge.prepareMembershipCount3(Array(1), Array(1), Array(1))
+      // ONE stream for the whole file: the aggregate partial table is
+      // per-stream, so every row group below accumulates into the same device
+      // buffer across separate command buffers.
+      val streamHandle = NativeBridge.membershipCount3StreamBegin(preparedHandle)
+      var streamFinished = false
+      var actual: Array[Long] = null
+      try {
+        val reader = ParquetFileReader.open(HadoopInputFile.fromPath(new Path(partFile), new Configuration()))
+        try {
+          val schemaColumns = reader.getFooter.getFileMetaData.getSchema.getColumns.asScala
+          def descriptorFor(name: String) = schemaColumns
+            .find(_.getPath()(0) == name)
+            .getOrElse(throw new RuntimeException(s"Missing column $name"))
+          val keyDescriptors = AggregateKeyColumns.map(descriptorFor)
+          val measureDescriptors = AggregateMeasureColumns.map(descriptorFor)
+
+          var pageReadStore = reader.readNextRowGroup()
+          while (pageReadStore != null) {
+            val rowGroupRows = pageReadStore.getRowCount.toInt
+            val rowGroupHandle = NativeBridge.parquetRowGroupBeginAggregate(
+              streamHandle, rowGroupRows, AggregateKeyColumns.length, AggregateMeasureColumns.length)
+            val codeTables = new Array[Array[Int]](AggregateKeyColumns.length)
+            val factorTables = new Array[Array[Int]](AggregateKeyColumns.length)
+            for (columnIndex <- AggregateKeyColumns.indices) {
+              val descriptor = keyDescriptors(columnIndex)
+              val pageReader = pageReadStore.getPageReader(descriptor)
+              val dictionaryPage = pageReader.readDictionaryPage()
+              if (dictionaryPage == null) {
+                throw new RuntimeException(
+                  s"${AggregateKeyColumns(columnIndex)}: expected a dictionary page but found none")
+              }
+              val dictionaryBuffer =
+                ByteBuffer.wrap(dictionaryPage.getBytes.toByteArray).order(ByteOrder.LITTLE_ENDIAN)
+              val dictionaryValues =
+                Array.tabulate(dictionaryPage.getDictionarySize)(entry => dictionaryBuffer.getInt(entry * 4))
+              // Key columns decode to dictionary IDS, so the code/factor
+              // tables handed to the kernel are indexed in dict-id space --
+              // rebuilt per row group, since each column chunk has its own
+              // dictionary.
+              codeTables(columnIndex) = dictionaryValues.map(aggregateCode(columnIndex, _))
+              factorTables(columnIndex) =
+                if (columnIndex == 1) dictionaryValues.map(aggregateFactor(columnIndex, _)) else null
+
+              val hasDefLevels = descriptor.getMaxDefinitionLevel > 0
+              var rowOffset = 0
+              var rawPage = pageReader.readPage()
+              while (rawPage != null) {
+                val dataPage = rawPage match {
+                  case v1: DataPageV1 => v1
+                  case other => throw new RuntimeException(
+                    s"${AggregateKeyColumns(columnIndex)}: unsupported page type ${other.getClass}")
+                }
+                require(DictionaryEncodings.contains(dataPage.getValueEncoding),
+                  s"${AggregateKeyColumns(columnIndex)}: unsupported value encoding " +
+                    dataPage.getValueEncoding)
+                val pageBytes = dataPage.getBytes.toByteArray
+                NativeBridge.parquetDecodePage(
+                  streamHandle, rowGroupHandle, columnIndex,
+                  pageBytes, pageBytes.length, dataPage.getValueCount, rowOffset, hasDefLevels)
+                rowOffset += dataPage.getValueCount
+                rawPage = pageReader.readPage()
+              }
+              require(rowOffset == rowGroupRows,
+                s"${AggregateKeyColumns(columnIndex)}: pages covered $rowOffset rows, expected $rowGroupRows")
+            }
+
+            for (slot <- AggregateMeasureColumns.indices) {
+              val descriptor = measureDescriptors(slot)
+              val pageReader = pageReadStore.getPageReader(descriptor)
+              val dictionaryPage = pageReader.readDictionaryPage()
+              if (dictionaryPage != null) {
+                val dictionaryBuffer =
+                  ByteBuffer.wrap(dictionaryPage.getBytes.toByteArray).order(ByteOrder.LITTLE_ENDIAN)
+                val dictionaryValues =
+                  Array.tabulate(dictionaryPage.getDictionarySize)(entry => dictionaryBuffer.getInt(entry * 4))
+                NativeBridge.parquetSetMeasureDictionary(rowGroupHandle, slot, dictionaryValues)
+              }
+              val hasDefLevels = descriptor.getMaxDefinitionLevel > 0
+              var rowOffset = 0
+              var rawPage = pageReader.readPage()
+              while (rawPage != null) {
+                val dataPage = rawPage match {
+                  case v1: DataPageV1 => v1
+                  case other => throw new RuntimeException(
+                    s"${AggregateMeasureColumns(slot)}: unsupported page type ${other.getClass}")
+                }
+                val encoding = dataPage.getValueEncoding
+                if (dictionaryPage != null) {
+                  require(DictionaryEncodings.contains(encoding),
+                    s"${AggregateMeasureColumns(slot)}: expected dictionary encoding, got $encoding")
+                } else {
+                  require(encoding == Encoding.PLAIN,
+                    s"${AggregateMeasureColumns(slot)}: expected PLAIN encoding, got $encoding")
+                }
+                val pageBytes = dataPage.getBytes.toByteArray
+                NativeBridge.parquetDecodeMeasurePage(
+                  streamHandle, rowGroupHandle, slot,
+                  pageBytes, pageBytes.length, dataPage.getValueCount, rowOffset, hasDefLevels)
+                rowOffset += dataPage.getValueCount
+                rawPage = pageReader.readPage()
+              }
+              require(rowOffset == rowGroupRows,
+                s"${AggregateMeasureColumns(slot)}: pages covered $rowOffset rows, expected $rowGroupRows")
+            }
+
+            // Consumes rowGroupHandle (like parquetRowGroupCount): no
+            // Release, and the handle must not be touched again.
+            NativeBridge.parquetRowGroupAggregate(
+              streamHandle, rowGroupHandle, codeTables, factorTables,
+              AggregateGroupCount, AggregateSlots, AggregateKinds)
+            rowGroups += 1
+            coveredRows += rowGroupRows
+            pageReadStore = reader.readNextRowGroup()
+          }
+        } finally {
+          reader.close()
+        }
+        // Set the flag BEFORE Finish: Finish destroys the native stream even
+        // when it throws, so the finally-block Abort must never fire after it.
+        streamFinished = true
+        actual = NativeBridge.parquetAggregateStreamFinish(streamHandle)
+      } finally {
+        if (!streamFinished) NativeBridge.parquetAggregateStreamAbort(streamHandle)
+      }
+      NativeBridge.releaseMembershipCount3(preparedHandle)
+
+      require(coveredRows == rows, s"row groups covered $coveredRows rows, expected $rows")
+      require(actual.length == expected.length,
+        s"GPU returned ${actual.length} accumulators, expected ${expected.length}")
+      val mismatches = expected.indices.count(index => actual(index) != expected(index))
+      val matched = mismatches == 0
+      println(
+        s"""{"mode":"aggregate","rows":$rows,"rowGroups":$rowGroups,""" +
+          s""""groups":$AggregateGroupCount,"aggregates":$aggregateCount,""" +
+          s""""mismatches":$mismatches,"match":$matched,""" +
+          s""""maxAmountSum":${amountSums.max},"minAmountSum":${amountSums.min}}""")
+      if (!matched) {
+        val first = expected.indices.find(index => actual(index) != expected(index)).get
+        println(
+          s"""{"mode":"aggregate","firstMismatchIndex":$first,""" +
+            s""""group":${first / aggregateCount},"aggregate":${first % aggregateCount},""" +
+            s""""expected":${expected(first)},"actual":${actual(first)}}""")
+        sys.exit(1)
+      }
+      // Cross-command-buffer accumulation into the one per-stream partial
+      // table is the whole point of the per-STREAM (not per-row-group) table;
+      // a single row group would never exercise it.
+      require(rowGroups >= 2,
+        s"expected the aggregate dataset to span at least 2 row groups, got $rowGroups")
+    } finally {
+      spark.stop()
+    }
+  }
+
+  /**
+   * g0 in 0..3 (3 is a non-member: its code is -1), g1 in 0..3, with nulls on
+   * two different moduli so both the null-gate and the code-gate drop rows.
+   * (g0 = 2, g1 = 3) is remapped to (2, 2) so that one group of the 12 is
+   * guaranteed to receive no rows at all.
+   *
+   * amount is ~1e6 per row and negative for the whole g1 = 3 dimension, so with
+   * ~rows/16 rows per group the per-group totals run past +/-2^32 in both
+   * directions -- the hi-word/carry path the split 32-bit atomics have to get
+   * right. quantity is negative for the whole g1 = 1 dimension (which is also
+   * the factor-2 dimension), giving negative per-group sums, and is null every
+   * 13th row so the sum/count(col) null policy is exercised; price is null
+   * every 11th row on a different modulus; amount is never null, so its
+   * measure plane also covers the no-nulls (mask bit clear) path.
+   *
+   * A small parquet.block.size splits the file into several row groups so the
+   * per-stream partial table accumulates across command buffers.
+   */
+  private def writeAggregateDataset(spark: SparkSession, path: String, rows: Int): Unit = {
+    val hadoopConf = spark.sparkContext.hadoopConfiguration
+    val previousBlockSize = hadoopConf.get("parquet.block.size")
+    hadoopConf.setInt("parquet.block.size", 65536)
+    try {
+      spark.range(rows)
+        .selectExpr(
+          "CASE WHEN id % 37 = 0 THEN CAST(NULL AS INT) ELSE CAST(pmod(id, 4) AS INT) END AS g0",
+          "CASE WHEN id % 41 = 0 THEN CAST(NULL AS INT) " +
+            "WHEN pmod(id, 4) = 2 AND pmod(id div 4, 4) = 3 THEN 2 " +
+            "ELSE CAST(pmod(id div 4, 4) AS INT) END AS g1",
+          "CASE WHEN id % 13 = 0 THEN CAST(NULL AS INT) " +
+            "WHEN pmod(id div 4, 4) = 1 THEN CAST(-(pmod(id, 50) + 1) AS INT) " +
+            "ELSE CAST(pmod(id, 50) + 1 AS INT) END AS quantity",
+          "CASE WHEN id % 11 = 0 THEN CAST(NULL AS DECIMAL(7,2)) " +
+            "ELSE CAST(pmod(id, 300) + 100 AS DECIMAL(7,2)) END AS price",
+          "CASE WHEN pmod(id div 4, 4) = 3 THEN CAST(-(1000000 + pmod(id, 7) * 13) AS INT) " +
+            "ELSE CAST(1000000 + pmod(id, 7) * 13 AS INT) END AS amount")
+        .coalesce(1)
+        .write
+        .option("parquet.page.size", "8192")
+        .option("parquet.block.size", "65536")
+        .mode("errorifexists").parquet(path)
+    } finally {
+      if (previousBlockSize != null) hadoopConf.set("parquet.block.size", previousBlockSize)
+      else hadoopConf.unset("parquet.block.size")
     }
   }
 

@@ -28,6 +28,7 @@ xcrun clang++ \
   -I "${JAVA_HOME}/include" \
   -I "${JAVA_HOME}/include/darwin" \
   "${native_root}/jni/SparkMetalBridge.mm" \
+  "${native_root}/jni/ParquetPageRuns.cpp" \
   -o "${build_root}/libsparkmetal.dylib"
 
 javac \

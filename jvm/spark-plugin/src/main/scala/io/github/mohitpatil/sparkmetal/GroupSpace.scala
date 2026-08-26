@@ -3,6 +3,8 @@ package io.github.mohitpatil.sparkmetal
 import scala.collection.mutable
 
 import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.types.{
+  BooleanType, ByteType, DataType, DateType, DecimalType, IntegerType, LongType, ShortType, StringType}
 
 /**
  * Driver-side (pure JVM, no GPU/native calls) builder for the dense
@@ -33,15 +35,17 @@ private[sparkmetal] object GroupSpace {
 
   /**
    * One dimension's collected build-side rows: join key -> its group-key
-   * attribute values (an empty [[InternalRow]] when the dimension
-   * contributes no group keys, i.e. attributeCount == 0). Every attribute
-   * field is assumed to be a nullable INT32 -- the only attribute/measure
-   * type this codebase's GPU tier supports anywhere (see
-   * GroupedAggregateShape's INT32-only measure/group-key restrictions) --
-   * so tuple equality below reads fields with `isNullAt`/`getInt` rather
-   * than a general schema-driven getter.
+   * attribute values (an empty [[InternalRow]], with `attributeCount == 0`
+   * and `attributeTypes` empty, when the dimension contributes no group
+   * keys). `attributeTypes` names every attribute field's type, in row
+   * order, and must have length `attributeCount`; see
+   * [[GroupSpace.SupportedAttributeTypes]] for what `build` accepts --
+   * anything else is rejected with `Left`, naming the offending type.
    */
-  case class Dimension(rows: Array[(Int, InternalRow)], attributeCount: Int)
+  case class Dimension(
+      rows: Array[(Int, InternalRow)],
+      attributeCount: Int,
+      attributeTypes: Seq[DataType] = Seq.empty)
 
   case class Built(
       groupCount: Int,
@@ -61,15 +65,52 @@ private[sparkmetal] object GroupSpace {
 
   private val EmptyTuple: InternalRow = InternalRow()
 
-  // Sentinel distinguishing a null attribute field from every possible boxed
-  // Int value, so two tuples that are both-null in some field compare equal
-  // to each other and unequal to any int (including 0).
-  private object NullField
+  /**
+   * Attribute types `build` knows how to read a value out of and compare by
+   * value: every fixed-width integral/boolean type, int-backed [[DateType]],
+   * [[StringType]] (compared via [[org.apache.spark.unsafe.types.UTF8String]]
+   * equality, which IS value-based), and [[DecimalType]] (any
+   * precision/scale). Anything else -- DoubleType/FloatType, arrays, maps,
+   * structs, ... -- is rejected by `build` before any row is ever read.
+   */
+  private def isSupportedAttributeType(dataType: DataType): Boolean = dataType match {
+    case IntegerType | LongType | ShortType | ByteType | BooleanType | DateType | StringType => true
+    case _: DecimalType => true
+    case _ => false
+  }
 
-  private def attributeKey(row: InternalRow, attributeCount: Int): Seq[Any] =
-    (0 until attributeCount).map { i =>
-      if (row.isNullAt(i)) NullField else row.getInt(i)
+  /**
+   * Extracts field `ordinal`'s value as a plain, independently-comparable
+   * Scala value: `null` for a null field (Scala's `==`/collection equality
+   * treats `null` elements of a `Seq` correctly, so no sentinel is needed);
+   * a UTF8String is `.copy()`d since `row` may be a buffer a collector
+   * reuses. Only called for a `dataType` that `isSupportedAttributeType`
+   * has already accepted -- `build` validates every dimension's
+   * `attributeTypes` before any row is read.
+   */
+  private def attributeValue(row: InternalRow, ordinal: Int, dataType: DataType): Any = {
+    if (row.isNullAt(ordinal)) {
+      null
+    } else {
+      dataType match {
+        case IntegerType => row.getInt(ordinal)
+        case LongType => row.getLong(ordinal)
+        case ShortType => row.getShort(ordinal)
+        case ByteType => row.getByte(ordinal)
+        case BooleanType => row.getBoolean(ordinal)
+        case DateType => row.getInt(ordinal) // int-backed: days since the epoch
+        case StringType => row.getUTF8String(ordinal).copy()
+        case decimalType: DecimalType => row.getDecimal(ordinal, decimalType.precision, decimalType.scale)
+        case other =>
+          // Unreachable: build() rejects any dimension carrying this type
+          // before attributeValue is ever called.
+          throw new IllegalStateException(s"unsupported attribute type reached attributeValue: $other")
+      }
     }
+  }
+
+  private def attributeKey(row: InternalRow, attributeTypes: Seq[DataType]): Seq[Any] =
+    attributeTypes.zipWithIndex.map { case (dataType, ordinal) => attributeValue(row, ordinal, dataType) }
 
   private case class DimensionSpace(
       componentCount: Int,
@@ -79,7 +120,8 @@ private[sparkmetal] object GroupSpace {
 
   /**
    * Left(reason) when: a dimension with attributes has duplicate join keys,
-   * the mixed-radix product exceeds maxGroups, or any dimension is empty.
+   * a dimension's attribute type is not one `build` supports, the
+   * mixed-radix product exceeds maxGroups, or any dimension is empty.
    */
   def build(dimensions: Seq[Dimension], maxGroups: Int): Either[String, Built] = {
     val spaces = mutable.ArrayBuffer.empty[DimensionSpace]
@@ -123,6 +165,11 @@ private[sparkmetal] object GroupSpace {
     if (dimension.rows.isEmpty) {
       return Left(s"dimension $index is empty")
     }
+    if (dimension.attributeTypes.length != dimension.attributeCount) {
+      return Left(
+        s"dimension $index: attributeTypes has length ${dimension.attributeTypes.length}, " +
+          s"expected attributeCount ${dimension.attributeCount}")
+    }
 
     if (dimension.attributeCount == 0) {
       // Attribute-free: every distinct join key maps to the SAME (only)
@@ -136,6 +183,12 @@ private[sparkmetal] object GroupSpace {
       val componentByKey = factorByKey.keys.map(key => key -> 0).toMap
       Right(DimensionSpace(1, componentByKey, factorByKey.toMap, Array(EmptyTuple)))
     } else {
+      dimension.attributeTypes.zipWithIndex.find { case (dataType, _) => !isSupportedAttributeType(dataType) } match {
+        case Some((dataType, ordinal)) =>
+          return Left(s"dimension $index: unsupported attribute type $dataType at attribute position $ordinal")
+        case None => ()
+      }
+
       val seenKeys = mutable.HashSet.empty[Int]
       for ((key, _) <- dimension.rows) {
         if (!seenKeys.add(key)) {
@@ -146,7 +199,7 @@ private[sparkmetal] object GroupSpace {
       val tuples = mutable.ArrayBuffer.empty[InternalRow]
       val componentByKey = mutable.HashMap.empty[Int, Int]
       for ((key, row) <- dimension.rows) {
-        val tupleKey = attributeKey(row, dimension.attributeCount)
+        val tupleKey = attributeKey(row, dimension.attributeTypes)
         val component = componentIndexByTuple.getOrElseUpdate(tupleKey, {
           tuples += row.copy()
           tuples.length - 1

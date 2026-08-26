@@ -16,7 +16,8 @@ import org.apache.spark.sql.{Row, SparkSession}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.AttributeReference
 import org.apache.spark.sql.functions.{col, count, expr, lit, sum}
-import org.apache.spark.sql.types.{IntegerType, LongType, StructField, StructType}
+import org.apache.spark.sql.types.{DoubleType, IntegerType, LongType, StringType, StructField, StructType}
+import org.apache.spark.unsafe.types.UTF8String
 
 // Round-trips a dictionary-encoded Parquet file through the CPU page parser
 // and the GPU expansion kernels, then checks the decoded (dictionary id,
@@ -598,11 +599,18 @@ object ParquetDecodeSmoke {
   // real broadcast-side build: `region` is attribute-free (it contributes
   // NO group component, only a membership gate and a duplicate-build-key
   // multiplicity factor -- region key 2 appears twice on the build side) and
-  // `category` carries 2 attributes (major, minor). Distinct join key 13
-  // deliberately shares its attribute tuple with key 10, proving
-  // GroupSpace.build groups by ATTRIBUTE TUPLE, not by join-key identity: a
-  // fact row joining on either key lands in the very same accumulator (and,
-  // since key 10 is quantity-positive and key 13 quantity-negative -- see
+  // `category` carries 2 attributes of TWO DIFFERENT TYPES: major (int) and
+  // brand (string -- TPC-DS group keys are frequently strings, e.g. q3/q42/
+  // q52/q55 group by i_brand/i_category, so GroupSpace must handle a string
+  // attribute, not just int32). Distinct join key 13 deliberately shares its
+  // FULL attribute tuple (major = 1, brand = "acme") with key 10 -- and
+  // "acme" alone is deliberately reused by key 12 with a DIFFERENT major, so
+  // string-value equality contributing to a tuple match is exercised without
+  // the string alone being sufficient for a match -- proving GroupSpace.build
+  // groups by the whole ATTRIBUTE TUPLE (value-compared, not reference- or
+  // position-compared), not by join-key identity: a fact row joining on
+  // either key 10 or key 13 lands in the very same accumulator (and, since
+  // key 10 is quantity-positive and key 13 quantity-negative -- see
   // writeAggregateDataset -- their contributions actually offset within that
   // one group). Key 14 is a dimension row with no matching fact rows at all,
   // so its group must come back all zeros; key 15 is a fact-side value with
@@ -628,9 +636,12 @@ object ParquetDecodeSmoke {
   // at all, exercising the code-gate on the attribute-free dimension too.
   private val RegionDimensionKeys = Seq(1, 2, 2, 3)
 
-  // Category dimension (2 attributes: major, minor). Keys 10 and 13 share
-  // the tuple (1, 1) -- see the comment above. Key 14 gets no fact rows.
-  private val CategoryDimensionRows = Seq((10, 1, 1), (11, 1, 2), (12, 2, 1), (13, 1, 1), (14, 3, 1))
+  // Category dimension (2 attributes: major: Int, brand: String). Keys 10
+  // and 13 share the tuple (1, "acme") -- see the comment above; key 12
+  // reuses the "acme" string with a different major, a distinct tuple. Key
+  // 14 gets no fact rows.
+  private val CategoryDimensionRows =
+    Seq((10, 1, "acme"), (11, 1, "globex"), (12, 2, "acme"), (13, 1, "acme"), (14, 3, "initech"))
 
   private def runAggregateMode(nativeLibrary: String, metalLibrary: String, rows: Int): Unit = {
     val spark = SparkSession.builder().appName("spark-metal-parquet-aggregate-smoke").getOrCreate()
@@ -654,11 +665,14 @@ object ParquetDecodeSmoke {
       val regionDimensionRows: Array[(Int, InternalRow)] =
         RegionDimensionKeys.map(key => (key, InternalRow())).toArray
       val categoryDimensionRows: Array[(Int, InternalRow)] =
-        CategoryDimensionRows.map { case (key, major, minor) => (key, InternalRow(major, minor)) }.toArray
+        CategoryDimensionRows.map { case (key, major, brand) =>
+          (key, InternalRow(major, UTF8String.fromString(brand)))
+        }.toArray
       val built = GroupSpace.build(
         Seq(
           GroupSpace.Dimension(regionDimensionRows, attributeCount = 0),
-          GroupSpace.Dimension(categoryDimensionRows, attributeCount = 2)),
+          GroupSpace.Dimension(
+            categoryDimensionRows, attributeCount = 2, attributeTypes = Seq(IntegerType, StringType))),
         maxGroups = 1024) match {
         case Right(b) => b
         case Left(reason) => throw new RuntimeException(s"GroupSpace.build unexpectedly rejected: $reason")
@@ -669,30 +683,32 @@ object ParquetDecodeSmoke {
         s"expected 4 groups (1 region component x 4 category tuples), got ${built.groupCount}")
 
       // Reference: an ACTUAL Spark join (region and category dimension
-      // tables against the fact file) + groupBy(major, minor), not a
+      // tables against the fact file) + groupBy(major, brand), not a
       // hand-derived formula. Spark's own equi-join already implements the
       // null-gate (a null key never matches) and the code-gate (region_key
       // = 4 / category_key = 15 match no dimension row); its groupBy
       // already implements the ignore-nulls sum/count(column) policy the
-      // kernel is expected to match.
+      // kernel is expected to match, and groups by the string attribute
+      // exactly the same way real TPC-DS-shaped queries (q3/q42/q52/q55)
+      // group by i_brand/i_category.
       import spark.implicits._
       val fact = spark.read.parquet(path)
       val regionDim = RegionDimensionKeys.toDF("region_key_b")
-      val categoryDim = CategoryDimensionRows.toDF("category_key_b", "major", "minor")
+      val categoryDim = CategoryDimensionRows.toDF("category_key_b", "major", "brand")
       val enriched = fact
         .join(regionDim, fact("region_key") === regionDim("region_key_b"))
         .join(categoryDim, fact("category_key") === categoryDim("category_key_b"))
         .withColumn("price_unscaled", expr("CAST(price * 100 AS INT)"))
-      val referenceAgg = enriched.groupBy("major", "minor").agg(
+      val referenceAgg = enriched.groupBy("major", "brand").agg(
         count(lit(1)).as("cnt"),
         sum(col("quantity")).as("sumQuantity"),
         sum(col("price_unscaled")).as("sumPriceUnscaled"),
         sum(col("amount")).as("sumAmount"),
         count(col("quantity")).as("countQuantity")
       ).collect()
-      val referenceMap: Map[(Int, Int), Array[Long]] = referenceAgg.map { row =>
+      val referenceMap: Map[(Int, String), Array[Long]] = referenceAgg.map { row =>
         def longOrZero(index: Int): Long = if (row.isNullAt(index)) 0L else row.getLong(index)
-        (row.getInt(0), row.getInt(1)) ->
+        (row.getInt(0), row.getString(1)) ->
           Array(longOrZero(2), longOrZero(3), longOrZero(4), longOrZero(5), longOrZero(6))
       }.toMap
 
@@ -702,7 +718,8 @@ object ParquetDecodeSmoke {
       val expected = new Array[Long](built.groupCount * aggregateCount)
       for (group <- 0 until built.groupCount) {
         val categoryTuple = built.groupTuples(group)(1)
-        val values = referenceMap.getOrElse((categoryTuple.getInt(0), categoryTuple.getInt(1)), new Array[Long](5))
+        val key = (categoryTuple.getInt(0), categoryTuple.getUTF8String(1).toString)
+        val values = referenceMap.getOrElse(key, new Array[Long](5))
         for (aggregate <- 0 until aggregateCount) {
           expected(group * aggregateCount + aggregate) = values(aggregate)
         }
@@ -713,10 +730,10 @@ object ParquetDecodeSmoke {
       // ever comparing them to the GPU's.
       val emptyGroup = (0 until built.groupCount).find { g =>
         val tuple = built.groupTuples(g)(1)
-        tuple.getInt(0) == 3 && tuple.getInt(1) == 1
-      }.getOrElse(throw new RuntimeException("expected a group for category tuple (major=3, minor=1)"))
+        tuple.getInt(0) == 3 && tuple.getUTF8String(1).toString == "initech"
+      }.getOrElse(throw new RuntimeException("expected a group for category tuple (major=3, brand=\"initech\")"))
       require((0 until aggregateCount).forall(a => expected(emptyGroup * aggregateCount + a) == 0L),
-        s"group $emptyGroup (category key 14, tuple (3,1)) was expected to receive no rows, got " +
+        s"group $emptyGroup (category key 14, tuple (3,\"initech\")) was expected to receive no rows, got " +
           (0 until aggregateCount).map(a => expected(emptyGroup * aggregateCount + a)).mkString(","))
       val quantitySums = (0 until built.groupCount).map(g => expected(g * aggregateCount + 1))
       require(quantitySums.exists(_ < 0L),
@@ -901,7 +918,7 @@ object ParquetDecodeSmoke {
     // must be rejected: unlike an attribute-free dimension, there is no
     // factor to fold a repeated key into once it carries attributes.
     val duplicateKeyDimension = GroupSpace.Dimension(
-      Array((1, InternalRow(10)), (1, InternalRow(20))), attributeCount = 1)
+      Array((1, InternalRow(10)), (1, InternalRow(20))), attributeCount = 1, attributeTypes = Seq(IntegerType))
     val duplicateKeyResult = GroupSpace.build(Seq(duplicateKeyDimension), maxGroups = 1000)
     require(duplicateKeyResult.isLeft,
       s"expected a duplicate join key in an attributed dimension to be rejected, got $duplicateKeyResult")
@@ -909,9 +926,9 @@ object ParquetDecodeSmoke {
     // An oversized group space (the mixed-radix product exceeds maxGroups)
     // must be rejected: 50 x 50 = 2500 groups against a cap of 100.
     val bigDimension0 = GroupSpace.Dimension(
-      Array.tabulate(50)(i => (i, InternalRow(i))), attributeCount = 1)
+      Array.tabulate(50)(i => (i, InternalRow(i))), attributeCount = 1, attributeTypes = Seq(IntegerType))
     val bigDimension1 = GroupSpace.Dimension(
-      Array.tabulate(50)(i => (i + 1000, InternalRow(i))), attributeCount = 1)
+      Array.tabulate(50)(i => (i + 1000, InternalRow(i))), attributeCount = 1, attributeTypes = Seq(IntegerType))
     val oversizedResult = GroupSpace.build(Seq(bigDimension0, bigDimension1), maxGroups = 100)
     require(oversizedResult.isLeft,
       s"expected a 50x50=2500-group space to be rejected by maxGroups=100, got $oversizedResult")
@@ -921,11 +938,27 @@ object ParquetDecodeSmoke {
     val emptyResult = GroupSpace.build(Seq(emptyDimension), maxGroups = 1000)
     require(emptyResult.isLeft, s"expected an empty dimension to be rejected, got $emptyResult")
 
+    // An attribute type GroupSpace.build does not support (e.g. DoubleType)
+    // must be rejected, naming the type -- it never even gets to reading
+    // any row's value.
+    val unsupportedTypeDimension = GroupSpace.Dimension(
+      Array((1, InternalRow(1.5d))), attributeCount = 1, attributeTypes = Seq(DoubleType))
+    val unsupportedTypeResult = GroupSpace.build(Seq(unsupportedTypeDimension), maxGroups = 1000)
+    require(unsupportedTypeResult.isLeft,
+      s"expected an unsupported attribute type (DoubleType) to be rejected, got $unsupportedTypeResult")
+    val unsupportedTypeReason = unsupportedTypeResult match {
+      case Left(reason) => reason
+      case Right(_) => ""
+    }
+    require(unsupportedTypeReason.contains("DoubleType"),
+      s"expected the rejection reason to name DoubleType, got $unsupportedTypeResult")
+
     println(
       s"""{"mode":"aggregate","case":"group-space-build-rejections",""" +
         s""""duplicateKeyRejected":${duplicateKeyResult.isLeft},""" +
         s""""oversizedRejected":${oversizedResult.isLeft},""" +
-        s""""emptyDimensionRejected":${emptyResult.isLeft}}""")
+        s""""emptyDimensionRejected":${emptyResult.isLeft},""" +
+        s""""unsupportedTypeRejected":${unsupportedTypeResult.isLeft}}""")
   }
 
   /**
@@ -941,8 +974,8 @@ object ParquetDecodeSmoke {
    * ~rows/5 rows per category the per-group totals run past +/-2^32 in both
    * directions -- the hi-word/carry path the split 32-bit atomics have to
    * get right. quantity is negative for category_key IN (11, 13) (13 is one
-   * of the two keys that collapse into the (major=1, minor=1) group with
-   * key 10, so that group's quantity sum mixes positive and negative
+   * of the two keys that collapse into the (major=1, brand="acme") group
+   * with key 10, so that group's quantity sum mixes positive and negative
    * contributions from two distinct join keys) and null every 13th row, so
    * the sum/count(col) null policy is exercised; price is null every 11th
    * row on a different modulus; amount is never null, so its measure plane

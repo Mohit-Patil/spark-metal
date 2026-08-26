@@ -35,9 +35,12 @@ private[sparkmetal] case class ParquetMembershipSplit(
 /**
  * Drives the GPU Parquet decode + membership count (Tasks 3/4) per
  * (file, row group), falling back to a CPU parquet-mr count for any row
- * group whose pages the native decoder rejects. Not yet reachable from the
- * planner (Task 6 wires eligibility + plan substitution); driven directly by
- * ParquetDecodeSmoke's "exec" mode until then.
+ * group whose pages the native decoder rejects. Planned by
+ * [[SparkMetalColumnarRule]] in place of [[MetalFusedMembershipCountExec]]
+ * whenever the fact-side scan is an eligible bucketless, unpartitioned
+ * Parquet [[org.apache.spark.sql.execution.FileSourceScanExec]] (Task 6);
+ * also driven directly by ParquetDecodeSmoke's "exec" mode for
+ * operator-level testing.
  */
 case class MetalParquetMembershipCountExec(
     outputAttribute: Attribute,

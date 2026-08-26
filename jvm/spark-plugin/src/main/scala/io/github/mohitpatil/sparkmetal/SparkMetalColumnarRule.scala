@@ -1,5 +1,8 @@
 package io.github.mohitpatil.sparkmetal
 
+import scala.util.control.NonFatal
+
+import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, Count, Partial, Sum}
 import org.apache.spark.sql.catalyst.optimizer.BuildRight
@@ -33,7 +36,7 @@ final class SparkMetalColumnarRule(
     ansiEnabled: Boolean,
     adaptiveEnabled: Boolean,
     parquetScanEnabled: Boolean)
-    extends ColumnarRule {
+    extends ColumnarRule with Logging {
 
   override def preColumnarTransitions: Rule[SparkPlan] = new Rule[SparkPlan] {
     override def apply(plan: SparkPlan): SparkPlan = plan.transformUp {
@@ -87,6 +90,14 @@ final class SparkMetalColumnarRule(
    * (letting the fused path proceed) whenever the region does not match
    * these conditions exactly, `spark.metal.parquetScan.enabled` is false, or
    * `ParquetEligibility.check` rejects the files.
+   *
+   * Safe-fallback: the shape check and `ParquetEligibility.check` both touch
+   * the filesystem (file listing, footer reads) on the planner's hot path.
+   * `ParquetEligibility.checkFile` does not itself catch I/O failures (a
+   * corrupt footer, a transient read error, a permissions problem), so any
+   * such throwable is caught here and treated as "not eligible" rather than
+   * aborting planning of the whole query -- the fused path is always a safe
+   * fallback for a file this GPU path cannot even inspect.
    */
   private def parquetMembershipCountExec(
       outputAttribute: Attribute,
@@ -96,30 +107,38 @@ final class SparkMetalColumnarRule(
     if (!parquetScanEnabled) {
       return None
     }
-    factPlan match {
-      case scan: FileSourceScanExec =>
-        val relation = scan.relation
-        val isEligibleShape =
-          relation.fileFormat.isInstanceOf[ParquetFileFormat] &&
-            relation.partitionSchema.isEmpty &&
-            relation.bucketSpec.isEmpty &&
-            scan.output.length == 3 &&
-            scan.output.forall(_.dataType == IntegerType) &&
-            ordinals.toSet == scan.output.indices.toSet &&
-            scan.dataFilters.forall(isOnlyNotNullPredicate)
-        if (!isEligibleShape) {
-          None
-        } else {
-          val columnNames = ordinals.map(scan.output(_).name)
-          val files = relation.location.inputFiles.toSeq
-          if (ParquetEligibility.check(files, columnNames).isRight) {
-            Some(MetalParquetMembershipCountExec(
-              outputAttribute, files, columnNames, keyPlans, nativeLibrary, metalLibrary))
-          } else {
+    try {
+      factPlan match {
+        case scan: FileSourceScanExec =>
+          val relation = scan.relation
+          val isEligibleShape =
+            relation.fileFormat.isInstanceOf[ParquetFileFormat] &&
+              relation.partitionSchema.isEmpty &&
+              relation.bucketSpec.isEmpty &&
+              scan.output.length == 3 &&
+              scan.output.forall(_.dataType == IntegerType) &&
+              ordinals.toSet == scan.output.indices.toSet &&
+              scan.dataFilters.forall(isOnlyNotNullPredicate)
+          if (!isEligibleShape) {
             None
+          } else {
+            val columnNames = ordinals.map(scan.output(_).name)
+            val files = relation.location.inputFiles.toSeq
+            if (ParquetEligibility.check(files, columnNames).isRight) {
+              Some(MetalParquetMembershipCountExec(
+                outputAttribute, files, columnNames, keyPlans, nativeLibrary, metalLibrary))
+            } else {
+              None
+            }
           }
-        }
-      case _ => None
+        case _ => None
+      }
+    } catch {
+      case NonFatal(e) =>
+        logWarning(
+          "Parquet eligibility check for the GPU scan failed; falling back to " +
+            "MetalFusedMembershipCountExec for this region", e)
+        None
     }
   }
 

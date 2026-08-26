@@ -100,4 +100,25 @@ public final class NativeBridge {
 
     public static native void membershipCount3StreamAbort(long streamHandle);
 
+    // Allocates row-group ids (int32) and validity (uchar) planes for 3 columns
+    // inside the stream, zero-fills validity via a blit, returns a handle.
+    public static native long parquetRowGroupBegin(long streamHandle, int rowCount);
+
+    // Parses one decompressed V1 data page on the CPU and encodes its GPU
+    // expansion into the stream (no wait). rowOffset is the first row of this
+    // page within the row group for this column.
+    public static native void parquetDecodePage(
+            long streamHandle, long rowGroupHandle, int column,
+            byte[] pageBytes, int pageLength, int valueCount, int rowOffset,
+            boolean hasDefLevels);
+
+    // Debug/verification: blocks, then copies the decoded planes out.
+    public static native void parquetRowGroupRead(
+            long streamHandle, long rowGroupHandle, int column,
+            int[] idsOut, byte[] validityOut);
+
+    // Releases a row-group handle without running membership (used by the smoke
+    // test and error paths). Task 4 adds the membership variant.
+    public static native void parquetRowGroupRelease(long rowGroupHandle);
+
 }

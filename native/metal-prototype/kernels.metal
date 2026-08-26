@@ -116,6 +116,57 @@ kernel void fused_membership_count_3_unique(
     }
 }
 
+struct ValueWorkItem { uint value_start; uint count; uint kind; uint payload; };
+struct RowSegment { uint row_start; uint value_start; uint count; uint valid; };
+struct ExpandParams { uint item_count; uint bit_width; uint value_bytes_offset; uint output_base; };
+struct ScatterParams { uint segment_count; uint row_base; };
+
+kernel void expand_value_runs(
+    device const uchar *page [[buffer(0)]],
+    device const ValueWorkItem *items [[buffer(1)]],
+    device int *output [[buffer(2)]],
+    constant ExpandParams &params [[buffer(3)]],
+    uint group_index [[threadgroup_position_in_grid]],
+    uint local_index [[thread_index_in_threadgroup]])
+{
+    if (group_index >= params.item_count) return;
+    ValueWorkItem item = items[group_index];
+    if (local_index >= item.count) return;
+    int value;
+    if (item.kind == 0) {
+        value = int(item.payload);
+    } else {
+        ulong bit = ulong(item.payload) + ulong(local_index) * params.bit_width;
+        device const uchar *bytes = page + params.value_bytes_offset;
+        uint window = uint(bytes[bit >> 3])
+            | (uint(bytes[(bit >> 3) + 1]) << 8)
+            | (uint(bytes[(bit >> 3) + 2]) << 16)
+            | (uint(bytes[(bit >> 3) + 3]) << 24);
+        value = int((window >> (bit & 7)) & ((1u << params.bit_width) - 1u));
+    }
+    output[params.output_base + item.value_start + local_index] = value;
+}
+
+kernel void scatter_segments(
+    device const int *values [[buffer(0)]],
+    device const RowSegment *segments [[buffer(1)]],
+    device int *ids [[buffer(2)]],
+    device uchar *validity [[buffer(3)]],
+    constant ScatterParams &params [[buffer(4)]],
+    uint group_index [[threadgroup_position_in_grid]],
+    uint local_index [[thread_index_in_threadgroup]])
+{
+    if (group_index >= params.segment_count) return;
+    RowSegment segment = segments[group_index];
+    if (local_index >= segment.count) return;
+    uint row = params.row_base + segment.row_start + local_index;
+    if (segment.valid != 0) {
+        ids[row] = values[segment.value_start + local_index];
+    } else {
+        validity[row] = 1;
+    }
+}
+
 kernel void fused_membership_count_3_multiplicity(
     device const int *input_0 [[buffer(0)]],
     device const int *input_1 [[buffer(1)]],

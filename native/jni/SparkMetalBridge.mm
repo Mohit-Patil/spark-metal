@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -10,6 +11,8 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include "ParquetPageRuns.h"
+
 namespace {
 
 id<MTLDevice> device;
@@ -17,6 +20,8 @@ id<MTLCommandQueue> commandQueue;
 id<MTLComputePipelineState> fusedPipeline;
 id<MTLComputePipelineState> membershipCountUniquePipeline;
 id<MTLComputePipelineState> membershipCountMultiplicityPipeline;
+id<MTLComputePipelineState> expandValueRunsPipeline;
+id<MTLComputePipelineState> scatterSegmentsPipeline;
 
 struct FusedParameters {
     uint32_t count;
@@ -61,6 +66,31 @@ struct MembershipStream {
     std::vector<id<MTLBuffer>> freeStaging;
     std::vector<id<MTLBuffer>> partialBuffers;
     std::vector<NSUInteger> partialGroupCounts;
+};
+
+struct ExpandParams {
+    uint32_t itemCount;
+    uint32_t bitWidth;
+    uint32_t valueBytesOffset;
+    uint32_t outputBase;
+};
+
+struct ScatterParams {
+    uint32_t segmentCount;
+    uint32_t rowBase;
+};
+
+// Holds the decoded ids/validity planes for one Parquet row group while its
+// pages are being expanded on the GPU. The planes are NOT staging buffers
+// returned via pendingStaging after each submit -- the row group outlives
+// several command buffers, so they are only recycled by
+// parquetRowGroupRelease, once the caller is done reading them.
+struct ParquetRowGroup {
+    uint32_t rowCount = 0;
+    id<MTLBuffer> ids[3];
+    id<MTLBuffer> validity[3];
+    bool columnHasNulls[3] = {false, false, false};
+    MembershipStream *stream = nullptr;
 };
 
 id<MTLBuffer> acquireStagingBuffer(MembershipStream *stream, size_t length) {
@@ -232,6 +262,28 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_initialize(
             [device newComputePipelineStateWithFunction:membershipMultiplicityFunction error:&error];
         if (membershipCountMultiplicityPipeline == nil) {
             throwRuntime(environment, [NSString stringWithFormat:@"Cannot build multiplicity membership-count pipeline: %@", error]);
+            return;
+        }
+        id<MTLFunction> expandValueRunsFunction = [library newFunctionWithName:@"expand_value_runs"];
+        if (expandValueRunsFunction == nil) {
+            throwRuntime(environment, @"Kernel expand_value_runs was not found");
+            return;
+        }
+        expandValueRunsPipeline =
+            [device newComputePipelineStateWithFunction:expandValueRunsFunction error:&error];
+        if (expandValueRunsPipeline == nil) {
+            throwRuntime(environment, [NSString stringWithFormat:@"Cannot build expand-value-runs pipeline: %@", error]);
+            return;
+        }
+        id<MTLFunction> scatterSegmentsFunction = [library newFunctionWithName:@"scatter_segments"];
+        if (scatterSegmentsFunction == nil) {
+            throwRuntime(environment, @"Kernel scatter_segments was not found");
+            return;
+        }
+        scatterSegmentsPipeline =
+            [device newComputePipelineStateWithFunction:scatterSegmentsFunction error:&error];
+        if (scatterSegmentsPipeline == nil) {
+            throwRuntime(environment, [NSString stringWithFormat:@"Cannot build scatter-segments pipeline: %@", error]);
         }
     }
 }
@@ -1083,5 +1135,285 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_membershipCount3StreamAbort(
             [commandBuffer waitUntilCompleted];
         }
         delete stream;
+    }
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetRowGroupBegin(
+    JNIEnv *environment,
+    jclass,
+    jlong streamHandle,
+    jint rowCount) {
+    @autoreleasepool {
+        if (commandQueue == nil) {
+            throwRuntime(environment, @"NativeBridge.initialize must be called first");
+            return 0;
+        }
+        if (streamHandle == 0 || rowCount <= 0) {
+            throwRuntime(environment, @"Row-group begin requires a stream and a positive row count");
+            return 0;
+        }
+        auto *stream = reinterpret_cast<MembershipStream *>(
+            static_cast<uintptr_t>(streamHandle));
+        size_t idsBytes = static_cast<size_t>(rowCount) * sizeof(int32_t);
+        size_t validityBytes = static_cast<size_t>(rowCount);
+
+        auto *rowGroup = new ParquetRowGroup();
+        rowGroup->rowCount = static_cast<uint32_t>(rowCount);
+        rowGroup->stream = stream;
+
+        id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+        bool allocationFailed = false;
+        for (int column = 0; column < 3; ++column) {
+            id<MTLBuffer> ids = acquireStagingBuffer(stream, idsBytes);
+            id<MTLBuffer> validity = acquireStagingBuffer(stream, validityBytes);
+            if (ids == nil || validity == nil) {
+                allocationFailed = true;
+                break;
+            }
+            rowGroup->ids[column] = ids;
+            rowGroup->validity[column] = validity;
+            rowGroup->columnHasNulls[column] = false;
+            [blit fillBuffer:validity range:NSMakeRange(0, validityBytes) value:0];
+        }
+        [blit endEncoding];
+        if (allocationFailed) {
+            delete rowGroup;
+            throwRuntime(environment, @"Cannot allocate Parquet row-group planes");
+            return 0;
+        }
+        [commandBuffer commit];
+        stream->commandBuffers.push_back(commandBuffer);
+        return static_cast<jlong>(reinterpret_cast<uintptr_t>(rowGroup));
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetDecodePage(
+    JNIEnv *environment,
+    jclass,
+    jlong streamHandle,
+    jlong rowGroupHandle,
+    jint column,
+    jbyteArray pageBytes,
+    jint pageLength,
+    jint valueCount,
+    jint rowOffset,
+    jboolean hasDefLevels) {
+    @autoreleasepool {
+        if (expandValueRunsPipeline == nil || scatterSegmentsPipeline == nil || commandQueue == nil) {
+            throwRuntime(environment, @"NativeBridge.initialize must be called first");
+            return;
+        }
+        if (streamHandle == 0 || rowGroupHandle == 0 || column < 0 || column >= 3 ||
+            pageBytes == nullptr || pageLength <= 0 || valueCount < 0 || rowOffset < 0) {
+            throwRuntime(environment, @"Invalid Parquet page decode arguments");
+            return;
+        }
+        auto *stream = reinterpret_cast<MembershipStream *>(
+            static_cast<uintptr_t>(streamHandle));
+        auto *rowGroup = reinterpret_cast<ParquetRowGroup *>(
+            static_cast<uintptr_t>(rowGroupHandle));
+
+        // pageLength + 4: expand_value_runs's 4-byte bit window may read up to
+        // 3 bytes past the payload; the tail is zeroed so that read is inert.
+        id<MTLBuffer> pageStaging = acquireStagingBuffer(stream, static_cast<size_t>(pageLength) + 4);
+        if (pageStaging == nil) {
+            throwRuntime(environment, @"Cannot allocate Parquet page staging buffer");
+            return;
+        }
+        uint8_t *pageContents = static_cast<uint8_t *>(pageStaging.contents);
+        environment->GetByteArrayRegion(
+            pageBytes, 0, pageLength, reinterpret_cast<jbyte *>(pageContents));
+        if (environment->ExceptionCheck()) return;
+        memset(pageContents + pageLength, 0, 4);
+
+        sparkmetal::PageRuns runs;
+        bool parsed = sparkmetal::parseDataPageV1(
+            pageContents, static_cast<size_t>(pageLength), static_cast<uint32_t>(valueCount),
+            hasDefLevels == JNI_TRUE, runs);
+        if (!parsed) {
+            throwRuntime(environment, @"Unsupported Parquet page");
+            return;
+        }
+        if (runs.allValid && runs.items.empty()) {
+            // Zero-value page (valueCount == 0); nothing to expand.
+            return;
+        }
+        if (!runs.allValid && runs.segments.empty()) {
+            // Defensive: a non-empty page always yields at least one segment
+            // once its definition levels are folded, but guard against
+            // dispatching an empty scatter regardless.
+            return;
+        }
+
+        // items can be empty here only when the whole page is null
+        // (nonNullCount == 0): scatter_segments still must run so the
+        // validity plane records those rows as null.
+        id<MTLBuffer> itemsBuffer = nil;
+        if (!runs.items.empty()) {
+            itemsBuffer = acquireStagingBuffer(
+                stream, runs.items.size() * sizeof(sparkmetal::ValueWorkItem));
+            if (itemsBuffer == nil) {
+                throwRuntime(environment, @"Cannot allocate Parquet work-item staging buffer");
+                return;
+            }
+            memcpy(itemsBuffer.contents, runs.items.data(),
+                runs.items.size() * sizeof(sparkmetal::ValueWorkItem));
+        }
+
+        std::vector<id<MTLBuffer>> usedStaging = {pageStaging};
+        if (itemsBuffer != nil) usedStaging.push_back(itemsBuffer);
+
+        id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+
+        if (runs.allValid) {
+            // allValid implies nonNullCount == valueCount > 0, so items is
+            // guaranteed non-empty by the guard above.
+            ExpandParams params = {
+                static_cast<uint32_t>(runs.items.size()),
+                runs.bitWidth,
+                runs.valueBytesOffset,
+                static_cast<uint32_t>(rowOffset)
+            };
+            [encoder setComputePipelineState:expandValueRunsPipeline];
+            [encoder setBuffer:pageStaging offset:0 atIndex:0];
+            [encoder setBuffer:itemsBuffer offset:0 atIndex:1];
+            [encoder setBuffer:rowGroup->ids[column] offset:0 atIndex:2];
+            [encoder setBytes:&params length:sizeof(params) atIndex:3];
+            [encoder dispatchThreadgroups:MTLSizeMake(runs.items.size(), 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(sparkmetal::kDecodeChunk, 1, 1)];
+        } else {
+            rowGroup->columnHasNulls[column] = true;
+            size_t valuesBytes = std::max<size_t>(
+                4, static_cast<size_t>(runs.nonNullCount) * sizeof(int32_t));
+            id<MTLBuffer> valuesBuffer = acquireStagingBuffer(stream, valuesBytes);
+            if (valuesBuffer == nil) {
+                [encoder endEncoding];
+                throwRuntime(environment, @"Cannot allocate Parquet value-scratch staging buffer");
+                return;
+            }
+            usedStaging.push_back(valuesBuffer);
+
+            if (itemsBuffer != nil) {
+                ExpandParams expandParams = {
+                    static_cast<uint32_t>(runs.items.size()),
+                    runs.bitWidth,
+                    runs.valueBytesOffset,
+                    0u
+                };
+                [encoder setComputePipelineState:expandValueRunsPipeline];
+                [encoder setBuffer:pageStaging offset:0 atIndex:0];
+                [encoder setBuffer:itemsBuffer offset:0 atIndex:1];
+                [encoder setBuffer:valuesBuffer offset:0 atIndex:2];
+                [encoder setBytes:&expandParams length:sizeof(expandParams) atIndex:3];
+                [encoder dispatchThreadgroups:MTLSizeMake(runs.items.size(), 1, 1)
+                         threadsPerThreadgroup:MTLSizeMake(sparkmetal::kDecodeChunk, 1, 1)];
+            }
+
+            id<MTLBuffer> segmentsBuffer = acquireStagingBuffer(
+                stream, runs.segments.size() * sizeof(sparkmetal::RowSegment));
+            if (segmentsBuffer == nil) {
+                [encoder endEncoding];
+                throwRuntime(environment, @"Cannot allocate Parquet segment staging buffer");
+                return;
+            }
+            memcpy(segmentsBuffer.contents, runs.segments.data(),
+                runs.segments.size() * sizeof(sparkmetal::RowSegment));
+            usedStaging.push_back(segmentsBuffer);
+
+            ScatterParams scatterParams = {
+                static_cast<uint32_t>(runs.segments.size()),
+                static_cast<uint32_t>(rowOffset)
+            };
+            [encoder setComputePipelineState:scatterSegmentsPipeline];
+            [encoder setBuffer:valuesBuffer offset:0 atIndex:0];
+            [encoder setBuffer:segmentsBuffer offset:0 atIndex:1];
+            [encoder setBuffer:rowGroup->ids[column] offset:0 atIndex:2];
+            [encoder setBuffer:rowGroup->validity[column] offset:0 atIndex:3];
+            [encoder setBytes:&scatterParams length:sizeof(scatterParams) atIndex:4];
+            [encoder dispatchThreadgroups:MTLSizeMake(runs.segments.size(), 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(sparkmetal::kDecodeChunk, 1, 1)];
+        }
+
+        [encoder endEncoding];
+        [commandBuffer commit];
+
+        stream->commandBuffers.push_back(commandBuffer);
+        for (id<MTLBuffer> buffer : usedStaging) {
+            stream->pendingStaging.push_back({buffer, commandBuffer});
+        }
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetRowGroupRead(
+    JNIEnv *environment,
+    jclass,
+    jlong streamHandle,
+    jlong rowGroupHandle,
+    jint column,
+    jintArray idsOut,
+    jbyteArray validityOut) {
+    @autoreleasepool {
+        if (streamHandle == 0 || rowGroupHandle == 0 || column < 0 || column >= 3 ||
+            idsOut == nullptr || validityOut == nullptr) {
+            throwRuntime(environment, @"Invalid Parquet row-group read arguments");
+            return;
+        }
+        auto *stream = reinterpret_cast<MembershipStream *>(
+            static_cast<uintptr_t>(streamHandle));
+        auto *rowGroup = reinterpret_cast<ParquetRowGroup *>(
+            static_cast<uintptr_t>(rowGroupHandle));
+        for (id<MTLCommandBuffer> commandBuffer : stream->commandBuffers) {
+            [commandBuffer waitUntilCompleted];
+            if (commandBuffer.status == MTLCommandBufferStatusError) {
+                throwRuntime(environment, [NSString stringWithFormat:@"Metal command failed: %@", commandBuffer.error]);
+                return;
+            }
+        }
+        jsize idsLength = environment->GetArrayLength(idsOut);
+        jsize validityLength = environment->GetArrayLength(validityOut);
+        if (static_cast<uint32_t>(idsLength) != rowGroup->rowCount ||
+            static_cast<uint32_t>(validityLength) != rowGroup->rowCount) {
+            throwRuntime(environment, @"Output arrays must match the row-group row count");
+            return;
+        }
+        environment->SetIntArrayRegion(
+            idsOut, 0, idsLength, static_cast<jint *>(rowGroup->ids[column].contents));
+        environment->SetByteArrayRegion(
+            validityOut, 0, validityLength, static_cast<jbyte *>(rowGroup->validity[column].contents));
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetRowGroupRelease(
+    JNIEnv *environment,
+    jclass,
+    jlong rowGroupHandle) {
+    @autoreleasepool {
+        if (rowGroupHandle == 0) {
+            throwRuntime(environment, @"Invalid Parquet row-group handle");
+            return;
+        }
+        auto *rowGroup = reinterpret_cast<ParquetRowGroup *>(
+            static_cast<uintptr_t>(rowGroupHandle));
+        MembershipStream *stream = rowGroup->stream;
+        id<MTLCommandBuffer> lastCommandBuffer =
+            (stream != nullptr && !stream->commandBuffers.empty())
+                ? stream->commandBuffers.back()
+                : nil;
+        for (int column = 0; column < 3; ++column) {
+            if (lastCommandBuffer != nil) {
+                stream->pendingStaging.push_back({rowGroup->ids[column], lastCommandBuffer});
+                stream->pendingStaging.push_back({rowGroup->validity[column], lastCommandBuffer});
+            } else if (stream != nullptr) {
+                stream->freeStaging.push_back(rowGroup->ids[column]);
+                stream->freeStaging.push_back(rowGroup->validity[column]);
+            }
+        }
+        delete rowGroup;
     }
 }

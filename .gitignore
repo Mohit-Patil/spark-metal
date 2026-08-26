@@ -15,4 +15,5 @@ __pycache__/
 benchmark-data/
 benchmark-results/
 spark-events/
-
+.tools/
+spark-warehouse/

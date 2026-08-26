@@ -17,10 +17,10 @@ Direct Metal is the provisional primary candidate for SQL execution because it e
 
 ## Current status
 
-- Repository foundation and research charter: in progress.
+- Private repository and research charter: established.
 - First test host detected: 16 GB MacBook Air with Apple M5.
 - Xcode and the Metal compiler: available.
-- Java and Apache Spark: not yet installed.
+- OpenJDK 21 and Apache Spark 4.2.0: installed and ARM64 smoke-tested.
 - TPC-DS baseline: not yet generated.
 
 ## Project principles
@@ -44,11 +44,31 @@ Direct Metal is the provisional primary candidate for SQL execution because it e
 
 The next milestone is a reproducible vanilla Spark baseline:
 
-1. Install and pin an ARM64 JDK and Spark distribution.
+1. Review and explicitly accept the TPC-DS kit licence.
 2. Generate TPC-DS scale factor 10 in Parquet.
 3. Execute the full query set where practical.
 4. Capture plans, correctness hashes, Spark metrics, and repeated runtimes.
 5. Select one numerical query fragment for MLX and Metal feasibility experiments.
 
-This repository is private while the feasibility work is underway.
+## Local setup
 
+```bash
+source scripts/project-env.sh
+scripts/smoke-test-spark.sh
+scripts/fetch-spark-tpcds-assets.sh
+```
+
+The TPC-DS generator is intentionally not vendored. After reviewing its licence,
+build the pinned generator with an explicit acknowledgement:
+
+```bash
+TPCDS_EULA_ACCEPTED=yes scripts/setup-tpcds-kit.sh
+scripts/generate-tpcds-raw.sh
+scripts/prepare-tpcds-parquet.sh
+scripts/run-tpcds-cpu.sh --queries q1 --warmups 1 --runs 5
+```
+
+Performance numbers produced here are research results and are not comparable to
+official TPC benchmark results.
+
+This repository is private while the feasibility work is underway.

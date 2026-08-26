@@ -5,13 +5,13 @@
 - [x] Establish project goal and success threshold.
 - [x] Record first-host hardware and missing dependencies.
 - [x] Define roles for Metal, MLX, Core ML/ANE, Spark ML, and SynapseML.
-- [ ] Publish the private repository.
+- [x] Publish the private repository.
 
 ## M1 — Reproducible CPU baseline
 
-- [ ] Select and pin ARM64 JDK.
-- [ ] Select and pin Spark/Scala version.
-- [ ] Add TPC-DS data generator.
+- [x] Select and pin ARM64 JDK.
+- [x] Select and pin Spark/Scala version.
+- [x] Add a licence-gated, pinned TPC-DS generator setup.
 - [ ] Generate scale-factor-10 Parquet data.
 - [ ] Add query runner, plan capture, metrics, and correctness hashes.
 - [ ] Run and publish the vanilla CPU baseline.
@@ -51,4 +51,3 @@
 - [ ] Integer equi-join.
 - [ ] Wider TPC-DS coverage.
 - [ ] Revisit zero-copy buffers, Parquet decoding, and local shuffle.
-

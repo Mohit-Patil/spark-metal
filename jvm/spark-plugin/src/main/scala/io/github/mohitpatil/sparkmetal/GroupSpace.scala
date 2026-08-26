@@ -77,8 +77,13 @@ private[sparkmetal] object GroupSpace {
    * equality, which IS value-based), and [[DecimalType]] (any
    * precision/scale). Anything else -- DoubleType/FloatType, arrays, maps,
    * structs, ... -- is rejected by `build` before any row is ever read.
+   *
+   * Exposed at `private[sparkmetal]` (not just `private`) so
+   * `SparkMetalColumnarRule` can pre-reject an unsupported group-key
+   * attribute type at planning time using the SAME predicate `build` itself
+   * enforces, rather than maintaining a second, independently-drifting copy.
    */
-  private def isSupportedAttributeType(dataType: DataType): Boolean = dataType match {
+  private[sparkmetal] def isSupportedAttributeType(dataType: DataType): Boolean = dataType match {
     case IntegerType | LongType | ShortType | ByteType | BooleanType | DateType | StringType => true
     case _: DecimalType => true
     case _ => false

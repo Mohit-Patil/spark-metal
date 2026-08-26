@@ -33,7 +33,13 @@ source "${script_dir}/project-env.sh"
 # (regenerating the dataset with a larger dictionary page size, or relaxing
 # the native decoder's key-dictionary requirement) -- see task-6-report.md.
 grouped_queries="${TPCDS_QUERIES:-q31}"
-boundary_queries="${TPCDS_BOUNDARY_QUERIES:-q96}"
+# q96/q88/q90: all three are the existing count-only, zero-group-key shape
+# -- matchRegion rejects this shape outright (before any ParquetEligibility
+# work), so they must keep planning the existing membership operators, never
+# MetalParquetGroupedAggregate. All three are asserted; per the controller's
+# instruction, if one of q88/q90 doesn't actually plan a membership operator
+# this script reports what it sees rather than silently forcing it.
+boundary_queries="${TPCDS_BOUNDARY_QUERIES:-q96,q88,q90}"
 warmups="${TPCDS_WARMUPS:-1}"
 runs="${TPCDS_RUNS:-2}"
 all_queries="${grouped_queries},${boundary_queries}"
@@ -41,6 +47,7 @@ all_queries="${grouped_queries},${boundary_queries}"
 run_id="$(date -u '+%Y%m%dT%H%M%SZ')"
 comparison_root="${TPCDS_COMPARISON_DIR:-${repo_root}/benchmark-results/grouped-aggregate-smoke-${run_id}}"
 disabled_root="${comparison_root}/metal-disabled"
+aqe_root="${comparison_root}/metal-aqe"
 mkdir -p "${comparison_root}"
 
 TPCDS_COMPARISON_DIR="${comparison_root}" \
@@ -59,13 +66,25 @@ TPCDS_RESULT_DIR="${disabled_root}" \
   "${script_dir}/run-tpcds-metal.sh" \
   --queries "${grouped_queries}" --warmups "${warmups}" --runs "${runs}"
 
+# AQE leg (spark.sql.adaptive.enabled=true, overriding run-tpcds-metal.sh's
+# own --conf spark.sql.adaptive.enabled=false -- spark-submit's --conf
+# processing takes the last value for a repeated key): the grouped-aggregate
+# branch is gated on !adaptiveEnabled (same as the membership branch), so
+# under AQE the plan must be entirely vanilla (no Metal operator of any
+# kind) and the result must still match the CPU baseline.
+TPCDS_RESULT_DIR="${aqe_root}" \
+  TPCDS_METAL_EXTRA_CONF="spark.sql.adaptive.enabled=true" \
+  "${script_dir}/run-tpcds-metal.sh" \
+  --queries "${grouped_queries}" --warmups "${warmups}" --runs "${runs}"
+
 python3 - "${comparison_root}/comparison.json" "${comparison_root}/cpu/summary.json" \
-  "${comparison_root}/metal" "${disabled_root}" "${grouped_queries}" "${boundary_queries}" <<'PYTHON'
+  "${comparison_root}/metal" "${disabled_root}" "${aqe_root}" "${grouped_queries}" "${boundary_queries}" <<'PYTHON'
 import json
 import sys
 from pathlib import Path
 
-comparison_path, cpu_summary_path, metal_dir, disabled_dir, grouped_csv, boundary_csv = sys.argv[1:7]
+(comparison_path, cpu_summary_path, metal_dir, disabled_dir, aqe_dir,
+ grouped_csv, boundary_csv) = sys.argv[1:8]
 
 with open(comparison_path, encoding="utf-8") as source:
     comparison = json.load(source)
@@ -73,11 +92,18 @@ with open(cpu_summary_path, encoding="utf-8") as source:
     cpu_summary = json.load(source)
 with open(f"{disabled_dir}/summary.json", encoding="utf-8") as source:
     disabled_summary = json.load(source)
+with open(f"{aqe_dir}/summary.json", encoding="utf-8") as source:
+    aqe_summary = json.load(source)
 
 metal_dir = Path(metal_dir)
 disabled_dir = Path(disabled_dir)
+aqe_dir = Path(aqe_dir)
 grouped_queries = [name for name in grouped_csv.split(",") if name]
 boundary_queries = [name for name in boundary_csv.split(",") if name]
+
+def result_key(summary, name):
+    entry = summary["queries"][name]
+    return (entry["row_count"], entry["sha256"])
 
 report = {}
 
@@ -100,14 +126,22 @@ for name in grouped_queries:
             f"{name}: expected a vanilla plan (no Metal operator) with "
             f"spark.metal.parquetAggregate.enabled=false, got:\n{disabled_plan_text}"
         )
-
-    cpu_result = cpu_summary["queries"][name]
-    disabled_result = disabled_summary["queries"][name]
-    if (cpu_result["row_count"], cpu_result["sha256"]) != (disabled_result["row_count"], disabled_result["sha256"]):
+    if result_key(cpu_summary, name) != result_key(disabled_summary, name):
         raise SystemExit(
             f"{name}: flag-disabled result diverges from the CPU baseline: "
-            f"cpu={cpu_result['row_count']}/{cpu_result['sha256']} "
-            f"disabled={disabled_result['row_count']}/{disabled_result['sha256']}"
+            f"cpu={result_key(cpu_summary, name)} disabled={result_key(disabled_summary, name)}"
+        )
+
+    aqe_plan_text = (aqe_dir / f"{name}-plan.txt").read_text(encoding="utf-8")
+    if "Metal" in aqe_plan_text:
+        raise SystemExit(
+            f"{name}: expected a vanilla plan (no Metal operator) under "
+            f"spark.sql.adaptive.enabled=true, got:\n{aqe_plan_text}"
+        )
+    if result_key(cpu_summary, name) != result_key(aqe_summary, name):
+        raise SystemExit(
+            f"{name}: AQE-leg result diverges from the CPU baseline: "
+            f"cpu={result_key(cpu_summary, name)} aqe={result_key(aqe_summary, name)}"
         )
 
     report[name] = {
@@ -115,6 +149,8 @@ for name in grouped_queries:
         "metal_plans_grouped_aggregate": True,
         "disabled_plan_is_vanilla": True,
         "disabled_result_matches_cpu": True,
+        "aqe_plan_is_vanilla": True,
+        "aqe_result_matches_cpu": True,
     }
 
 for name in boundary_queries:
@@ -130,7 +166,14 @@ for name in boundary_queries:
             f"{name}: MetalParquetGroupedAggregate must not plan for a count-only, "
             f"zero-group-key region, got:\n{plan_text}"
         )
-    if "MetalParquetMembershipCount" not in plan_text and "MetalFusedMembershipCount" not in plan_text:
+    has_membership_operator = (
+        "MetalParquetMembershipCount" in plan_text or "MetalFusedMembershipCount" in plan_text
+    )
+    # Empirically confirmed true for q96/q88/q90 on this dataset (all three
+    # plan a membership operator) before this was made a hard assertion --
+    # see task-6-report.md's fix-round addendum. A future regression here
+    # should fail loudly, not be silently downgraded to a note.
+    if not has_membership_operator:
         raise SystemExit(f"{name}: expected a membership-count Metal operator in plan, got:\n{plan_text}")
 
     report[name] = {

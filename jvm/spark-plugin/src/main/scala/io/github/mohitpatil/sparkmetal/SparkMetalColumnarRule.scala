@@ -15,8 +15,7 @@ import org.apache.spark.sql.execution.aggregate.HashAggregateExec
 import org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeExec, ReusedExchangeExec}
 import org.apache.spark.sql.execution.joins.BroadcastHashJoinExec
-import org.apache.spark.sql.types.{
-  BooleanType, ByteType, DataType, DateType, DecimalType, IntegerType, LongType, ShortType, StringType}
+import org.apache.spark.sql.types.{IntegerType, LongType}
 
 private case class FusedSumSpec(
     attribute: AttributeReference,
@@ -77,7 +76,16 @@ final class SparkMetalColumnarRule(
    * query.
    */
   private def replaceGroupedAggregate(aggregate: HashAggregateExec): Option[SparkPlan] = {
-    if (!parquetAggregateEnabled) {
+    // ansiEnabled: this operator's GPU sum accumulators are wrapping int64 --
+    // ANSI SQL's overflow-throwing Sum semantics diverge from that, exactly
+    // why `replace` (the fused-sum branch) also gates on ansiEnabled.
+    // adaptiveEnabled: this branch sits ahead of (preempts) the only other
+    // adaptiveEnabled check (in replaceMembershipCount) for every region it
+    // matches, and the keyPlans it builds re-execute a stripped
+    // BroadcastQueryStageExec child directly, outside AQE's own replan
+    // machinery -- disabled under AQE for the same reason the membership
+    // branch is.
+    if (!parquetAggregateEnabled || ansiEnabled || adaptiveEnabled) {
       return None
     }
     try {
@@ -111,7 +119,9 @@ final class SparkMetalColumnarRule(
     // Pre-reject any group-key attribute type GroupSpace cannot represent
     // (Double/Float in particular) here, at planning time, rather than
     // letting the exec's driver-side throw be the first place this surfaces.
-    if (!region.groupKeys.forall(attribute => isSupportedGroupKeyType(attribute.dataType))) {
+    // Reuses GroupSpace's own predicate rather than a second, independently
+    // drifting copy of the supported-type list.
+    if (!region.groupKeys.forall(attribute => GroupSpace.isSupportedAttributeType(attribute.dataType))) {
       return None
     }
 
@@ -162,6 +172,14 @@ final class SparkMetalColumnarRule(
 
     val keyColumnNames = region.factKeys.map(_.name)
     val measureColumnNames = region.measureColumns.map(_.name)
+    // MetalParquetGroupedAggregateExec.require caps this at 4; pre-check it
+    // here so an over-wide region declines quietly (falls through to the
+    // next candidate operator) instead of reaching the exec's constructor
+    // require and surfacing as a logWarning stack trace on a plan that
+    // should simply not have been rewritten.
+    if (measureColumnNames.length > 4) {
+      return None
+    }
     val files = region.scan.relation.location.inputFiles.toSeq
 
     if (ParquetEligibility.check(files, keyColumnNames).isLeft) {
@@ -181,12 +199,6 @@ final class SparkMetalColumnarRule(
       keyPlans,
       nativeLibrary,
       metalLibrary))
-  }
-
-  private def isSupportedGroupKeyType(dataType: DataType): Boolean = dataType match {
-    case IntegerType | LongType | ShortType | ByteType | BooleanType | DateType | StringType => true
-    case _: DecimalType => true
-    case _ => false
   }
 
   /**

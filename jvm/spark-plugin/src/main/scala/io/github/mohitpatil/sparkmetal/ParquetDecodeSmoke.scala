@@ -16,6 +16,8 @@ import org.apache.parquet.hadoop.util.HadoopInputFile
 import org.apache.spark.sql.{Row, SparkSession}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.AttributeReference
+import org.apache.spark.sql.catalyst.expressions.aggregate.Partial
+import org.apache.spark.sql.execution.aggregate.HashAggregateExec
 import org.apache.spark.sql.functions.{avg, col, count, expr, lit, sum}
 import org.apache.spark.sql.types.{
   DateType, Decimal, DecimalType, DoubleType, IntegerType, LongType, StringType, StructField, StructType}
@@ -1163,6 +1165,13 @@ object ParquetDecodeSmoke {
       SparkMetalNative.ensureInitialized(nativeLibrary, metalLibrary)
       import spark.implicits._
 
+      // Final-review fix wave, fix 1: an IsNotNull filter on a non-key
+      // column (here, the SUM's own measure input) must never let
+      // GroupedAggregateShape.matchRegion accept the region -- checked FIRST
+      // and independently of the exec-level dataset setup below, which
+      // exercises a different (already-shape-matched) path entirely.
+      checkIsNotNullOnMeasureRejected(spark, tempDir)
+
       val quantityAttribute = AttributeReference("quantity", IntegerType)()
       val amountAttribute = AttributeReference("amount", IntegerType)()
       val aggSpecs = Seq(
@@ -1676,6 +1685,60 @@ object ParquetDecodeSmoke {
           "not fall back or silently succeed")
     } finally {
       spark.stop()
+    }
+  }
+
+  /**
+   * Final-review fix wave, fix 1 (RED first): builds a broadcast-joined
+   * dimension/fact query whose partial HashAggregateExec would otherwise
+   * match the v1 grouped-aggregate region shape, but adds an explicit
+   * `WHERE f.measure IS NOT NULL` -- a filter on the SUM's own measure
+   * column, not a join key. Before the fix, GroupedAggregateShape's
+   * `isOnlyNotNullPredicate` accepted IsNotNull over ANY attribute purely by
+   * predicate shape, so this query's region matched (Right(region)) and the
+   * operator would have silently summed past the null-filtering the CPU
+   * plan performs. `matchRegion` must instead return Left, naming the
+   * measure column, not the region.
+   */
+  private def checkIsNotNullOnMeasureRejected(spark: SparkSession, tempDir: java.nio.file.Path): Unit = {
+    import spark.implicits._
+    val dimPath = tempDir.resolve("isnotnull-dim").toString
+    val factPath = tempDir.resolve("isnotnull-fact").toString
+    Seq((1, "acme"), (2, "globex")).toDF("cat_key", "name")
+      .coalesce(1).write.mode("errorifexists").parquet(dimPath)
+    Seq((1, Some(10)), (2, Some(20)), (1, None: Option[Int]))
+      .toDF("cat_key", "measure")
+      .coalesce(1).write.mode("errorifexists").parquet(factPath)
+
+    spark.read.parquet(dimPath).createOrReplaceTempView("isnotnull_dim")
+    spark.read.parquet(factPath).createOrReplaceTempView("isnotnull_fact")
+    try {
+      val plan = spark.sql(
+        "SELECT d.name, sum(f.measure) FROM isnotnull_fact f " +
+          "JOIN isnotnull_dim d ON f.cat_key = d.cat_key " +
+          "WHERE f.measure IS NOT NULL GROUP BY d.name"
+      ).queryExecution.executedPlan
+
+      val outcomes = plan.collect {
+        case aggregate: HashAggregateExec
+            if aggregate.aggregateExpressions.nonEmpty && aggregate.aggregateExpressions.forall(_.mode == Partial) =>
+          GroupedAggregateShape.matchRegion(aggregate)
+      }
+      require(outcomes.nonEmpty,
+        s"expected at least one partial HashAggregateExec in the plan for the IsNotNull-on-measure probe:\n$plan")
+      val reasons = outcomes.map {
+        case Left(reason) => reason
+        case Right(region) =>
+          throw new IllegalStateException(
+            s"expected matchRegion to reject an IsNotNull filter on the measure column, " +
+              s"but it matched: $region")
+      }
+      require(reasons.forall(reason => reason.contains("IsNotNull") && reason.contains("non-key")),
+        s"expected the rejection reason to name a non-key IsNotNull filter, got: $reasons")
+      println(s"""{"mode":"agg-exec","case":"isnotnull-on-measure-rejected","reasons":${reasons.mkString("[\"", "\", \"", "\"]")}}""")
+    } finally {
+      spark.catalog.dropTempView("isnotnull_dim")
+      spark.catalog.dropTempView("isnotnull_fact")
     }
   }
 

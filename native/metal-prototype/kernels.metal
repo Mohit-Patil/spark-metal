@@ -300,7 +300,17 @@ kernel void fused_grouped_aggregate(
         {measure_nulls_0, measure_nulls_1, measure_nulls_2, measure_nulls_3};
 
     uint group = 0u;
-    uint factor = 1u;
+    // ulong, not uint: factor is a product across up to 4 columns of
+    // per-column duplicate-key multiplicities, and a uint accumulator can
+    // wrap at 2^32 well within the range a handful of moderately-duplicated
+    // dimensions can reach. The CPU fallback (aggregateRowGroupOnCpu in
+    // MetalParquetGroupedAggregateExec) already accumulates its factor as a
+    // Scala Long for exactly this reason -- ulong here matches that width.
+    // Actual multiplicities are always small non-negative counts, so the
+    // product is expected to stay well inside the signed 64-bit range that
+    // long(factor) below reinterprets it into (matching the CPU fallback's
+    // `measureValues(slot) * factor` Long multiply).
+    ulong factor = 1ul;
     for (uint column = 0u; column < params.key_count && column < 4u; ++column) {
         if ((params.key_null_mask & (1u << column)) != 0u &&
             key_nulls[column][global_index] != 0) {
@@ -317,7 +327,7 @@ kernel void fused_grouped_aggregate(
         uint factor_length = params.factor_length[column];
         if (factor_length != 0u) {
             if (entry >= factor_length) return;
-            factor *= factor_tables[column][entry];
+            factor *= ulong(factor_tables[column][entry]);
         }
     }
     // Defensive: a well-formed set of code tables can only sum to a group id

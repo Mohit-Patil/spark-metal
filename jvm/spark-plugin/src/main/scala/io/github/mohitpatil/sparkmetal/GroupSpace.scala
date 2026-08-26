@@ -150,7 +150,19 @@ private[sparkmetal] object GroupSpace {
     for (i <- spaces.indices) {
       radices(i) = groupCount
       groupCount *= spaces(i).componentCount
+      // Early exit inside the loop, not just after it: with enough
+      // dimensions the running product can overflow Long before the loop
+      // even finishes, wrapping past maxGroups undetected by a check made
+      // only once at the end. Bailing out the moment the (still-accurate)
+      // running product first exceeds maxGroups guarantees the comparison
+      // below never happens on wrapped-around Java Long garbage.
+      if (groupCount > maxGroups) {
+        return Left(s"group space size $groupCount exceeds maxGroups $maxGroups")
+      }
     }
+    // Unreachable for any non-empty dimension list (the in-loop check above
+    // already returns) -- kept as a safety net for the zero-dimension case,
+    // where the loop above never runs at all.
     if (groupCount > maxGroups) {
       return Left(s"group space size $groupCount exceeds maxGroups $maxGroups")
     }

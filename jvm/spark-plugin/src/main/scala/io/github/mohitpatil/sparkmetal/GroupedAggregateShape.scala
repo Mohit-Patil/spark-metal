@@ -60,7 +60,17 @@ private[sparkmetal] object GroupedAggregateShape {
   private case class FactWalk(
       scan: FileSourceScanExec,
       joins: Seq[BroadcastHashJoinExec],
-      factKeys: Seq[Attribute])
+      factKeys: Seq[Attribute],
+      // Every attribute referenced by an IsNotNull conjunct encountered while
+      // walking from the aggregate down to the scan (FilterExec conditions
+      // and the terminal scan's dataFilters) -- never a broadcast (build)
+      // side subtree, since walkFactSide only ever descends the streamed
+      // side of a join. Collected here, not in isOnlyNotNullPredicate (which
+      // only judges predicate SHAPE and is also used, unrelated, by the
+      // membership operators via SparkMetalColumnarRule's own copy), so that
+      // the fix in matchAggregate below is scoped to the grouped matcher and
+      // never touches membership-operator matching.
+      notNullTargets: Seq[AttributeReference])
 
   /**
    * Returns the matched region, or `Left(reason)` naming the first
@@ -108,6 +118,7 @@ private[sparkmetal] object GroupedAggregateShape {
       groupKeys <- resolveGroupKeys(groupingExpressions, aggregate.child)
       aggs <- resolveAggSpecs(aggregateExpressions, aggregate.child)
       walk <- walkFactSide(aggregate.child)
+      _ <- validateNotNullTargets(walk)
     } yield {
       Region(
         aggregate = aggregate,
@@ -117,6 +128,51 @@ private[sparkmetal] object GroupedAggregateShape {
         factKeys = walk.factKeys,
         scan = walk.scan,
         measureColumns = aggs.collect { case AggSpec(_, FactColumn(attribute), _, _) => attribute }.distinct)
+    }
+  }
+
+  /**
+   * Grouped-matcher-only restriction (final-review fix wave): the operator
+   * enforces nullness ONLY for the fact-side join key columns it walks in
+   * `walkFactSide` (an inner broadcast join already drops null keys, so an
+   * explicit IsNotNull on a factKey is a harmless no-op to accept) -- it
+   * never re-checks an IsNotNull found on some other column, whether that is
+   * a measure (`WHERE q IS NOT NULL`) or a dimension attribute referenced
+   * after a join (`WHERE d.name IS NOT NULL`). Before this check,
+   * `isOnlyNotNullPredicate` accepted IsNotNull over ANY attribute purely by
+   * predicate SHAPE, so such a filter matched the region and the operator
+   * would silently count rows the CPU plan filters out.
+   *
+   * `walk.notNullTargets` already excludes anything found only inside a
+   * broadcast (dimension) build-side subtree -- walkFactSide never descends
+   * there -- so a legitimate dimension-side filter (already applied by
+   * ordinary Spark execution, since the GPU takeover never touches that
+   * subtree) is never even a candidate here. What remains is either a
+   * genuine factKey (accept) or something else entirely -- a fact-side
+   * measure, or a dimension attribute pulled in by a post-join filter
+   * (reject either way).
+   *
+   * The comparison is a direct exprId membership test against
+   * `walk.factKeys`, NOT a second call to `resolve` from the aggregate's
+   * root: `resolve`'s ProjectExec case only looks a target attribute up in
+   * that Project's OWN output list, which is correct for a group key or
+   * measure (guaranteed to still be referenced above every Project on its
+   * way up to the aggregate) but wrong here -- a join key is routinely
+   * consumed by its join and then dropped by the next Project, so it is
+   * simply absent from that Project's output, and re-resolving it from the
+   * top would misreport "attribute missing from project output" for a
+   * perfectly ordinary factKey filter (observed on TPC-DS q3's
+   * ss_sold_date_sk/ss_item_sk IsNotNull filters, both dropped from the
+   * outer Project once their joins are done). factKeys and notNullTargets
+   * are both collected by the SAME walkFactSide traversal without renaming
+   * either one, so their exprIds already line up whenever they name the
+   * same underlying column -- no re-resolution needed.
+   */
+  private def validateNotNullTargets(walk: FactWalk): Either[String, Unit] = {
+    val factKeyIds = walk.factKeys.map(_.exprId).toSet
+    walk.notNullTargets.find(attribute => !factKeyIds.contains(attribute.exprId)) match {
+      case Some(attribute) => Left(s"IsNotNull filter on non-key column ${attribute.name}#${attribute.exprId.id}")
+      case None => Right(())
     }
   }
 
@@ -257,8 +313,11 @@ private[sparkmetal] object GroupedAggregateShape {
     case adapter: InputAdapter => walkFactSide(adapter.child)
     case project: ProjectExec => walkFactSide(project.child)
     case filter: FilterExec =>
-      if (isOnlyNotNullPredicate(filter.condition)) walkFactSide(filter.child)
-      else Left("filter beyond IsNotNull")
+      if (isOnlyNotNullPredicate(filter.condition)) {
+        walkFactSide(filter.child).map { walk =>
+          walk.copy(notNullTargets = collectNotNullAttributes(filter.condition) ++ walk.notNullTargets)
+        }
+      } else Left("filter beyond IsNotNull")
     case columnarToRow: ColumnarToRowExec => walkFactSide(columnarToRow.child)
     case join: BroadcastHashJoinExec =>
       if (join.joinType != org.apache.spark.sql.catalyst.plans.Inner) {
@@ -289,7 +348,7 @@ private[sparkmetal] object GroupedAggregateShape {
       } else if (!scan.dataFilters.forall(isOnlyNotNullPredicate)) {
         Left("scan data filter beyond IsNotNull")
       } else {
-        Right(FactWalk(scan, Seq.empty, Seq.empty))
+        Right(FactWalk(scan, Seq.empty, Seq.empty, scan.dataFilters.flatMap(collectNotNullAttributes)))
       }
     case other => Left(s"unsupported node between aggregate and scan: ${other.nodeName}")
   }
@@ -298,6 +357,20 @@ private[sparkmetal] object GroupedAggregateShape {
     case IsNotNull(_: AttributeReference) => true
     case And(left, right) => isOnlyNotNullPredicate(left) && isOnlyNotNullPredicate(right)
     case _ => false
+  }
+
+  /**
+   * Extracts every IsNotNull target out of a predicate tree already known
+   * (by `isOnlyNotNullPredicate`) to be built from nothing but IsNotNull and
+   * And -- used only to figure out WHICH column each IsNotNull names, for
+   * `validateNotNullTargets`'s key-only restriction. This never changes
+   * whether a predicate is accepted, only which attributes get reported for
+   * a predicate already accepted.
+   */
+  private def collectNotNullAttributes(expression: Expression): Seq[AttributeReference] = expression match {
+    case IsNotNull(attribute: AttributeReference) => Seq(attribute)
+    case And(left, right) => collectNotNullAttributes(left) ++ collectNotNullAttributes(right)
+    case _ => Seq.empty
   }
 
   // ---------------------------------------------------------------------

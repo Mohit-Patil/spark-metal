@@ -414,10 +414,11 @@ case class MetalParquetGroupedAggregateExec(
                 // The handle is consumed by a successful Aggregate call --
                 // clear it immediately so that if pageReadStore.close()
                 // (below, in this same finally) throws, the catch block
-                // does not release an already-consumed handle (a
-                // use-after-free) AND does not double-count this row group
-                // by recomputing it on the CPU on top of its already-landed
-                // GPU contribution.
+                // below (rowGroupHandle == 0L) does not release an
+                // already-consumed handle (a use-after-free) and rethrows
+                // instead of double-counting this row group by recomputing
+                // it on the CPU on top of its already-landed GPU
+                // contribution.
                 rowGroupHandle = 0L
                 localRowGroups += 1
               } finally {
@@ -432,10 +433,18 @@ case class MetalParquetGroupedAggregateExec(
                 // (rowGroupHandle != 0L) must be released explicitly; pages
                 // already fed to the failed GPU pass cannot be re-read, so
                 // the CPU recompute uses a fresh PageReadStore.
+                //
+                // rowGroupHandle == 0L here means the GPU aggregate already
+                // landed successfully for this row group (it is zeroed
+                // immediately after parquetRowGroupAggregate succeeds, above)
+                // and this exception came from pageReadStore.close() itself,
+                // AFTER that success. Falling back to a CPU recompute in that
+                // case would add this row group's contribution a second time
+                // on top of the one the GPU already committed, so there is
+                // nothing safe to do but propagate the close() failure.
+                if (rowGroupHandle == 0L) throw e
                 logWarning(s"Row group ${split.file}#${split.rowGroupIndex} fell back to CPU", e)
-                if (rowGroupHandle != 0L) {
-                  NativeBridge.parquetRowGroupRelease(rowGroupHandle)
-                }
+                NativeBridge.parquetRowGroupRelease(rowGroupHandle)
                 localFallbacks += 1
                 localRowGroups += 1
                 val freshStore = reader.readRowGroup(split.rowGroupIndex)

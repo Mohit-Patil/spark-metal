@@ -68,6 +68,12 @@ The first version supports fixed-width columns only.
 
 A narrow JNI API will pass native handles rather than per-row values. Ownership and lifetime must be explicit so that JVM cleanup cannot invalidate a Metal command in flight.
 
+The implemented bridge has two paths. Spark off-heap integer vectors expose a
+native address; when their address and batch length meet Metal's page-alignment
+requirements, the bridge wraps them with `newBufferWithBytesNoCopy`. Other input
+vectors are copied into reusable, page-aligned native buffers exposed to Java as
+direct `ByteBuffer` objects. Both paths carry an explicit null mask.
+
 ### Apple columnar runtime
 
 The runtime will provide device-independent operation contracts:
@@ -132,3 +138,6 @@ Zero-copy is an optimization milestone, not an assumption.
 
 An operator remains on the CPU when any required expression, data type, semantic mode, memory condition, or backend feature is unsupported. The plugin should report a reason for every rejected region.
 
+The current prototype always falls back when `spark.sql.ansi.enabled=true`.
+Its first Metal kernel implements Spark's non-ANSI 32-bit integer wrapping, not
+ANSI overflow exceptions.

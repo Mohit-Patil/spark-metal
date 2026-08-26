@@ -13,27 +13,28 @@
 - [x] Select and pin Spark/Scala version.
 - [x] Add a licence-gated, pinned TPC-DS generator setup.
 - [ ] Generate scale-factor-10 Parquet data.
-- [ ] Add query runner, plan capture, metrics, and correctness hashes.
+- [x] Add query runner, plan capture, metrics, and correctness hashes.
 - [ ] Run and publish the vanilla CPU baseline.
 
 ## M2 — Apple backend feasibility
 
-- [ ] Implement a common representative workload.
-- [ ] Run CPU reference.
+- [x] Implement a common representative workload.
+- [x] Run CPU reference.
 - [ ] Run MLX GPU prototype.
-- [ ] Run direct Metal prototype.
+- [x] Run direct Metal prototype.
 - [ ] Evaluate MPSGraph if it reduces implementation work.
 - [ ] Run Core ML compute-unit experiment where the graph is representable.
-- [ ] Record crossover batch sizes and select the primary backend.
+- [x] Record the direct-Metal crossover batch sizes.
+- [ ] Select the primary backend after the remaining comparisons.
 
 ## M3 — Spark columnar vertical slice
 
-- [ ] Register a Spark columnar rule.
+- [x] Register a Spark columnar rule.
 - [ ] Add capability tagging and fallback explanations.
-- [ ] Add native fixed-width column bridge.
-- [ ] Implement integer filter and projection.
-- [ ] Implement global partial reductions.
-- [ ] Fuse filter, projection, and reduction.
+- [x] Add native fixed-width column bridge.
+- [x] Implement integer filter and projection.
+- [x] Implement global partial reductions.
+- [x] Fuse filter, projection, and reduction.
 
 ## M4 — TPC-DS proof
 
@@ -45,7 +46,7 @@
 
 ## M5 — Expansion
 
-- [ ] Null masks.
+- [x] Null masks for the initial fused integer expression.
 - [ ] Limited fixed-point decimals.
 - [ ] Grouped aggregation.
 - [ ] Integer equi-join.

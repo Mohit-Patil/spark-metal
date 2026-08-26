@@ -21,6 +21,9 @@ Direct Metal is the provisional primary candidate for SQL execution because it e
 - First test host detected: 16 GB MacBook Air with Apple M5.
 - Xcode and the Metal compiler: available.
 - OpenJDK 21 and Apache Spark 4.2.0: installed and ARM64 smoke-tested.
+- A Spark 4.2 columnar rule, JNI bridge, and fused Metal partial aggregate: working.
+- Integer null semantics: validated through Spark and independently through JNI.
+- Controlled 32-million-row synthetic Spark comparison: correct but currently about 5% slower than CPU.
 - TPC-DS baseline: not yet generated.
 
 ## Project principles
@@ -37,6 +40,8 @@ Direct Metal is the provisional primary candidate for SQL execution because it e
 - [Backend evaluation](docs/BACKEND_EVALUATION.md)
 - [Proposed architecture](docs/ARCHITECTURE.md)
 - [Benchmark protocol](docs/BENCHMARK_PROTOCOL.md)
+- [Direct Metal prototype](docs/METAL_PROTOTYPE.md)
+- [Prototype results](docs/PROTOTYPE_RESULTS.md)
 - [Roadmap](docs/ROADMAP.md)
 - [First host environment](docs/environment/first-host.md)
 
@@ -66,6 +71,15 @@ TPCDS_EULA_ACCEPTED=yes scripts/setup-tpcds-kit.sh
 scripts/generate-tpcds-raw.sh
 scripts/prepare-tpcds-parquet.sh
 scripts/run-tpcds-cpu.sh --queries q1 --warmups 1 --runs 5
+```
+
+The native and Spark integration checks do not require TPC-DS data:
+
+```bash
+scripts/run-metal-microbenchmark.sh
+scripts/run-jni-smoke-test.sh
+scripts/run-spark-plugin-smoke-test.sh
+scripts/run-spark-synthetic-benchmark.sh
 ```
 
 Performance numbers produced here are research results and are not comparable to

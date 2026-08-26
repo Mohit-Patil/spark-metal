@@ -13,7 +13,7 @@ Captured on 2026-08-26.
 | macOS | 26.6.2 (25G83) |
 | Python | 3.13.14 |
 | Xcode | 26.6 (17F113) |
-| Metal compiler | Available through the Xcode default toolchain |
+| Metal compiler | Metal Toolchain 17F109, installed as an Xcode component |
 | Java | Homebrew OpenJDK 21.0.12.1 |
 | Apache Spark | 4.2.0, Scala 2.13.18, revision 32f7299601108917fb01920a54e084595b7b3bf8 |
 | Free disk at capture | Approximately 203 GiB |

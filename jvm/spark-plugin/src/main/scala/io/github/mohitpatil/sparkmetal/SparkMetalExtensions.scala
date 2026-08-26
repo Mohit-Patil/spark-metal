@@ -11,7 +11,8 @@ final class SparkMetalExtensions extends (SparkSessionExtensions => Unit) {
         session.conf.get("spark.sql.ansi.enabled").toBoolean,
         session.conf.get("spark.sql.adaptive.enabled").toBoolean,
         session.conf.get("spark.metal.parquetScan.enabled", "true").toBoolean,
-        session.conf.get("spark.metal.parquetAggregate.enabled", "true").toBoolean)
+        session.conf.get("spark.metal.parquetAggregate.enabled", "true").toBoolean,
+        session.conf.get("spark.metal.parquetAggregate.maxRegions", "1").toInt)
     }
   }
 }

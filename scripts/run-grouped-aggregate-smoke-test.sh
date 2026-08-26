@@ -7,14 +7,12 @@ repo_root="$(cd "${script_dir}/.." && pwd)"
 # shellcheck source=project-env.sh
 source "${script_dir}/project-env.sh"
 
-# Default grouped-aggregate queries: q31 (partial Sum over a date_dim/
-# customer_address star-join, keyed on ss_addr_sk/ss_sold_date_sk, grouped on
-# dimension attributes) and q3 (partial Sum over a date_dim/item star-join,
-# keyed on ss_sold_date_sk/ss_item_sk). q96: the existing count-only,
-# zero-group-key region -- matchRegion rejects this shape outright, so it
-# must keep planning MetalParquetMembershipCount, never
-# MetalParquetGroupedAggregate. Both sets are run through the SAME CPU/Metal
-# comparison so a single comparison.json carries every result_match.
+# Winner query: q3 (partial Sum over a date_dim/item star-join, keyed on
+# ss_sold_date_sk/ss_item_sk) has exactly one grouped-aggregate region and
+# clears the accelerator's default budget (spark.metal.parquetAggregate.
+# maxRegions, default 1) -- proof the region-count gate does not over-block a
+# single-region query. It is asserted below not just for result_match and
+# the operator's presence in the plan, but for cpuFallbackRowGroups == 0.
 #
 # q3 is the task brief's originally-named demonstration query, and was
 # excluded here until Task 6b: it joins store_sales to item on ss_item_sk,
@@ -27,33 +25,50 @@ source "${script_dir}/project-env.sh"
 # HashAggregateExec on this dataset. Task 6b (see task-6b-report.md) relaxed
 # that requirement to admit PLAIN key chunks via dense VALUE-space code
 # tables, recovering q3 (and, per Task 1's ELIGIBLE list, most of the other
-# item-keyed queries this tier targets): it is asserted below not just for
-# result_match and the operator's presence in the plan, but for
-# cpuFallbackRowGroups == 0 -- proof the PLAIN ss_item_sk chunks decoded and
-# aggregated entirely on the GPU, not via the operator's per-row-group CPU
-# fallback.
-grouped_queries="${TPCDS_QUERIES:-q31,q3}"
+# item-keyed queries this tier targets): its cpuFallbackRowGroups == 0 is
+# proof the PLAIN ss_item_sk chunks decoded and aggregated entirely on the
+# GPU, not via the operator's per-row-group CPU fallback.
+winner_queries="${TPCDS_QUERIES:-q3}"
 # Grouped queries whose accelerator_metrics must show zero per-row-group CPU
 # fallback -- proof a PLAIN key chunk (not just a dictionary one) ran end to
 # end on the GPU. See the q3 comment above.
 zero_fallback_queries="${TPCDS_ZERO_FALLBACK_QUERIES:-q3}"
+# Multi-region query: q31 (six MetalParquetGroupedAggregate regions, per
+# Task 7's coverage table -- repeated CTE references over store_sales/
+# web_sales multiply the operator's per-region fixed cost until it loses to
+# CPU by 0.17x-0.28x). Task 7b's region-count gate must decline ALL of a
+# query's grouped regions once the count exceeds
+# spark.metal.parquetAggregate.maxRegions (default 1): under the default
+# config q31 must plan entirely vanilla (falling through to plain
+# HashAggregateExec, since its regions are not the membership operators'
+# count-only/zero-group-key shape either) while still matching the CPU
+# result exactly, and only with maxRegions raised to 0 (unlimited) does it
+# plan MetalParquetGroupedAggregate again -- the original, pre-gate behavior.
+multi_region_query="${TPCDS_MULTI_REGION_QUERY:-q31}"
 # q96/q88/q90: all three are the existing count-only, zero-group-key shape
 # -- matchRegion rejects this shape outright (before any ParquetEligibility
 # work), so they must keep planning the existing membership operators, never
-# MetalParquetGroupedAggregate. All three are asserted; per the controller's
-# instruction, if one of q88/q90 doesn't actually plan a membership operator
-# this script reports what it sees rather than silently forcing it.
+# MetalParquetGroupedAggregate, regardless of the region-count gate (which
+# only governs the grouped-aggregate branch). All three are asserted; per
+# the controller's instruction, if one of q88/q90 doesn't actually plan a
+# membership operator this script reports what it sees rather than silently
+# forcing it.
 boundary_queries="${TPCDS_BOUNDARY_QUERIES:-q96,q88,q90}"
 warmups="${TPCDS_WARMUPS:-1}"
 runs="${TPCDS_RUNS:-2}"
-all_queries="${grouped_queries},${boundary_queries}"
+all_queries="${winner_queries},${multi_region_query},${boundary_queries}"
 
 run_id="$(date -u '+%Y%m%dT%H%M%SZ')"
 comparison_root="${TPCDS_COMPARISON_DIR:-${repo_root}/benchmark-results/grouped-aggregate-smoke-${run_id}}"
 disabled_root="${comparison_root}/metal-disabled"
 aqe_root="${comparison_root}/metal-aqe"
+unlimited_root="${comparison_root}/metal-unlimited-regions"
 mkdir -p "${comparison_root}"
 
+# Default-config run (spark.metal.parquetAggregate.maxRegions defaults to
+# 1): carries the winner leg, the multi-region gate leg, and the boundary
+# leg through the SAME CPU/Metal comparison so a single comparison.json
+# carries every result_match.
 TPCDS_COMPARISON_DIR="${comparison_root}" \
   TPCDS_QUERIES="${all_queries}" \
   TPCDS_WARMUPS="${warmups}" \
@@ -61,14 +76,14 @@ TPCDS_COMPARISON_DIR="${comparison_root}" \
   "${script_dir}/run-tpcds-comparison.sh"
 
 # Flag-off leg (spark.metal.parquetAggregate.enabled=false): only the
-# grouped-aggregate queries need rerunning here -- this leg exists to prove
-# the new operator disappears (falls back to a vanilla HashAggregateExec)
-# when the flag is off, mirroring run-q96-membership-smoke-test.sh's
-# metal-disabled leg for spark.metal.parquetScan.enabled.
+# winner query needs rerunning here -- this leg exists to prove the new
+# operator disappears (falls back to a vanilla HashAggregateExec) when the
+# flag is off, mirroring run-q96-membership-smoke-test.sh's metal-disabled
+# leg for spark.metal.parquetScan.enabled.
 TPCDS_RESULT_DIR="${disabled_root}" \
   TPCDS_METAL_EXTRA_CONF="spark.metal.parquetAggregate.enabled=false" \
   "${script_dir}/run-tpcds-metal.sh" \
-  --queries "${grouped_queries}" --warmups "${warmups}" --runs "${runs}"
+  --queries "${winner_queries}" --warmups "${warmups}" --runs "${runs}"
 
 # AQE leg (spark.sql.adaptive.enabled=true, overriding run-tpcds-metal.sh's
 # own --conf spark.sql.adaptive.enabled=false -- spark-submit's --conf
@@ -79,17 +94,26 @@ TPCDS_RESULT_DIR="${disabled_root}" \
 TPCDS_RESULT_DIR="${aqe_root}" \
   TPCDS_METAL_EXTRA_CONF="spark.sql.adaptive.enabled=true" \
   "${script_dir}/run-tpcds-metal.sh" \
-  --queries "${grouped_queries}" --warmups "${warmups}" --runs "${runs}"
+  --queries "${winner_queries}" --warmups "${warmups}" --runs "${runs}"
+
+# Unlimited-regions leg (spark.metal.parquetAggregate.maxRegions=0): only
+# the multi-region query needs rerunning here -- this is q31's original,
+# pre-gate leg (Task 7 planned MetalParquetGroupedAggregate for q31 under
+# every config), now reached only by explicitly raising the region budget.
+TPCDS_RESULT_DIR="${unlimited_root}" \
+  TPCDS_METAL_EXTRA_CONF="spark.metal.parquetAggregate.maxRegions=0" \
+  "${script_dir}/run-tpcds-metal.sh" \
+  --queries "${multi_region_query}" --warmups "${warmups}" --runs "${runs}"
 
 python3 - "${comparison_root}/comparison.json" "${comparison_root}/cpu/summary.json" \
-  "${comparison_root}/metal" "${disabled_root}" "${aqe_root}" "${grouped_queries}" "${boundary_queries}" \
-  "${zero_fallback_queries}" <<'PYTHON'
+  "${comparison_root}/metal" "${disabled_root}" "${aqe_root}" "${unlimited_root}" \
+  "${winner_queries}" "${multi_region_query}" "${boundary_queries}" "${zero_fallback_queries}" <<'PYTHON'
 import json
 import sys
 from pathlib import Path
 
-(comparison_path, cpu_summary_path, metal_dir, disabled_dir, aqe_dir,
- grouped_csv, boundary_csv, zero_fallback_csv) = sys.argv[1:9]
+(comparison_path, cpu_summary_path, metal_dir, disabled_dir, aqe_dir, unlimited_dir,
+ winner_csv, multi_region_csv, boundary_csv, zero_fallback_csv) = sys.argv[1:11]
 
 with open(comparison_path, encoding="utf-8") as source:
     comparison = json.load(source)
@@ -99,11 +123,15 @@ with open(f"{disabled_dir}/summary.json", encoding="utf-8") as source:
     disabled_summary = json.load(source)
 with open(f"{aqe_dir}/summary.json", encoding="utf-8") as source:
     aqe_summary = json.load(source)
+with open(f"{unlimited_dir}/summary.json", encoding="utf-8") as source:
+    unlimited_summary = json.load(source)
 
 metal_dir = Path(metal_dir)
 disabled_dir = Path(disabled_dir)
 aqe_dir = Path(aqe_dir)
-grouped_queries = [name for name in grouped_csv.split(",") if name]
+unlimited_dir = Path(unlimited_dir)
+winner_queries = [name for name in winner_csv.split(",") if name]
+multi_region_queries = [name for name in multi_region_csv.split(",") if name]
 boundary_queries = [name for name in boundary_csv.split(",") if name]
 zero_fallback_queries = {name for name in zero_fallback_csv.split(",") if name}
 
@@ -113,7 +141,7 @@ def result_key(summary, name):
 
 report = {}
 
-for name in grouped_queries:
+for name in winner_queries:
     result = comparison["queries"].get(name)
     if result is None:
         raise SystemExit(f"{name}: missing from comparison.json")
@@ -123,7 +151,9 @@ for name in grouped_queries:
     plan_text = (metal_dir / f"{name}-plan.txt").read_text(encoding="utf-8")
     if "MetalParquetGroupedAggregate" not in plan_text:
         raise SystemExit(
-            f"{name}: expected MetalParquetGroupedAggregate in the (flag-enabled) metal plan, got:\n{plan_text}"
+            f"{name}: expected MetalParquetGroupedAggregate in the (flag-enabled, default "
+            f"maxRegions) metal plan -- the region-count gate should not block a single-region "
+            f"winner, got:\n{plan_text}"
         )
 
     disabled_plan_text = (disabled_dir / f"{name}-plan.txt").read_text(encoding="utf-8")
@@ -176,6 +206,54 @@ for name in grouped_queries:
                 f"got {cpu_fallback_row_groups} (accelerator_metrics={result.get('accelerator_metrics')})"
             )
         report[name]["cpu_fallback_row_groups"] = cpu_fallback_row_groups
+
+for name in multi_region_queries:
+    result = comparison["queries"].get(name)
+    if result is None:
+        raise SystemExit(f"{name}: missing from comparison.json")
+    if not result["result_match"]:
+        raise SystemExit(f"{name}: CPU/Metal result mismatch: {result}")
+
+    # Task 7b: q31's six regions exceed the default maxRegions=1 budget, so
+    # the grouped branch must decline ALL of its regions and the query must
+    # fall all the way through to a vanilla (non-Metal) plan -- q31's regions
+    # are not the membership operators' shape either, so no other Metal
+    # operator should appear.
+    plan_text = (metal_dir / f"{name}-plan.txt").read_text(encoding="utf-8")
+    if "Metal" in plan_text:
+        raise SystemExit(
+            f"{name}: expected a vanilla plan (no Metal operator) under the default "
+            f"maxRegions=1 budget -- {name} has more than one grouped-aggregate region, got:\n{plan_text}"
+        )
+
+    unlimited_plan_text = (unlimited_dir / f"{name}-plan.txt").read_text(encoding="utf-8")
+    if "MetalParquetGroupedAggregate" not in unlimited_plan_text:
+        raise SystemExit(
+            f"{name}: expected MetalParquetGroupedAggregate in the metal plan with "
+            f"spark.metal.parquetAggregate.maxRegions=0 (unlimited), got:\n{unlimited_plan_text}"
+        )
+    if result_key(cpu_summary, name) != result_key(unlimited_summary, name):
+        raise SystemExit(
+            f"{name}: unlimited-maxRegions result diverges from the CPU baseline: "
+            f"cpu={result_key(cpu_summary, name)} unlimited={result_key(unlimited_summary, name)}"
+        )
+
+    unlimited_metrics = unlimited_summary["queries"][name].get("accelerator_metrics", {})
+    node_metrics = unlimited_metrics.get("MetalParquetGroupedAggregate", {})
+    cpu_fallback_row_groups = node_metrics.get("cpuFallbackRowGroups")
+    if cpu_fallback_row_groups != 0:
+        raise SystemExit(
+            f"{name}: expected cpuFallbackRowGroups == 0 under maxRegions=0, "
+            f"got {cpu_fallback_row_groups} (accelerator_metrics={unlimited_metrics})"
+        )
+
+    report[name] = {
+        "result_match": True,
+        "default_config_plan_is_vanilla": True,
+        "unlimited_max_regions_plans_grouped_aggregate": True,
+        "unlimited_max_regions_result_matches_cpu": True,
+        "unlimited_max_regions_cpu_fallback_row_groups": cpu_fallback_row_groups,
+    }
 
 for name in boundary_queries:
     result = comparison["queries"].get(name)

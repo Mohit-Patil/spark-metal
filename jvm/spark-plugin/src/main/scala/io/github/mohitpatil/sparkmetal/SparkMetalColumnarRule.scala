@@ -37,17 +37,85 @@ final class SparkMetalColumnarRule(
     ansiEnabled: Boolean,
     adaptiveEnabled: Boolean,
     parquetScanEnabled: Boolean,
-    parquetAggregateEnabled: Boolean)
+    parquetAggregateEnabled: Boolean,
+    parquetAggregateMaxRegions: Int)
     extends ColumnarRule with Logging {
 
   override def preColumnarTransitions: Rule[SparkPlan] = new Rule[SparkPlan] {
-    override def apply(plan: SparkPlan): SparkPlan = plan.transformUp {
-      case aggregate: HashAggregateExec =>
-        replaceGroupedAggregate(aggregate)
-          .orElse(replaceMembershipCount(aggregate))
-          .orElse(replace(aggregate))
-          .getOrElse(aggregate)
+    override def apply(plan: SparkPlan): SparkPlan = {
+      // Controller ruling (Task 7b): the grouped-aggregate operator's
+      // per-region fixed cost (dimension collection, group-space build,
+      // split planning, row-at-a-time emission) multiplies with the number
+      // of regions in a query, while Spark's CPU plan shares work across
+      // them -- every query with >=3 regions in the full-suite run lost
+      // badly (0.09x-0.50x) and every single-region query won or tied. So
+      // the grouped branch is only allowed to fire at all for this plan
+      // when the number of regions it would match does not exceed
+      // `spark.metal.parquetAggregate.maxRegions` (values <= 0 mean no
+      // limit). This is computed ONCE for the whole plan, here, rather than
+      // per node -- `groupedAggregateAllowed` is then just a captured local
+      // read by every `replaceGroupedAggregate` call below.
+      val groupedAggregateAllowed = isGroupedAggregateAllowed(plan)
+      plan.transformUp {
+        case aggregate: HashAggregateExec =>
+          (if (groupedAggregateAllowed) replaceGroupedAggregate(aggregate) else None)
+            .orElse(replaceMembershipCount(aggregate))
+            .orElse(replace(aggregate))
+            .getOrElse(aggregate)
+      }
     }
+  }
+
+  /**
+   * Whether the grouped-aggregate branch may fire anywhere in `plan`: false
+   * outright when the branch's own flags (`parquetAggregateEnabled`,
+   * `ansiEnabled`, `adaptiveEnabled`) already disable it -- skipping the
+   * plan walk entirely in that (common, flag-off) case -- otherwise
+   * `countMatchingRegions(plan) <= parquetAggregateMaxRegions` (a
+   * `maxRegions <= 0` config means unlimited).
+   *
+   * Safe-fallback: `countMatchingRegions` calls the same pure, filesystem-
+   * free `GroupedAggregateShape.matchRegion` that `replaceGroupedAggregate`
+   * already wraps in `NonFatal`, but a thrown exception here (unlike there)
+   * would abort planning of the whole query rather than falling back to a
+   * single region -- so any such surprise is caught here too, and treated
+   * as "the grouped branch is not allowed for this plan" (the same
+   * conservative choice `replaceGroupedAggregate` makes per-region) rather
+   * than as unlimited.
+   */
+  private def isGroupedAggregateAllowed(plan: SparkPlan): Boolean = {
+    if (!parquetAggregateEnabled || ansiEnabled || adaptiveEnabled) {
+      return false
+    }
+    try {
+      parquetAggregateMaxRegions <= 0 || countMatchingRegions(plan) <= parquetAggregateMaxRegions
+    } catch {
+      case NonFatal(e) =>
+        logWarning(
+          "Grouped-aggregate region count failed; disabling the grouped-aggregate branch " +
+            "for this plan", e)
+        false
+    }
+  }
+
+  /**
+   * Counts the query plan's distinct, non-nested `matchRegion` matches:
+   * walks `plan` top-down, and whenever a [[HashAggregateExec]] node
+   * matches, counts it as one region WITHOUT recursing into that node's own
+   * children -- a matched region's subtree, down to its fact scan, is
+   * already consumed by that match, so any nested `HashAggregateExec`
+   * within it cannot be an independent region. A non-matching aggregate (or
+   * any other node) recurses into its children, so independent regions
+   * elsewhere in the plan (a second star-join island, a subquery) are still
+   * found and counted.
+   */
+  private def countMatchingRegions(plan: SparkPlan): Int = plan match {
+    case aggregate: HashAggregateExec =>
+      GroupedAggregateShape.matchRegion(aggregate) match {
+        case scala.util.Right(_) => 1
+        case scala.util.Left(_) => aggregate.children.map(countMatchingRegions).sum
+      }
+    case other => other.children.map(countMatchingRegions).sum
   }
 
   /**

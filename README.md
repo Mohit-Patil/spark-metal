@@ -59,6 +59,14 @@ inference, but are not substitutes for a Spark SQL execution engine.
   work is a planner cost threshold, not a faster kernel — so the ledgered
   threadgroup-local pre-aggregation optimization was deliberately **not**
   implemented.
+- **That planner cost threshold now exists.**
+  `spark.metal.parquetAggregate.maxRegions` (default **1**, `<= 0` meaning no
+  limit) counts a query's `MetalParquetGroupedAggregate`-eligible regions at
+  planning time and declines the grouped-aggregate branch for the whole query
+  once that count exceeds the budget. With the default, the accelerator's
+  grouped-aggregate branch fires only on the single-region winner set —
+  q53, q63, q89 plus the parity singles q70, q55, q52, q98, q3, q20, q12, q42
+  — while q96, q88 and q90's membership operators are unaffected.
 - Handling PLAIN-encoded join keys was required to reach the item-keyed
   queries at all: `ss_item_sk` has no dictionary page in any SF10
   `store_sales` file. Key decode now builds a dense value-space code table for

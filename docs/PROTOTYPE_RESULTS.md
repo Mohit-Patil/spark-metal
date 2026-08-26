@@ -224,6 +224,35 @@ declines multi-region and large-group-space plans, enabling this operator makes
 the median accelerated TPC-DS query slower, not faster. The next unit of work
 is that threshold, not a faster kernel — the kernel is already 1% of the time.
 
+### The region-budget gate
+
+That threshold now exists: `spark.metal.parquetAggregate.maxRegions` (default
+**1**) caps how many `MetalParquetGroupedAggregate` regions a query's physical
+plan may contain before the grouped-aggregate branch declines all of them for
+that query (values `<= 0` mean no limit). The count is a cheap, planning-time
+structural pass over the plan — `GroupedAggregateShape.matchRegion` run against
+every `HashAggregateExec` node, without touching a Parquet footer or the
+filesystem — computed once per plan and shared across every region's
+eligibility check, not recomputed per node. A query over budget falls all the
+way through to the next candidate: the membership operators for a count-only,
+zero-group-key shape, or otherwise a vanilla `HashAggregateExec`, exactly as if
+the grouped-aggregate tier did not exist for that query.
+
+With the default budget, the accelerator's grouped-aggregate branch fires only
+on the single-region set from the coverage table above: the three queries that
+win under every protocol (**q53, q63, q89**) plus the eight parity singles that
+neither win nor lose meaningfully (**q70, q55, q52, q98, q3, q20, q12, q42**).
+Every multi-region query from the coverage table (q77, q47, q57, q58, q56, q60,
+q83, q31, q33, q74) now plans vanilla instead of losing to CPU. The three
+membership queries (**q96, q88, q90**) are untouched by this gate — their
+count-only, zero-group-key shape was already rejected by `matchRegion` itself,
+before this Task's region count is even taken — and keep planning
+`MetalParquetMembershipCount`/`MetalFusedMembershipCount` as before.
+`run-grouped-aggregate-smoke-test.sh` asserts q31 (six regions) plans vanilla
+under the default budget and still matches Spark's CPU result exactly, and
+plans `MetalParquetGroupedAggregate` again with
+`spark.metal.parquetAggregate.maxRegions=0`.
+
 ## Full TPC-DS SF10 suite validation (2026-08-26)
 
 All 103 pinned Spark TPC-DS queries were run through both configurations

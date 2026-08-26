@@ -1,5 +1,229 @@
 # Prototype results
 
+## GPU grouped aggregation across the TPC-DS SF10 suite (2026-08-27)
+
+`MetalParquetGroupedAggregateExec` generalizes the accelerated region from
+"three membership joins + partial `count(*)`" to "N broadcast joins + partial
+grouped aggregate (SUM/COUNT/AVG)" over an eligible Parquet fact scan. It is
+controlled by `spark.metal.parquetAggregate.enabled` (default true) and, like
+the membership operators, declines under ANSI mode and adaptive execution.
+
+### Suite outcome
+
+The full 103-query comparison
+(`benchmark-results/task7-full`, one warm-up, three measured runs, both legs in
+one JVM each) completed without a wedge:
+
+- **103/103 exact result-hash, row-count, and schema matches**
+  (`all_results_match: true`).
+- The accelerator now fires on **24 of 103 queries**: 21 through
+  `MetalParquetGroupedAggregate` and the pre-existing 3 through
+  `MetalParquetMembershipCount`.
+- **`cpuFallbackRowGroups = 0` on every one of the 24.** No row group in the
+  whole suite fell back to CPU, and no whole-operator fallback fired.
+- Four `OutOfMemoryError`s occurred (one in the CPU leg at q64, three in the
+  Metal leg around q10 and q95), all retried successfully by Spark with exact
+  final results. Unlike the 2026-08-26 run, neither leg wedged; the documented
+  q14/q64/q95 6 GB heap hazard remains real but did not require a tail rerun.
+
+### Correctness is unambiguous; performance is not
+
+This is the honest headline: **the operator is exactly correct everywhere it
+fires and faster than Spark on only a handful of queries.** Measured three
+ways — the suite leg, a 24-query strict batch (5 warm-ups, 11 runs,
+`benchmark-results/task7-strict`), and an isolated 8-query strict batch
+(`benchmark-results/task7-winners`) — only **q53, q63, and q89 clear the 1.10x
+gate under every protocol.** Everything else sits at parity or loses, several
+of them badly.
+
+The three protocols disagree by more than the effect being measured for the
+near-parity queries, so all three are shown rather than the most flattering
+one. The spread has a measured cause: the same untouched
+`MetalParquetMembershipCount` operator ran q96 in 122 ms inside the full suite,
+132 ms in an isolated 3-query batch, and 188 ms inside the back-to-back
+24-query batch — a 43% swing from run context alone on this fanless M5 Air.
+Sustained GPU batches throttle; the CPU leg throttles less.
+
+### Coverage table — every query where the accelerator fired
+
+`regions` counts `MetalParquetGroupedAggregate` nodes in the executed plan.
+`metalTime` and `decodeParseTime` are the strict batch's accumulators summed
+across tasks; for multi-region queries the harness records only one node's
+metrics (its `accelerator_metrics` dict is keyed by node name), so those two
+columns understate total accelerator work there.
+
+| Query | regions | suite 1/3 | strict 24q 5/11 | isolated 5/11 | cpuFallbackRowGroups | metalTime | decodeParseTime |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| q89 | 1 | 1.52x | 1.32x | 1.13x | 0 | 72 ms | 583 ms |
+| q53 | 1 | 1.26x | 1.30x | 1.16x | 0 | 60 ms | 376 ms |
+| q70 | 1 | 1.03x | 1.23x | 0.90x | 0 | 71 ms | 338 ms |
+| q63 | 1 | 1.27x | 1.17x | 1.14x | 0 | 234 ms | 930 ms |
+| q55 | 1 | 1.37x | 1.11x | 0.93x | 0 | 30 ms | 314 ms |
+| q52 | 1 | 1.39x | 0.99x | 0.95x | 0 | 27 ms | 318 ms |
+| q77 | 5 | 0.50x | 0.94x | — | 0 | 46 ms | 1127 ms |
+| q98 | 1 | 0.70x | 0.75x | — | 0 | 28 ms | 676 ms |
+| q3 | 1 | 1.03x | 0.74x | 1.05x | 0 | 62 ms | 368 ms |
+| q20 | 1 | 0.64x | 0.59x | — | 0 | 20 ms | 93 ms |
+| q12 | 1 | 0.51x | 0.57x | — | 0 | 20 ms | 71 ms |
+| q47 | 3 | 0.54x | 0.44x | — | 0 | 46 ms | 523 ms |
+| q57 | 3 | 0.47x | 0.44x | — | 0 | 48 ms | 411 ms |
+| q42 | 1 | 0.93x | 0.35x | 1.07x | 0 | 37 ms | 2437 ms |
+| q58 | 3 | 0.43x | 0.33x | — | 0 | 128 ms | 957 ms |
+| q56 | 3 | 0.41x | 0.31x | — | 0 | 36 ms | 1334 ms |
+| q60 | 3 | 0.24x | 0.29x | — | 0 | 38 ms | 1913 ms |
+| q83 | 3 | 0.17x | 0.19x | — | 0 | 73 ms | 82 ms |
+| q31 | 6 | 0.28x | 0.17x | — | 0 | 53 ms | 1846 ms |
+| q33 | 3 | 0.21x | 0.15x | — | 0 | 56 ms | 4208 ms |
+| q74 | 4 | 0.11x | 0.09x | — | 0 | 133 ms | 4861 ms |
+
+**Every query with three or more accelerated regions loses, without
+exception**, and the loss deepens with region count (q31, six regions, 0.17x).
+Every query that wins has exactly one. The operator's per-region fixed cost —
+driver-side dimension collection, group-space construction, split planning, and
+row-at-a-time materialization of the partial-aggregate output — is paid once
+per region, and TPC-DS's `UNION ALL` over `store_sales`/`catalog_sales`/
+`web_sales` (q33, q56, q60, q83) or repeated CTE references (q31, q74)
+multiply it. Spark's CPU plan shares far more work across those regions than
+this operator does.
+
+The second failure mode is group-space size. q74 (500,000 groups, 449,790
+output rows) is the worst result in the suite at 0.09x: emitting nearly half a
+million partial-aggregate `InternalRow`s one at a time costs more than the
+entire join and aggregate it replaced.
+
+**These are planner-cost-threshold candidates, not tuning targets.** The
+operator should decline a region when the plan already contains other
+accelerated regions over the same fact tables, and when the estimated group
+space is large relative to the fact scan. That gate does not exist yet.
+
+### The bottleneck is not the GPU, so the ledgered kernel optimization was not taken
+
+The plan carried one ledgered optimization for this tier: threadgroup-local
+pre-aggregation ahead of the global atomics, to be implemented only if a fired
+query was slower than CPU *and* profiling attributed it to atomic contention.
+The first condition holds; the second does not, so it was not implemented.
+
+Across all 21 accelerated queries `metalTime` ranges from **20 ms to 234 ms**
+while `decodeParseTime` — CPU-side Parquet page parsing inside the JNI bridge —
+ranges from 71 ms to 4,861 ms. On the worst query, q74, the GPU kernel accounts
+for 133 ms of a 20,400 ms execution: **0.65%**. Atomic contention cannot explain
+any of these losses, and a faster kernel would not move them. q74 also has by
+far the largest group space (500,000), which is precisely where atomic
+contention would show up if it were the problem — and it does not.
+
+### Membership operators: absolute times held, ratios did not
+
+q96/q88/q90 were untouched by this tier and are boundary-asserted (the
+count-only, zero-group-key shape is rejected by the grouped matcher by design,
+verified in `run-grouped-aggregate-smoke-test.sh`). Their recorded results were
+q96 1.72x, q90 1.60x, q88 1.58x. Re-measured in isolation
+(`benchmark-results/task7-membership`, 5 warm-ups, 11 runs):
+
+| Query | Recorded CPU → Metal | Recorded | Now CPU → Metal | Now |
+|---|---|---:|---|---:|
+| q96 | 211.2 → 122.9 ms | 1.72x | 180.5 → 132.5 ms | 1.36x |
+| q88 | 1710.2 → 1080.2 ms | 1.58x | 1215.2 → 827.1 ms | 1.47x |
+| q90 | 197.7 → 123.3 ms | 1.60x | 160.8 → 118.5 ms | 1.36x |
+
+**The ratios fell, but the Metal operator did not get slower.** q88's Metal
+median improved 23% (1080 → 827 ms) and q90's improved 4%; q96's 132.5 ms sits
+inside its own historical 122.9–153.8 ms spread across six same-code runs. Both
+legs got faster and the CPU leg got faster by more, partly because the earlier
+figures used one warm-up and these use five — additional warm-ups favour
+Spark's JIT-compiled CPU path. Reported as a ratio regression against the
+recorded numbers, with the absolute evidence that the operator itself is
+unchanged.
+
+### Eligibility reconciliation — all 25 Task-1-eligible queries accounted for
+
+The planning-time shape probe (`scripts/inspect-grouped-aggregates.sh`)
+classified 25 of 103 queries as eligible on shape alone. **21 fired; the other
+4 were rejected by a documented planner cap**, re-confirmed by re-running the
+probe against the shipped build:
+
+| Query | Probe shape | Fired? | Reason |
+|---|---|---|---|
+| q3, q12, q20, q31, q33, q42, q47, q52, q53, q55, q56, q57, q58, q60, q63, q70, q74, q77, q83, q89, q98 | — | yes | — |
+| q7 | joins=4 groups=1 aggs=[avg×4] | no | Internal aggregate slot cap: 4 `avg`s cost 2 slots each plus 1 occupancy slot = 9 > 8 (`buildGroupedAggregateExec`) |
+| q26 | joins=4 groups=1 aggs=[avg×4] | no | Same slot cap: 9 > 8 |
+| q61 | joins=6 groups=0 aggs=[sum] | no | Kernel key cap: 6 joins > 4 |
+| q91 | joins=6 groups=5 aggs=[sum] | no | Kernel key cap: 6 joins > 4 |
+
+No eligible query was lost to an encoding rejection, a group-space cap, or a
+build reject — the group-space and encoding paths accepted every region they
+were offered, which is why `cpuFallbackRowGroups` is 0 across the board. The
+four misses are both deterministic and shape-only: they do not depend on the
+data, and raising either cap is a bounded kernel change rather than a
+correctness question.
+
+### Spec corrections found by implementation
+
+Two claims in `GPU_GROUPED_AGGREGATE_SPEC.md` were wrong and are corrected
+here rather than quietly dropped.
+
+1. **q67 is not addressable, and it was the largest prize in the spec.** The
+   spec's non-goals said "q67's rollup runs in Spark's final aggregate — only
+   its partial is ours", and its evidence section led the addressable pool with
+   q67 at an 11.2 s CPU median. Both are wrong: Spark places the `Expand` node
+   for `GROUP BY ROLLUP` *below* the partial aggregate, between it and the
+   scan, so the rollup expansion is inside the region this tier would replace,
+   not above it. Every rollup/cube query (q5, q14a, q18, q22, q27, q36, q67,
+   q80, q86) is rejected for this reason. The spec's "41 addressable queries"
+   figure was a plan-shape estimate that did not model attribute lineage; the
+   probe that did model it found 25, and 21 of those fired.
+
+2. **Duplicate dimension join keys cannot be handled by a multiplicity
+   factor when the dimension carries group-key attributes.** The spec said
+   multiplicity semantics "multiply contributions exactly as today's
+   multiplicity kernel". That is only valid for an attribute-free dimension.
+   If an attributed dimension has two rows with the same join key but
+   different attribute tuples, a matching fact row must fan out into *several
+   distinct groups* — an effect no scalar multiplier on a single group id can
+   express. `GroupSpace.build` therefore rejects duplicate keys in an
+   attributed dimension, and the operator takes a whole-operator CPU fallback
+   that performs a real hash join with Cartesian fan-out. This is validated
+   against Spark's own join result by the
+   `whole-operator-cpu-duplicate-key` case in
+   `scripts/run-parquet-decode-smoke-test.sh`.
+
+### The `ss_item_sk` discovery and the value-space answer
+
+Planner integration initially excluded every item-keyed query — q3, q42, q52,
+q55 and others — because `ParquetEligibility.check` requires join-key columns
+to be dictionary-encoded, and **`ss_item_sk` is PLAIN-encoded in all 30 SF10
+`store_sales` files**. SF10's `item` table has roughly 204,000 distinct values —
+enough to overflow a row group's dictionary page and force parquet-mr to fall
+back to PLAIN for that column across the whole table — so the single
+most-joined fact column in TPC-DS never gets a dictionary page at this scale
+factor. The key-column decode path in the JNI
+bridge hard-required dictionary framing: it always parsed the value section as
+an RLE/bit-packed id stream, and would have silently misread a PLAIN page's raw
+packed int32s.
+
+The fix was to decode a PLAIN key chunk into a dense **value-space** code table
+— indexed by the raw key value rather than by dictionary id — leaving the
+kernel completely unchanged, since it only ever reads "code at index". The
+dictionary case remains a dictionary-id-space table; only the table's index
+domain differs. A PLAIN key carries one extra runtime obligation the
+planning-time check cannot see: the dimension's join-key domain must fit the
+value-space table's bound, enforced by a driver-side domain guard once the
+dimension rows are collected. This recovered q3, q42, q52 and q55 — including
+q52, q55 and q42, three of the queries that come closest to the gate.
+
+### Bottom line
+
+The grouped-aggregate tier is a **correctness success and a performance
+disappointment.** It extends exact GPU execution from 3 queries to 24 with zero
+CPU fallbacks and zero result mismatches across 103 queries, which is the
+harder half of the problem. But it beats Spark on three queries (q53 1.16x,
+q63 1.14x, q89 1.13x under the most conservative protocol available for each);
+of the remaining 18, sixteen are below parity in the 24-query strict batch and
+the worst is 11x slower than CPU. `spark.metal.parquetAggregate.enabled` defaults to
+true and, on this evidence, should not: without a planner cost threshold that
+declines multi-region and large-group-space plans, enabling this operator makes
+the median accelerated TPC-DS query slower, not faster. The next unit of work
+is that threshold, not a faster kernel — the kernel is already 1% of the time.
+
 ## Full TPC-DS SF10 suite validation (2026-08-26)
 
 All 103 pinned Spark TPC-DS queries were run through both configurations

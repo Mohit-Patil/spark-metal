@@ -41,6 +41,28 @@ inference, but are not substitutes for a Spark SQL execution engine.
 - The earlier fused operator remains, one flag away, for plans whose fact-side
   scan is ineligible. It streams Spark's own vectorized batches to the GPU and
   met the same gate at 1.52x.
+- **Grouped aggregation on the GPU: correct everywhere, faster in three
+  places.** `MetalParquetGroupedAggregate`
+  (`spark.metal.parquetAggregate.enabled`, default true) generalizes the
+  accelerated region to N broadcast joins plus a partial SUM/COUNT/AVG over an
+  eligible Parquet fact scan. Across the full 103-query SF10 suite it fires on
+  21 queries — 24 counting the three membership queries — with
+  **103/103 exact result matches and `cpuFallbackRowGroups = 0` on every
+  accelerated query**. Only q53, q63 and q89 beat Spark's CPU under every
+  measurement protocol (1.16x / 1.14x / 1.13x at their most conservative);
+  most of the rest lose, the worst by 11x.
+- The losses are not GPU losses. `metalTime` is 20-234 ms across all 21
+  queries while CPU-side Parquet page parsing runs to 4.9 s; on the worst
+  query the kernel is 0.65% of execution. Every query with three or more
+  accelerated regions loses, because the operator's per-region driver cost is
+  paid once per region while Spark's plan shares that work. The next unit of
+  work is a planner cost threshold, not a faster kernel — so the ledgered
+  threadgroup-local pre-aggregation optimization was deliberately **not**
+  implemented.
+- Handling PLAIN-encoded join keys was required to reach the item-keyed
+  queries at all: `ss_item_sk` has no dictionary page in any SF10
+  `store_sales` file. Key decode now builds a dense value-space code table for
+  PLAIN chunks, with the GPU kernel unchanged.
 - Head-to-head on one build: the GPU Parquet path wins on SF10 (1.49x vs 1.20x)
   and loses on the 33.5-million-row synthetic q96 shape (1.53x vs 1.75x), whose
   small dictionaries, absent nulls, and long runs already suit Spark's
@@ -109,6 +131,8 @@ scripts/run-jni-smoke-test.sh
 scripts/run-spark-plugin-smoke-test.sh
 scripts/run-spark-synthetic-benchmark.sh
 scripts/run-q96-membership-smoke-test.sh
+scripts/run-parquet-decode-smoke-test.sh
+scripts/run-parquet-runs-test.sh
 Q96_SYNTHETIC_WARMUPS=5 Q96_SYNTHETIC_RUNS=11 scripts/run-q96-synthetic-benchmark.sh
 ```
 
@@ -116,6 +140,14 @@ After scale-factor-10 Parquet data exists, run the paired comparison with:
 
 ```bash
 scripts/run-tpcds-comparison.sh --queries q96 --warmups 2 --runs 7
+```
+
+The grouped-aggregate correctness smoke and the planning-time eligibility
+probe also need that dataset:
+
+```bash
+scripts/run-grouped-aggregate-smoke-test.sh
+scripts/inspect-grouped-aggregates.sh
 ```
 
 Performance numbers produced here are research results and are not comparable to

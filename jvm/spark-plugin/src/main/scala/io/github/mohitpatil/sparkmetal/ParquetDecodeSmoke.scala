@@ -319,14 +319,7 @@ object ParquetDecodeSmoke {
     val spark = SparkSession.builder().appName("spark-metal-parquet-decode-smoke-exec").getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
     val tempDir = Files.createTempDirectory("spark-metal-parquet-decode-smoke-exec")
-    val path = tempDir.resolve("data").toString
     try {
-      writeDataset(spark, path, rows)
-      val partFile = Files.list(java.nio.file.Path.of(path)).iterator().asScala
-        .map(_.toString)
-        .find(_.endsWith(".parquet"))
-        .getOrElse(throw new RuntimeException(s"No .parquet part file found under $path"))
-
       // Member set: values 50..199 in every column. writeDataset's k0/k1/k2
       // all start their non-null range at +50 (see the memberLow comment in
       // runDecodeAndCountMode), so this range is non-empty for every
@@ -337,9 +330,13 @@ object ParquetDecodeSmoke {
       val memberLow = 50
       val memberHigh = 199
       import spark.implicits._
-      val fact = spark.read.parquet(path).select("k0", "k1", "k2")
 
-      def check(caseName: String, keyValues: Seq[Int]): Unit = {
+      def check(
+          caseName: String,
+          files: Seq[String],
+          keyValues: Seq[Int],
+          minRowGroups: Option[Int] = None,
+          minFiles: Option[Int] = None): Unit = {
         val dim0 = keyValues.toDF("k0j")
         val dim1 = keyValues.toDF("k1j")
         val dim2 = keyValues.toDF("k2j")
@@ -347,7 +344,7 @@ object ParquetDecodeSmoke {
         val outputAttribute = AttributeReference("count", LongType, nullable = false)()
         val exec = MetalParquetMembershipCountExec(
           outputAttribute,
-          Seq(partFile),
+          files,
           Columns,
           Seq(
             dim0.queryExecution.executedPlan,
@@ -364,7 +361,13 @@ object ParquetDecodeSmoke {
           }
         }.collect()
         val actualCount = partitionCounts.sum
+        // Read after the action above completes: task-level accumulator
+        // updates are merged into the driver-side SQLMetric synchronously
+        // as part of that action, so this reflects the total across every
+        // partition/row-group this run touched.
+        val observedRowGroups = exec.metrics("numRowGroups").value
 
+        val fact = spark.read.parquet(files: _*).select("k0", "k1", "k2")
         val expectedCount = fact
           .join(dim0, fact("k0") === dim0("k0j"))
           .join(dim1, fact("k1") === dim1("k1j"))
@@ -372,13 +375,27 @@ object ParquetDecodeSmoke {
           .count()
 
         println(
-          s"""{"mode":"exec","case":"$caseName","rows":$rows,""" +
-            s""""expectedCount":$expectedCount,"actualCount":$actualCount}""")
+          s"""{"mode":"exec","case":"$caseName","rows":$rows,"files":${files.length},""" +
+            s""""numRowGroups":$observedRowGroups,"expectedCount":$expectedCount,""" +
+            s""""actualCount":$actualCount}""")
         require(expectedCount > 0, s"$caseName: expected join count must be non-zero")
         require(actualCount == expectedCount,
           s"$caseName: MetalParquetMembershipCountExec count $actualCount did not match " +
             s"expected $expectedCount")
+        minRowGroups.foreach { min =>
+          require(observedRowGroups >= min,
+            s"$caseName: expected numRowGroups >= $min, observed $observedRowGroups")
+        }
+        minFiles.foreach { min =>
+          require(files.length >= min, s"$caseName: expected files >= $min, got ${files.length}")
+        }
       }
+
+      // --- Layout A: a single file, a single row group -------------------
+      val pathSingle = tempDir.resolve("data-single").toString
+      writeDataset(spark, pathSingle, rows)
+      val singleFile = listParquetFiles(pathSingle)
+      require(singleFile.length == 1, s"expected exactly 1 part file under $pathSingle, got $singleFile")
 
       // Unique keys 50..199: every column's non-null range starts at +50
       // (see the memberLow comment in runDecodeAndCountMode), so this range
@@ -388,27 +405,73 @@ object ParquetDecodeSmoke {
       // correctly excluded. All keys are unique, so this exercises the
       // presence-table path and, with dense small-integer domains, the GPU
       // stream (parquetRowGroupBegin/parquetDecodePage/parquetRowGroupCount).
-      check("unique-dense", memberLow to memberHigh)
+      check("unique-dense", singleFile, memberLow to memberHigh)
 
       // Duplicate every key twice in all three dimensions: each matching
       // fact row now has build-side multiplicity 2 per column, so a
       // qualifying row contributes 2*2*2=8 to the count instead of 1. This
       // exercises the multiplicity-table path (MembershipTables.multiplicity)
       // instead of the presence-table path, on the same GPU stream.
-      check("duplicate-dense", (memberLow to memberHigh) ++ (memberLow to memberHigh))
+      check("duplicate-dense", singleFile, (memberLow to memberHigh) ++ (memberLow to memberHigh))
 
       // One key far outside the fact table's actual value range (max ~950)
       // blows the dense-domain span (max - min + 1 <= 16M) without changing
       // which fact rows match, forcing denseDomains = false for all three
       // columns and driving every row group through the CPU
       // (ColumnReadStoreImpl) fallback path instead of the GPU stream.
-      check("sparse-cpu-fallback", (memberLow to memberHigh) :+ 20000000)
+      check("sparse-cpu-fallback", singleFile, (memberLow to memberHigh) :+ 20000000)
+
+      // --- Layout B: one file, multiple row groups ------------------------
+      // parquet-mr only re-checks buffered row-group size at record-count
+      // checkpoints it extrapolates from the average buffered bytes/record
+      // seen so far (capped at +10,000 records between checks); for this
+      // dictionary-coded, highly-compressible synthetic data that estimate
+      // starts tiny, so a "realistic" 256KB threshold was empirically found
+      // to never trip a checkpoint before end-of-file (single ~331KB row
+      // group for all 100003 rows). A much smaller 4KB threshold forces
+      // frequent checkpoints instead, splitting this dataset into ~200 row
+      // groups within the single part file -- exercising the per-split
+      // loop's multiple-splits-per-file path (same cached ParquetFileReader,
+      // several readRowGroup(index) calls in sequence) the way SF10-shaped
+      // data from other writers could.
+      val pathMultiRowGroup = tempDir.resolve("data-multi-rowgroup").toString
+      writeDataset(spark, pathMultiRowGroup, rows, rowGroupBytes = Some(4096))
+      val multiRowGroupFile = listParquetFiles(pathMultiRowGroup)
+      require(multiRowGroupFile.length == 1,
+        s"expected exactly 1 part file under $pathMultiRowGroup, got $multiRowGroupFile")
+      check("multi-rowgroup-single-file", multiRowGroupFile, memberLow to memberHigh, minRowGroups = Some(2))
+
+      // --- Layout C: multiple files, splits spanning files ----------------
+      val pathMultiFile = tempDir.resolve("data-multi-file").toString
+      writeDataset(spark, pathMultiFile, rows, partitions = 3)
+      val multiFiles = listParquetFiles(pathMultiFile)
+      check("multi-file", multiFiles, memberLow to memberHigh, minFiles = Some(2))
     } finally {
       spark.stop()
     }
   }
 
-  private def writeDataset(spark: SparkSession, path: String, rows: Int): Unit = {
+  /**
+   * @param partitions   number of output part files (1 = coalesce to a
+   *                     single file, preserving row order; >1 repartitions
+   *                     -- with a shuffle -- into that many files, which the
+   *                     row/null formulas below tolerate fine since they
+   *                     only depend on the `id` value, not row order).
+   * @param rowGroupBytes when set, forces a small Parquet row-group (block)
+   *                     size so a single part file spans multiple row
+   *                     groups. Set both as a DataFrameWriter option and on
+   *                     the Hadoop configuration directly (belt and
+   *                     suspenders -- some parquet-mr/Spark version
+   *                     combinations only honor one of the two), and
+   *                     restored afterward so it does not leak into other
+   *                     datasets written by the same SparkSession.
+   */
+  private def writeDataset(
+      spark: SparkSession,
+      path: String,
+      rows: Int,
+      partitions: Int = 1,
+      rowGroupBytes: Option[Int] = None): Unit = {
     // k0 additionally goes null for a long contiguous id range (on top of the
     // modulo pattern), guaranteeing at least one data page that is 100% null
     // -- exercising the entirely-null-page path in
@@ -424,16 +487,33 @@ object ParquetDecodeSmoke {
     // before cutting. The null range here (70,001 rows) is wide enough that,
     // even after that first straddling page, at least one subsequent
     // 20,000-row-capped page starts and ends fully inside the null run.
-    spark.range(rows)
-      .selectExpr(
-        "CASE WHEN id BETWEEN 20000 AND 90000 THEN CAST(NULL AS INT) " +
-          "WHEN id % 17 = 0 THEN CAST(NULL AS INT) " +
-          "ELSE CAST(pmod(id, 900) + 50 AS INT) END AS k0",
-        "CASE WHEN id % 17 = 0 THEN CAST(NULL AS INT) ELSE CAST(pmod(id, 850) + 50 AS INT) END AS k1",
-        "CASE WHEN id % 17 = 0 THEN CAST(NULL AS INT) ELSE CAST(pmod(id, 700) + 50 AS INT) END AS k2")
-      .coalesce(1)
-      .write
-      .option("parquet.page.size", "8192")
-      .mode("errorifexists").parquet(path)
+    val hadoopConf = spark.sparkContext.hadoopConfiguration
+    val previousBlockSize = hadoopConf.get("parquet.block.size")
+    rowGroupBytes.foreach(bytes => hadoopConf.setInt("parquet.block.size", bytes))
+    try {
+      val base = spark.range(rows)
+        .selectExpr(
+          "CASE WHEN id BETWEEN 20000 AND 90000 THEN CAST(NULL AS INT) " +
+            "WHEN id % 17 = 0 THEN CAST(NULL AS INT) " +
+            "ELSE CAST(pmod(id, 900) + 50 AS INT) END AS k0",
+          "CASE WHEN id % 17 = 0 THEN CAST(NULL AS INT) ELSE CAST(pmod(id, 850) + 50 AS INT) END AS k1",
+          "CASE WHEN id % 17 = 0 THEN CAST(NULL AS INT) ELSE CAST(pmod(id, 700) + 50 AS INT) END AS k2")
+      val laidOut = if (partitions <= 1) base.coalesce(1) else base.repartition(partitions)
+      var writer = laidOut.write.option("parquet.page.size", "8192")
+      rowGroupBytes.foreach(bytes => writer = writer.option("parquet.block.size", bytes.toString))
+      writer.mode("errorifexists").parquet(path)
+    } finally {
+      rowGroupBytes.foreach { _ =>
+        if (previousBlockSize != null) hadoopConf.set("parquet.block.size", previousBlockSize)
+        else hadoopConf.unset("parquet.block.size")
+      }
+    }
   }
+
+  private def listParquetFiles(path: String): Seq[String] =
+    Files.list(java.nio.file.Path.of(path)).iterator().asScala
+      .map(_.toString)
+      .filter(_.endsWith(".parquet"))
+      .toSeq
+      .sorted
 }

@@ -33,7 +33,16 @@ public final class NativeBridge {
             int multiplier,
             int addend);
 
-    public static native long membershipCount3Address(
+    public static native long prepareMembershipCount3(
+            int[] keys0,
+            int[] keys1,
+            int[] keys2);
+
+    public static native void releaseMembershipCount3(long preparedHandle);
+
+    public static native long membershipCount3CopyFallbacks(long preparedHandle);
+
+    public static native long membershipCount3PreparedAddress(
             long input0Address,
             long null0Address,
             boolean hasNull0,
@@ -44,8 +53,6 @@ public final class NativeBridge {
             long null2Address,
             boolean hasNull2,
             int count,
-            int[] keys0,
-            int[] keys1,
-            int[] keys2);
+            long preparedHandle);
 
 }

@@ -27,9 +27,12 @@ inference, but are not substitutes for a Spark SQL execution engine.
 - Two Spark 4.2 columnar plan replacements, a JNI bridge, and three Metal kernels: working.
 - Integer null semantics: validated through Spark and independently through JNI.
 - Controlled 32-million-row synthetic Spark comparison: correct but currently about 5% slower than CPU.
-- Exact q96-shaped three-join/count comparison over 33,554,432 fact rows: 0.202 s
-  CPU median versus 0.178 s Metal median, or **1.13x**, with five warm-ups and
-  eleven measured runs.
+- Exact q96-shaped three-join/count comparison over 33,554,432 fact rows:
+  repeated strict runs currently measure **1.10x–1.12x** end to end, with five
+  warm-ups and eleven measured runs per configuration.
+- The q96 operator reuses prepared dimension maps and partial-result buffers per
+  partition. Its latest run mapped every off-heap fact column into Metal shared
+  memory without a copy fallback.
 - MLX 0.32.1 comparison: exact, but its GPU did not beat its compiled CPU path through 8.4 million rows.
 - Core ML 9.0 capability probe: CPU/GPU execution is possible, but the tested SQL-shaped graph cannot use the Neural Engine or produce Spark's required 64-bit sum.
 - TPC-DS scale-factor-10 data and official query result: not yet generated; the

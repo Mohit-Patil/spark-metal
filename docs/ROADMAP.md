@@ -37,6 +37,8 @@
 - [x] Fuse filter, projection, and reduction.
 - [x] Fuse three integer broadcast-membership joins and partial count.
 - [x] Preserve null and duplicate-key join semantics for that slice.
+- [x] Reuse prepared membership maps and partial buffers per partition.
+- [x] Add page-offset shared-memory mapping with observable copy fallback.
 
 ## M4 — TPC-DS proof
 
@@ -53,4 +55,4 @@
 - [ ] Grouped aggregation.
 - [ ] Integer equi-join.
 - [ ] Wider TPC-DS coverage.
-- [ ] Revisit zero-copy buffers, Parquet decoding, and local shuffle.
+- [ ] Extend zero-copy coverage and revisit Parquet decoding and local shuffle.

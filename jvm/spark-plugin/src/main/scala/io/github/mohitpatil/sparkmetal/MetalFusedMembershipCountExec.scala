@@ -33,7 +33,9 @@ case class MetalFusedMembershipCountExec(
   override lazy val metrics: Map[String, SQLMetric] = Map(
     "numInputRows" -> SQLMetrics.createMetric(sparkContext, "number of fact rows"),
     "numInputBatches" -> SQLMetrics.createMetric(sparkContext, "number of fact batches"),
+    "inputCopyFallbacks" -> SQLMetrics.createMetric(sparkContext, "Metal input copy fallbacks"),
     "dimensionTime" -> SQLMetrics.createTimingMetric(sparkContext, "dimension key collection time"),
+    "membershipBuildTime" -> SQLMetrics.createTimingMetric(sparkContext, "membership map build time"),
     "metalTime" -> SQLMetrics.createTimingMetric(sparkContext, "Metal membership and count time"))
 
   override protected def doExecute(): RDD[InternalRow] =
@@ -55,23 +57,42 @@ case class MetalFusedMembershipCountExec(
     dimensionTime += (System.nanoTime() - dimensionStarted) / 1000000
     val inputRows = longMetric("numInputRows")
     val inputBatches = longMetric("numInputBatches")
+    val inputCopyFallbacks = longMetric("inputCopyFallbacks")
+    val membershipBuildTime = longMetric("membershipBuildTime")
     val metalTime = longMetric("metalTime")
     val multiplicities = keys.map(_.groupMapReduce(identity)(_ => 1L)(_ + _))
+    val denseDomains = keys.forall { values =>
+      values.nonEmpty && values.last.toLong - values.head.toLong + 1L <= 16L * 1024 * 1024
+    }
     factPlan.executeColumnar().mapPartitions { batches =>
       SparkMetalNative.ensureInitialized(nativeLibrary, metalLibrary)
       var partitionCount = 0L
-      while (batches.hasNext) {
-        val batch = batches.next()
-        val rowCount = batch.numRows()
-        inputRows += rowCount
-        inputBatches += 1
-        try {
-          val columns = factOrdinals.map(batch.column)
-          val started = System.nanoTime()
-          partitionCount += executeBatch(columns, keys, multiplicities, rowCount)
-          metalTime += (System.nanoTime() - started) / 1000000
-        } finally {
-          batch.closeIfFreeable()
+      val preparedHandle = if (denseDomains) {
+        val started = System.nanoTime()
+        val handle = NativeBridge.prepareMembershipCount3(keys(0), keys(1), keys(2))
+        membershipBuildTime += (System.nanoTime() - started) / 1000000
+        handle
+      } else 0L
+      try {
+        while (batches.hasNext) {
+          val batch = batches.next()
+          val rowCount = batch.numRows()
+          inputRows += rowCount
+          inputBatches += 1
+          try {
+            val columns = factOrdinals.map(batch.column)
+            val started = System.nanoTime()
+            partitionCount += executeBatch(
+              columns, multiplicities, rowCount, preparedHandle)
+            metalTime += (System.nanoTime() - started) / 1000000
+          } finally {
+            batch.closeIfFreeable()
+          }
+        }
+      } finally {
+        if (preparedHandle != 0L) {
+          inputCopyFallbacks += NativeBridge.membershipCount3CopyFallbacks(preparedHandle)
+          NativeBridge.releaseMembershipCount3(preparedHandle)
         }
       }
       val vector = new OnHeapColumnVector(1, LongType)
@@ -82,17 +103,14 @@ case class MetalFusedMembershipCountExec(
 
   private def executeBatch(
       columns: Seq[ColumnVector],
-      keys: Seq[Array[Int]],
       multiplicities: Seq[Map[Int, Long]],
-      rowCount: Int): Long = {
-    if (keys.exists(_.isEmpty)) {
+      rowCount: Int,
+      preparedHandle: Long): Long = {
+    if (multiplicities.exists(_.isEmpty)) {
       return 0L
     }
-    val denseDomains = keys.forall { values =>
-      values.last.toLong - values.head.toLong + 1L <= 16L * 1024 * 1024
-    }
-    if (denseDomains && columns.forall(OffHeapColumnVectorAccess.supportsIntAddress)) {
-      return NativeBridge.membershipCount3Address(
+    if (preparedHandle != 0L && columns.forall(OffHeapColumnVectorAccess.supportsIntAddress)) {
+      return NativeBridge.membershipCount3PreparedAddress(
         OffHeapColumnVectorAccess.valueAddress(columns(0)),
         if (columns(0).hasNull()) OffHeapColumnVectorAccess.nullAddress(columns(0)) else 0L,
         columns(0).hasNull(),
@@ -103,7 +121,7 @@ case class MetalFusedMembershipCountExec(
         if (columns(2).hasNull()) OffHeapColumnVectorAccess.nullAddress(columns(2)) else 0L,
         columns(2).hasNull(),
         rowCount,
-        keys(0), keys(1), keys(2))
+        preparedHandle)
     }
     var count = 0L
     var row = 0

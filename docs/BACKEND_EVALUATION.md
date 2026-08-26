@@ -115,8 +115,9 @@ These projects are valuable at the integration layer: model/session reuse, batch
 Direct Metal is the primary SQL backend because it is the only evaluated path
 that provides the necessary kernel, integer, memory, and Spark integration
 control. The first single-expression Spark experiment is 0.95x, while the wider
-q96-shaped fusion is 1.13x, demonstrating why whole-plan-region replacement is
-the useful level of acceleration. The official TPC-DS success gate remains open.
+q96-shaped fusion is currently 1.10x–1.12x in repeated strict runs,
+demonstrating why whole-plan-region replacement is the useful level of
+acceleration. The official TPC-DS success gate remains open.
 MLX remains a compact feasibility/reference backend; Core ML, the Neural Engine,
 Spark ML, and SynapseML remain model-inference or integration-layer options
 rather than TPC-DS execution engines.

@@ -69,10 +69,12 @@ The first version supports fixed-width columns only.
 A narrow JNI API will pass native handles rather than per-row values. Ownership and lifetime must be explicit so that JVM cleanup cannot invalidate a Metal command in flight.
 
 The implemented bridge has two paths. Spark off-heap integer vectors expose a
-native address; when their address and batch length meet Metal's page-alignment
-requirements, the bridge wraps them with `newBufferWithBytesNoCopy`. Other input
-vectors are copied into reusable, page-aligned native buffers exposed to Java as
-direct `ByteBuffer` objects. Both paths carry an explicit null mask.
+native address. The membership-count path aligns that address down to the
+enclosing macOS page, wraps the page range with `newBufferWithBytesNoCopy`, and
+passes the original displacement as the Metal buffer offset. If Metal rejects a
+mapping, the bridge copies that column and increments an explicit Spark SQL
+metric. The fused-sum path uses a direct page-aligned wrap when possible and a
+reusable shared buffer otherwise. Both paths carry an explicit null mask.
 
 ### Apple columnar runtime
 
@@ -124,6 +126,8 @@ Two membership kernels preserve both speed and SQL join multiplicity:
 
 Null fact keys never match. Empty key sets return zero. On-heap vectors and key
 domains wider than 16,777,216 entries execute through an exact CPU fallback.
+Dense membership maps, the null placeholder, and the partial-count buffer are
+prepared once and reused for every columnar batch in a Spark partition.
 
 ## Numeric policy
 
@@ -135,7 +139,11 @@ domains wider than 16,777,216 entries execute through an exact CPU fallback.
 
 ## Memory policy
 
-The first implementation uses one explicit copy from Spark's decoded columnar input into reusable Metal shared buffers. This gives a correct baseline before attempting zero-copy ownership.
+The q96 slice now maps Spark's decoded off-heap column pages directly into Metal
+shared buffers for the duration of each synchronous command. Its
+`inputCopyFallbacks` metric records any batch that cannot take that path. The
+operator still includes Parquet decoding, command encoding, synchronization,
+and result materialization in end-to-end measurements.
 
 Measured stages:
 
@@ -149,7 +157,8 @@ Spark decode
   + remaining Spark execution
 ```
 
-Zero-copy is an optimization milestone, not an assumption.
+This is borrowed, synchronous access rather than ownership transfer: Spark keeps
+the column batch alive until the Metal command completes, then closes it.
 
 ## Fallback policy
 

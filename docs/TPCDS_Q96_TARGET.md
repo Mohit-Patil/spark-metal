@@ -39,9 +39,11 @@ on-heap columns and overly wide dense key domains use an exact CPU fallback.
 ## Evidence before the licensed run
 
 The exact q96 SQL text runs against a generated q96-shaped dataset with
-33,554,432 fact rows. With five warm-ups and eleven measured observations on the
-first host, CPU median time is 201.910 ms and Metal median time is 178.462 ms,
-for a 1.13x end-to-end speedup and identical result.
+33,554,432 fact rows. In the latest two strict comparisons, each using five
+warm-ups and eleven measured observations per configuration, end-to-end speedup
+is 1.10x and 1.12x with identical results. The latest medians are 200.281 ms CPU
+and 179.344 ms Metal. All 32 fact batches used page-offset shared-memory mapping
+with no input-copy fallback.
 
 This is a plan-shape and crossover experiment, not a TPC-DS benchmark result.
 The project goal is satisfied only after the same mechanism runs an unmodified

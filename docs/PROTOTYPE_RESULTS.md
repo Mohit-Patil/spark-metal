@@ -89,10 +89,12 @@ warm-ups, and eleven measured runs.
 
 | Configuration | Median end-to-end time | Result |
 |---|---:|---:|
-| Vanilla Spark CPU | 201.910 ms | 720 |
-| Spark Metal | 178.462 ms | 720 |
+| Vanilla Spark CPU | 200.281 ms | 720 |
+| Spark Metal | 179.344 ms | 720 |
 
-Observed end-to-end speedup: **1.13x**. This crosses the project's provisional
+Observed end-to-end speedup: **1.12x**. A preceding strict run of the same
+implementation measured 189.449 ms CPU and 172.130 ms Metal, or **1.10x**.
+Both cross the project's provisional
 10% performance threshold on the synthetic plan shape. It is not the goal result:
 the success gate explicitly requires the licensed TPC-DS scale-factor-10 data.
 
@@ -100,6 +102,11 @@ The q96 edge-case test also matches at 60 rows after introducing null fact keys
 and a duplicated matching dimension key. The implementation uses a compact
 one-byte presence-map kernel when build keys are unique and a separate
 multiplicity kernel when they are not.
+
+The current bridge prepares membership maps and the partial-count buffer once
+per partition. It maps the enclosing virtual-memory pages of Spark's off-heap
+columns into Metal and supplies the column displacement as a buffer offset. The
+latest strict run processed 32 fact batches with `inputCopyFallbacks = 0`.
 
 ## Correctness evidence
 

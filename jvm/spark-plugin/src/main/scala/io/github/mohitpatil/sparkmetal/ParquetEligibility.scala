@@ -48,6 +48,15 @@ private[sparkmetal] final class BoundedCache[K, V](maxEntries: Int) {
 object ParquetEligibility {
   private val SupportedEncodings: Set[Encoding] = Set(
     Encoding.RLE, Encoding.BIT_PACKED, Encoding.PLAIN_DICTIONARY, Encoding.RLE_DICTIONARY)
+  // Measures (checkMeasures, requireDictionary = false) may additionally be
+  // PLAIN-encoded -- MetalParquetGroupedAggregateExec.decodeMeasureColumn
+  // explicitly supports a PLAIN value chunk for a measure column (no
+  // dictionary page at all), unlike a join/group key, which the GPU decode
+  // path always requires in dictionary-id space. Without this, a genuinely
+  // PLAIN-encoded measure chunk would fail the general encoding-support
+  // filter below even though `requireDictionary = false` was meant to admit
+  // exactly this case.
+  private val SupportedMeasureEncodings: Set[Encoding] = SupportedEncodings + Encoding.PLAIN
   private val SupportedCodecs: Set[CompressionCodecName] = Set(
     CompressionCodecName.SNAPPY, CompressionCodecName.UNCOMPRESSED)
 
@@ -75,10 +84,15 @@ object ParquetEligibility {
    * missing-or-non-INT32 column then throws outside the CPU-fallback catch, and
    * a cached Left wrongly rejects an eligible plan.
    *
-   * Column names are held as a List so the key's equality is by value.
+   * Column names are held as a List so the key's equality is by value. The
+   * trailing Boolean discriminates `check` (dictionary required, for join/
+   * group keys) from `checkMeasures` (dictionary NOT required, for measure
+   * columns) -- without it, the two verdicts for the same (file, columns)
+   * pair would collide in the cache and whichever ran first would silently
+   * answer the other's stricter-or-looser question.
    */
   private val verdicts =
-    new BoundedCache[(FileVersion, List[String]), Either[String, Unit]](MaxCachedFiles)
+    new BoundedCache[(FileVersion, List[String], Boolean), Either[String, Unit]](MaxCachedFiles)
 
   /**
    * The version of one file, or None when its status cannot be read -- an
@@ -94,16 +108,32 @@ object ParquetEligibility {
       case _: Exception => None
     }
 
-  def check(paths: Seq[String], columnNames: Seq[String]): Either[String, Unit] = {
+  def check(paths: Seq[String], columnNames: Seq[String]): Either[String, Unit] =
+    checkColumns(paths, columnNames, requireDictionary = true)
+
+  /**
+   * Relaxed variant for Task 6's grouped-aggregate MEASURE columns. A
+   * measure column feeds the GPU decode path's PLAIN-or-dictionary measure
+   * decoder (unlike a join/group key, which the GPU path always decodes
+   * through a dictionary -- see `MetalParquetGroupedAggregateExec.
+   * decodeMeasureColumn`), so it is not required to be dictionary-encoded.
+   * Everything else `check` validates -- INT32 primitive type, nesting, and
+   * codec/encoding support -- still applies.
+   */
+  def checkMeasures(paths: Seq[String], columnNames: Seq[String]): Either[String, Unit] =
+    checkColumns(paths, columnNames, requireDictionary = false)
+
+  private def checkColumns(
+      paths: Seq[String], columnNames: Seq[String], requireDictionary: Boolean): Either[String, Unit] = {
     val results = if (paths.length <= 1) {
-      paths.map(cachedCheckFile(_, columnNames))
+      paths.map(cachedCheckFile(_, columnNames, requireDictionary))
     } else {
       val executor = Executors.newFixedThreadPool(
         math.min(paths.length, Runtime.getRuntime.availableProcessors))
       try {
         implicit val context: ExecutionContext = ExecutionContext.fromExecutor(executor)
         Await.result(
-          Future.traverse(paths)(path => Future(cachedCheckFile(path, columnNames))),
+          Future.traverse(paths)(path => Future(cachedCheckFile(path, columnNames, requireDictionary))),
           Duration.Inf)
       } finally {
         executor.shutdown()
@@ -113,21 +143,23 @@ object ParquetEligibility {
     results.collectFirst { case left @ Left(_) => left }.getOrElse(Right(()))
   }
 
-  private def cachedCheckFile(path: String, columnNames: Seq[String]): Either[String, Unit] =
+  private def cachedCheckFile(
+      path: String, columnNames: Seq[String], requireDictionary: Boolean): Either[String, Unit] =
     fileVersion(path) match {
-      case None => checkFile(path, columnNames)
+      case None => checkFile(path, columnNames, requireDictionary)
       case Some(version) =>
-        val key = (version, columnNames.toList)
+        val key = (version, columnNames.toList, requireDictionary)
         verdicts.get(key) match {
           case Some(verdict) => verdict
           case None =>
-            val verdict = checkFile(path, columnNames)
+            val verdict = checkFile(path, columnNames, requireDictionary)
             verdicts.put(key, verdict)
             verdict
         }
     }
 
-  private def checkFile(path: String, columnNames: Seq[String]): Either[String, Unit] = {
+  private def checkFile(
+      path: String, columnNames: Seq[String], requireDictionary: Boolean): Either[String, Unit] = {
     val reader = ParquetFileReader.open(
       HadoopInputFile.fromPath(new Path(path), sharedConfiguration))
     try {
@@ -145,10 +177,11 @@ object ParquetEligibility {
            if columnNames.contains(chunk.getPath.toDotString)) {
         if (!SupportedCodecs.contains(chunk.getCodec))
           return Left(s"$path: ${chunk.getPath}: codec ${chunk.getCodec}")
-        val unsupported = chunk.getEncodings.asScala.filterNot(SupportedEncodings.contains)
+        val supportedEncodings = if (requireDictionary) SupportedEncodings else SupportedMeasureEncodings
+        val unsupported = chunk.getEncodings.asScala.filterNot(supportedEncodings.contains)
         if (unsupported.nonEmpty)
           return Left(s"$path: ${chunk.getPath}: encodings $unsupported")
-        if (!chunk.getEncodings.asScala.exists(e =>
+        if (requireDictionary && !chunk.getEncodings.asScala.exists(e =>
             e == Encoding.PLAIN_DICTIONARY || e == Encoding.RLE_DICTIONARY))
           return Left(s"$path: ${chunk.getPath}: values are not dictionary-encoded")
       }

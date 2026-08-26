@@ -1,11 +1,12 @@
 package io.github.mohitpatil.sparkmetal
 
+import scala.collection.mutable
 import scala.util.control.NonFatal
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, Count, Partial, Sum}
-import org.apache.spark.sql.catalyst.optimizer.BuildRight
+import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight}
 import org.apache.spark.sql.catalyst.plans.Inner
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.{ColumnarRule, FileSourceScanExec, FilterExec, ProjectExec, SparkPlan}
@@ -14,7 +15,8 @@ import org.apache.spark.sql.execution.aggregate.HashAggregateExec
 import org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeExec, ReusedExchangeExec}
 import org.apache.spark.sql.execution.joins.BroadcastHashJoinExec
-import org.apache.spark.sql.types.{IntegerType, LongType}
+import org.apache.spark.sql.types.{
+  BooleanType, ByteType, DataType, DateType, DecimalType, IntegerType, LongType, ShortType, StringType}
 
 private case class FusedSumSpec(
     attribute: AttributeReference,
@@ -35,15 +37,180 @@ final class SparkMetalColumnarRule(
     metalLibrary: String,
     ansiEnabled: Boolean,
     adaptiveEnabled: Boolean,
-    parquetScanEnabled: Boolean)
+    parquetScanEnabled: Boolean,
+    parquetAggregateEnabled: Boolean)
     extends ColumnarRule with Logging {
 
   override def preColumnarTransitions: Rule[SparkPlan] = new Rule[SparkPlan] {
     override def apply(plan: SparkPlan): SparkPlan = plan.transformUp {
       case aggregate: HashAggregateExec =>
-        replaceMembershipCount(aggregate).orElse(replace(aggregate)).getOrElse(aggregate)
+        replaceGroupedAggregate(aggregate)
+          .orElse(replaceMembershipCount(aggregate))
+          .orElse(replace(aggregate))
+          .getOrElse(aggregate)
     }
   }
+
+  /**
+   * Task 6: plans [[MetalParquetGroupedAggregateExec]] in place of a partial
+   * Sum/Count/Average [[HashAggregateExec]] grouping on star-schema
+   * dimension attributes -- [[GroupedAggregateShape.matchRegion]] does the
+   * structural matching (Task 1); this method is the eligibility gate on
+   * top of a match: the feature flag, the kernel's join-count and internal-
+   * aggregate-slot caps, [[GroupSpace]]'s supported group-key attribute
+   * types, and [[ParquetEligibility]] over both the join keys (dictionary
+   * required) and the measure columns (dictionary NOT required -- see
+   * `ParquetEligibility.checkMeasures`).
+   *
+   * Ordered BEFORE [[replaceMembershipCount]]: `matchRegion` itself already
+   * refuses a count-only, zero-group-key region (q96/q88/q90's shape), so
+   * the two rules never compete for the same region -- this method returns
+   * `None` for those regions (by way of `matchRegion` returning `Left`)
+   * before doing any filesystem work, and the membership branches proceed
+   * exactly as before.
+   *
+   * Safe-fallback: mirrors `parquetMembershipCountExec` -- the whole
+   * evaluation (shape re-derivation, footer reads via `ParquetEligibility`)
+   * is wrapped in `NonFatal` so a planner-time surprise (a corrupt footer, an
+   * unexpected plan shape `matchRegion` didn't anticipate) falls back to the
+   * untouched `HashAggregateExec` rather than aborting planning of the whole
+   * query.
+   */
+  private def replaceGroupedAggregate(aggregate: HashAggregateExec): Option[SparkPlan] = {
+    if (!parquetAggregateEnabled) {
+      return None
+    }
+    try {
+      GroupedAggregateShape.matchRegion(aggregate) match {
+        case scala.util.Left(_) => None
+        case scala.util.Right(region) => buildGroupedAggregateExec(region)
+      }
+    } catch {
+      case NonFatal(e) =>
+        logWarning(
+          "Grouped-aggregate eligibility check failed; falling back to the next candidate " +
+            "operator for this region", e)
+        None
+    }
+  }
+
+  private def buildGroupedAggregateExec(region: GroupedAggregateShape.Region): Option[SparkPlan] = {
+    // Kernel key cap: at most 4 joins (dimensions), and this operator always
+    // needs at least one to have a join key column to decode at all.
+    if (region.joins.isEmpty || region.joins.length > 4) {
+      return None
+    }
+    // Internal aggregate slot cap: 2 slots per sum/avg (sum + paired count),
+    // 1 per count, plus 1 occupancy slot -- computed conservatively (no
+    // dedup across repeated aggregates on the same column), matching
+    // MetalParquetGroupedAggregateExec.buildInternalAggPlan's actual layout.
+    val internalSlotCount = region.aggs.map(spec => if (spec.function == "count") 1 else 2).sum + 1
+    if (internalSlotCount > 8) {
+      return None
+    }
+    // Pre-reject any group-key attribute type GroupSpace cannot represent
+    // (Double/Float in particular) here, at planning time, rather than
+    // letting the exec's driver-side throw be the first place this surfaces.
+    if (!region.groupKeys.forall(attribute => isSupportedGroupKeyType(attribute.dataType))) {
+      return None
+    }
+
+    val buildPlanOptions = region.joins.map(joinBuildPlan)
+    if (buildPlanOptions.exists(_.isEmpty)) {
+      return None
+    }
+    val buildPlans = buildPlanOptions.map(_.get)
+    val buildKeyExprs = region.joins.map(joinBuildKey)
+    // The build-side join key must itself be int32 -- it is compared for
+    // equality against the fact-side int32 key (matchRegion already
+    // validated the fact side), and MetalParquetGroupedAggregateExec's
+    // dimension collector always reads ordinal 0 of a keyPlan row as an Int.
+    if (buildKeyExprs.exists(_.dataType != IntegerType)) {
+      return None
+    }
+
+    // Every group key resolved (by matchRegion) to some join's build-side
+    // output; re-derive WHICH join here so it can be projected out of that
+    // join's own keyPlan, in the canonical per-dimension order it is first
+    // encountered.
+    val exprIdToDimension: Map[ExprId, Int] =
+      buildPlans.zipWithIndex.flatMap { case (plan, index) => plan.output.map(_.exprId -> index) }.toMap
+    if (!region.groupKeys.forall(attribute => exprIdToDimension.contains(attribute.exprId))) {
+      return None
+    }
+
+    val dimensionAttributes = Array.fill(region.joins.length)(mutable.ArrayBuffer.empty[Attribute])
+    val groupKeyDimensionIndex = region.groupKeys.map { attribute =>
+      val dimensionIndex = exprIdToDimension(attribute.exprId)
+      val attributes = dimensionAttributes(dimensionIndex)
+      val existingPosition = attributes.indexWhere(_.exprId == attribute.exprId)
+      if (existingPosition >= 0) {
+        (dimensionIndex, existingPosition)
+      } else {
+        attributes += attribute
+        (dimensionIndex, attributes.length - 1)
+      }
+    }
+
+    val keyPlans = region.joins.indices.map { index =>
+      val keyExpression: NamedExpression = buildKeyExprs(index) match {
+        case named: NamedExpression => named
+        case other => Alias(other, "spark_metal_group_key")()
+      }
+      ProjectExec(keyExpression +: dimensionAttributes(index).toSeq, buildPlans(index))
+    }
+
+    val keyColumnNames = region.factKeys.map(_.name)
+    val measureColumnNames = region.measureColumns.map(_.name)
+    val files = region.scan.relation.location.inputFiles.toSeq
+
+    if (ParquetEligibility.check(files, keyColumnNames).isLeft) {
+      return None
+    }
+    if (measureColumnNames.nonEmpty && ParquetEligibility.checkMeasures(files, measureColumnNames).isLeft) {
+      return None
+    }
+
+    Some(MetalParquetGroupedAggregateExec(
+      region.aggregate.output,
+      files,
+      keyColumnNames,
+      measureColumnNames,
+      region.aggs,
+      groupKeyDimensionIndex,
+      keyPlans,
+      nativeLibrary,
+      metalLibrary))
+  }
+
+  private def isSupportedGroupKeyType(dataType: DataType): Boolean = dataType match {
+    case IntegerType | LongType | ShortType | ByteType | BooleanType | DateType | StringType => true
+    case _: DecimalType => true
+    case _ => false
+  }
+
+  /**
+   * The join's build-side plan, with its [[BroadcastExchangeExec]] (or an
+   * AQE [[ReusedExchangeExec]]/[[BroadcastQueryStageExec]] wrapping one)
+   * stripped off -- mirrors `stripBroadcast`'s use in
+   * `extractMembershipTree`. A raw `join.left`/`join.right` here is always
+   * headed by one of these exchange nodes (EnsureRequirements guarantees a
+   * broadcast exchange sits directly above a `BroadcastHashJoinExec`'s build
+   * side), and `BroadcastExchangeExec.doExecute()` throws
+   * `UnsupportedOperationException` -- it only supports
+   * `doExecuteBroadcast()` -- so a `ProjectExec` wrapping the unstripped
+   * node would compile and plan fine but blow up the first time
+   * `executeCollect()` actually ran it. `None` when the build side is not
+   * headed by a recognized exchange node, an unexpected shape that should
+   * fall back to the next candidate operator rather than risk that crash.
+   */
+  private def joinBuildPlan(join: BroadcastHashJoinExec): Option[SparkPlan] = {
+    val raw = if (join.buildSide == BuildLeft) join.left else join.right
+    stripBroadcast(raw)
+  }
+
+  private def joinBuildKey(join: BroadcastHashJoinExec): Expression =
+    if (join.buildSide == BuildLeft) join.leftKeys.head else join.rightKeys.head
 
   private def replaceMembershipCount(aggregate: HashAggregateExec): Option[SparkPlan] = {
     if (adaptiveEnabled ||

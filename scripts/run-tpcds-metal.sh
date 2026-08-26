@@ -26,6 +26,17 @@ fi
 "${script_dir}/build-spark-plugin.sh"
 build_root="${repo_root}/build/spark-plugin"
 
+# Optional extra --conf overrides (e.g. to disable a feature flag for a
+# regression leg) without forking this script's fixed conf list. Space-
+# separated "key=value" entries; see run-grouped-aggregate-smoke-test.sh for
+# a worked example.
+extra_conf_args=()
+if [[ -n "${TPCDS_METAL_EXTRA_CONF:-}" ]]; then
+  for entry in ${TPCDS_METAL_EXTRA_CONF}; do
+    extra_conf_args+=(--conf "${entry}")
+  done
+fi
+
 spark-submit \
   --master "${spark_master}" \
   --driver-memory 6g \
@@ -40,6 +51,7 @@ spark-submit \
   --conf spark.sql.extensions=io.github.mohitpatil.sparkmetal.SparkMetalExtensions \
   --conf "spark.metal.nativeLibrary=${build_root}/libsparkmetal.dylib" \
   --conf "spark.metal.metalLibrary=${build_root}/kernels.metallib" \
+  "${extra_conf_args[@]+"${extra_conf_args[@]}"}" \
   "${repo_root}/benchmarks/tpcds/run_queries.py" \
   --data-dir "${data_dir}" \
   --queries-dir "${queries_dir}" \

@@ -426,13 +426,14 @@ case class MetalParquetGroupedAggregateExec(
           if (cpuFallbackBuffer != null) cpuFallbackBuffer else new Array[Long](totalCells)
         }
 
+      val toUnsafeRow = outputProjection()
       val outputRows = mutable.ArrayBuffer.empty[InternalRow]
       var g = 0
       while (g < groupCount) {
         val base = g * internalAggCount
         if (resultBuffer(base + occupancySlot) > 0L) {
-          outputRows += buildOutputRow(
-            built.groupTuples(g), dimensionAttributeTypes, resultBuffer, base, aggSlotMappings)
+          outputRows += toUnsafeRow(buildOutputRow(
+            built.groupTuples(g), dimensionAttributeTypes, resultBuffer, base, aggSlotMappings)).copy()
         }
         g += 1
       }
@@ -741,8 +742,9 @@ case class MetalParquetGroupedAggregateExec(
       // construction; no separate occupancy filter is needed (unlike the
       // GPU path's dense, pre-sized array, which can hold never-touched
       // groups).
+      val toUnsafeRow = outputProjection()
       val outputRows = groupMap.values.map { case (attributeRows, buffer) =>
-        buildOutputRow(attributeRows, dimensionAttributeTypes, buffer, 0, aggSlotMappings)
+        toUnsafeRow(buildOutputRow(attributeRows, dimensionAttributeTypes, buffer, 0, aggSlotMappings)).copy()
       }.toArray
       numOutputRows += outputRows.length
       outputRows.iterator
@@ -895,6 +897,22 @@ case class MetalParquetGroupedAggregateExec(
     case decimalType: DecimalType => Decimal(value, decimalType.precision, decimalType.scale)
     case other => throw new IllegalStateException(s"unsupported sum output type: $other")
   }
+
+  /**
+   * Converts `buildOutputRow`'s `GenericInternalRow` into a genuine
+   * `UnsafeRow`. This operator sits directly below a real
+   * `ShuffleExchangeExec` once planned into an actual query (Task 6):
+   * `UnsafeRowSerializerInstance.writeValue` hard-casts every row it
+   * serializes to `UnsafeRow`, so a bare `GenericInternalRow` reaching that
+   * boundary throws a `ClassCastException` deep inside the shuffle write
+   * path -- invisible to Task 5's direct-construction smoke, which never
+   * routed this operator's output through a real shuffle. One projection is
+   * built per partition (not per row) and reused; callers must `.copy()`
+   * its result before retaining more than one row, since `UnsafeProjection`
+   * reuses its own output buffer across calls.
+   */
+  private def outputProjection(): UnsafeProjection =
+    UnsafeProjection.create(outputAttributes.map(_.dataType).toArray)
 
   /**
    * Builds one partial output row for an occupied group: group-key values

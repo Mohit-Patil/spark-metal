@@ -37,6 +37,7 @@ spark-submit \
   --conf spark.sql.ansi.enabled=false \
   --conf spark.sql.shuffle.partitions=16 \
   --conf spark.sql.parquet.enableVectorizedReader=true \
+  --conf spark.sql.parquet.columnarReaderBatchSize=1048576 \
   --conf spark.sql.columnVector.offheap.enabled=true \
   --class io.github.mohitpatil.sparkmetal.GroupedAggregateShape \
   "${build_root}/spark-metal-plugin.jar" \

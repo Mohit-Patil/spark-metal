@@ -11,7 +11,7 @@ import org.apache.spark.sql.catalyst.expressions.{
   NamedExpression, UnscaledValue}
 import org.apache.spark.sql.catalyst.expressions.aggregate.{
   AggregateExpression, AggregateFunction, Average, Count, Partial, Sum}
-import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight}
+import org.apache.spark.sql.catalyst.optimizer.BuildLeft
 import org.apache.spark.sql.execution.{
   ColumnarToRowExec, ExpandExec, FileSourceScanExec, FilterExec, InputAdapter, ProjectExec,
   SparkPlan, WholeStageCodegenExec}

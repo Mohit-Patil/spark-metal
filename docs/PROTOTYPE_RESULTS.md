@@ -1,5 +1,33 @@
 # Prototype results
 
+## Full TPC-DS SF10 suite validation (2026-08-26)
+
+All 103 pinned Spark TPC-DS queries were run through both configurations
+(one warm-up, three measured runs; `benchmark-results/comparison-20260826T124359Z`
+for q1–q94 and `comparison-20260826T141241Z` for q95–q99 after a Metal-leg
+JVM wedge — see below).
+
+- **103/103 queries produce exact result-hash, row-count, and schema matches.**
+- The accelerator fires on exactly three queries and wins on all three with
+  zero CPU fallbacks: **q96 1.72x, q90 1.60x, q88 1.58x**. q88 — which lost
+  to CPU under the earlier fused operator — clears the gate under GPU Parquet
+  decode. No other executed plan contains a Metal operator; the remaining
+  queries' timing deltas scatter symmetrically within run-to-run noise.
+- One `OutOfMemoryError` occurred during the Metal leg's q14a and was retried
+  successfully by Spark (final result exact); the long-lived Metal-leg JVM
+  later wedged at q95 after 94 queries. Analysis attributes both to the 6 GB
+  local-mode heap running at its ceiling on TPC-DS's three heaviest
+  sort-merge-join queries (q14, q64, q95 — the only queries showing heap
+  warnings), aggravated by the Metal leg always running second on a
+  memory-degraded host: the failing stacks are entirely vanilla Spark sorter
+  allocations, q14a's plans are byte-identical across configurations, and the
+  pressure began before any accelerated query had executed. Suite runs should
+  use an 8 GB driver or per-query JVMs for those three queries.
+- A plan-shape scan of the suite identifies **41 broadcast-only star-aggregate
+  queries** (SUM/COUNT/AVG partials over fact scans, led by q67 at 11.2 s and
+  q22 at 8.0 s) as the addressable pool for the next accelerator tier; see
+  `GPU_GROUPED_AGGREGATE_SPEC.md`.
+
 Captured on the first Apple M5 host on 2026-08-26. These results are feasibility
 measurements, not TPC-DS results and not comparable to official TPC benchmark
 results.

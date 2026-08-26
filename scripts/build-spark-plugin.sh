@@ -56,6 +56,7 @@ java -cp "${SPARK_HOME}/jars/*" scala.tools.nsc.Main \
   "${plugin_root}/scala/io/github/mohitpatil/sparkmetal/MetalParquetMembershipCountExec.scala" \
   "${plugin_root}/scala/io/github/mohitpatil/sparkmetal/GroupedAggregateShape.scala" \
   "${plugin_root}/scala/io/github/mohitpatil/sparkmetal/GroupSpace.scala" \
+  "${plugin_root}/scala/io/github/mohitpatil/sparkmetal/MetalParquetGroupedAggregateExec.scala" \
   "${plugin_root}/scala/io/github/mohitpatil/sparkmetal/SparkMetalColumnarRule.scala" \
   "${plugin_root}/scala/io/github/mohitpatil/sparkmetal/SparkMetalExtensions.scala" \
   "${plugin_root}/scala/io/github/mohitpatil/sparkmetal/PluginSmoke.scala" \

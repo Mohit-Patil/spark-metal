@@ -3,6 +3,7 @@ package io.github.mohitpatil.sparkmetal
 import java.nio.{ByteBuffer, ByteOrder}
 import java.nio.file.Files
 
+import scala.collection.mutable
 import scala.jdk.CollectionConverters._
 
 import org.apache.hadoop.conf.Configuration
@@ -15,7 +16,7 @@ import org.apache.parquet.hadoop.util.HadoopInputFile
 import org.apache.spark.sql.{Row, SparkSession}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.AttributeReference
-import org.apache.spark.sql.functions.{col, count, expr, lit, sum}
+import org.apache.spark.sql.functions.{avg, col, count, expr, lit, sum}
 import org.apache.spark.sql.types.{
   DateType, Decimal, DecimalType, DoubleType, IntegerType, LongType, StringType, StructField, StructType}
 import org.apache.spark.unsafe.types.UTF8String
@@ -44,6 +45,11 @@ object ParquetDecodeSmoke {
         "Usage: ParquetDecodeSmoke aggregate NATIVE_LIB METAL_LIB [ROWS]")
       val rows = if (arguments.length > 3) arguments(3).toInt else 100003
       runAggregateMode(arguments(1), arguments(2), rows)
+    } else if (arguments.nonEmpty && arguments(0) == "agg-exec") {
+      require(arguments.length >= 3,
+        "Usage: ParquetDecodeSmoke agg-exec NATIVE_LIB METAL_LIB [ROWS]")
+      val rows = if (arguments.length > 3) arguments(3).toInt else 100003
+      runAggExecMode(arguments(1), arguments(2), rows)
     } else {
       runDecodeAndCountMode(arguments)
     }
@@ -1080,6 +1086,293 @@ object ParquetDecodeSmoke {
     val files = listParquetFiles(path)
     require(files.length == 1, s"expected exactly 1 part file under $path, got $files")
     files.head
+  }
+
+  private val GroupedExecKeyColumns = Seq("cat_key", "region_key")
+  private val GroupedExecMeasureColumns = Seq("quantity", "amount")
+
+  /**
+   * Task 5: drive MetalParquetGroupedAggregateExec directly (it is not yet
+   * reachable from the planner -- that's Task 6) over a synthetic star: a
+   * fact table with 2 join keys (cat_key -> an ATTRIBUTED dimension with a
+   * string and a decimal attribute, region_key -> an attribute-free
+   * dimension with a DUPLICATE key) and 2 measures (quantity, amount) that
+   * both carry nulls and negatives. Four user aggregates cover every
+   * function/kind combination this operator supports: sum(quantity),
+   * count(quantity), avg(amount), count(1).
+   *
+   * Each case compares the operator's emitted PARTIAL rows -- merged per
+   * group on the JVM (sum ignoring None+None==None, count/occupancy summed
+   * plainly, avg finalized as mergedSum/mergedCount) -- against Spark's own
+   * end-to-end join + groupBy + agg answer over the SAME files/dimensions,
+   * per the brief (comparing partials against a plan-substituted final
+   * aggregate is not attempted; the actual join+groupBy is the ground
+   * truth).
+   */
+  private def runAggExecMode(nativeLibrary: String, metalLibrary: String, rows: Int): Unit = {
+    val spark = SparkSession.builder().appName("spark-metal-grouped-aggregate-exec-smoke").getOrCreate()
+    spark.sparkContext.setLogLevel("WARN")
+    val tempDir = Files.createTempDirectory("spark-metal-grouped-aggregate-exec-smoke")
+    try {
+      SparkMetalNative.ensureInitialized(nativeLibrary, metalLibrary)
+      import spark.implicits._
+
+      val quantityAttribute = AttributeReference("quantity", IntegerType)()
+      val amountAttribute = AttributeReference("amount", IntegerType)()
+      val aggSpecs = Seq(
+        GroupedAggregateShape.AggSpec(
+          "sum", GroupedAggregateShape.FactColumn(quantityAttribute), unscaled = false, sumDataType = LongType),
+        GroupedAggregateShape.AggSpec(
+          "count", GroupedAggregateShape.FactColumn(quantityAttribute), unscaled = false, sumDataType = LongType),
+        GroupedAggregateShape.AggSpec(
+          "avg", GroupedAggregateShape.FactColumn(amountAttribute), unscaled = false, sumDataType = DoubleType),
+        GroupedAggregateShape.AggSpec(
+          "count", GroupedAggregateShape.CountStar, unscaled = false, sumDataType = LongType))
+
+      // Group-key output columns come from dimension 0 (cat_key) only --
+      // dimension 1 (region_key) is attribute-free and contributes nothing
+      // but a membership gate + multiplicity factor.
+      val outputAttributes = Seq(
+        AttributeReference("major", IntegerType, nullable = true)(),
+        AttributeReference("brand", StringType, nullable = true)(),
+        AttributeReference("listPrice", DecimalType(7, 2), nullable = true)(),
+        AttributeReference("sumQuantity", LongType, nullable = true)(),
+        AttributeReference("countQuantity", LongType, nullable = false)(),
+        AttributeReference("avgAmountSum", DoubleType, nullable = true)(),
+        AttributeReference("avgAmountCount", LongType, nullable = false)(),
+        AttributeReference("countStar", LongType, nullable = false)())
+      val groupKeyDimensionIndex = Seq((0, 0), (0, 1), (0, 2))
+
+      // cat_key in {1,2,3,4}: key 4 has no fact rows (an all-zero group is
+      // guaranteed); a fact-side cat_key of 5 matches no dimension row
+      // (code-gate). listPrice is explicitly cast to DecimalType(7,2) --
+      // the SAME precision/scale outputAttributes declares -- since
+      // UnsafeRow's getDecimal(ordinal, precision, scale) decodes
+      // differently depending on the precision it is told, and the two
+      // must agree for a real UnsafeRow-backed dimension row (unlike
+      // GenericInternalRow, which ignores precision entirely).
+      // cat_key = 6 is a dedicated "all-null-quantity" group (see the id < 50
+      // reserved band in writeFactDataset below): it proves the per-aggregate
+      // null gate (sum is null iff its paired non-null count is zero) fires
+      // independently per aggregate -- that group's sum(quantity) is null
+      // while its avg(amount) is populated, in the SAME emitted row. (cat_key
+      // = 5 is deliberately left with NO dimension row -- the main dataset's
+      // cat_key formula below ranges over 1..5, so 5 remains the existing
+      // "fact value matches no dimension row" code-gate case.)
+      val catRows = Seq(
+        (1, 1, "acme", BigDecimal(19.99)),
+        (2, 1, "globex", BigDecimal(19.99)),
+        (3, 2, "acme", BigDecimal(29.99)),
+        (4, 3, "initech", BigDecimal(29.99)),
+        (6, 99, "nullq", BigDecimal(9.99)))
+      val catDim = catRows.toDF("cat_key", "major", "brand", "listPrice")
+        .withColumn("listPrice", col("listPrice").cast(DecimalType(7, 2)))
+
+      // region_key in {10,20,20,30}: 20 is DUPLICATED in this
+      // attribute-free dimension, folding into a multiplicity factor of 2
+      // (not rejected, unlike a duplicate in an attributed dimension); a
+      // fact-side region_key of 40 matches no dimension row.
+      val regionDim = Seq(10, 20, 20, 30).toDF("region_key")
+
+      def writeFactDataset(catKeyExpr: String, path: String): Unit = {
+        spark.range(rows)
+          .selectExpr(
+            "id",
+            // A narrow id < 50 band is reserved for cat_key = 6 with
+            // region_key always = 10 (a guaranteed full match) and quantity
+            // always null (see below) -- every other row uses the caller's
+            // own cat_key formula untouched.
+            s"CASE WHEN id < 50 THEN 6 ELSE ($catKeyExpr) END AS cat_key",
+            "CASE WHEN id < 50 THEN 10 WHEN id % 7 = 0 THEN CAST(NULL AS INT) " +
+              "ELSE CASE pmod(id, 4) WHEN 0 THEN 10 WHEN 1 THEN 20 WHEN 2 THEN 30 ELSE 40 END END AS region_key")
+          .withColumn("quantity",
+            expr("CASE WHEN id < 50 THEN CAST(NULL AS INT) " +
+              "WHEN id % 11 = 0 THEN CAST(NULL AS INT) " +
+              "WHEN pmod(id, 5) = 0 THEN CAST(-(pmod(id, 20) + 1) AS INT) " +
+              "ELSE CAST(pmod(id, 20) + 1 AS INT) END"))
+          .withColumn("amount",
+            expr("CASE WHEN id % 13 = 0 THEN CAST(NULL AS INT) " +
+              "WHEN pmod(id, 6) = 0 THEN CAST(-(1000 + pmod(id, 50)) AS INT) " +
+              "ELSE CAST(1000 + pmod(id, 50) AS INT) END"))
+          .drop("id")
+          .coalesce(1)
+          .write.mode("errorifexists").parquet(path)
+      }
+
+      val mainPath = tempDir.resolve("data-main").toString
+      writeFactDataset(
+        "CASE WHEN id % 17 = 0 THEN CAST(NULL AS INT) ELSE CAST(pmod(id, 5) + 1 AS INT) END", mainPath)
+      val mainFile = singlePartFile(mainPath)
+
+      // A second file whose cat_key is near-unique (raw id, offset well
+      // past the dimension's real key range) for ~99% of rows -- same
+      // trick as writeDictionaryOverflowDataset -- so parquet-mr abandons
+      // the dictionary for it. decodeKeyColumn's dictionaryPage == null
+      // check then throws for every row group of this file, driving it
+      // through the per-row-group CPU fallback. Every 100th row is
+      // deliberately a REAL match (cat_key/region_key both drawn from the
+      // dimensions' actual key sets) so aggregateRowGroupOnCpu's
+      // arithmetic (group id, factor, null-aware sum/count) is genuinely
+      // exercised on CPU -- not just its "every row is a non-member"
+      // branch, which a file that matches nothing at all would only cover.
+      val overflowPath = tempDir.resolve("data-overflow").toString
+      val hadoopConf = spark.sparkContext.hadoopConfiguration
+      val previousDictionarySize = hadoopConf.get("parquet.dictionary.page.size")
+      hadoopConf.setInt("parquet.dictionary.page.size", 4096)
+      try {
+        spark.range(rows)
+          .selectExpr(
+            "id",
+            "CASE WHEN id % 100 = 0 THEN CAST(pmod(id, 4) + 1 AS INT) " +
+              "ELSE CAST(id + 1000000 AS INT) END AS cat_key",
+            "CASE WHEN id % 100 = 0 THEN CAST(pmod(id, 3) * 10 + 10 AS INT) " +
+              "ELSE CAST(pmod(id, 4) * 10 + 10 AS INT) END AS region_key")
+          .withColumn("quantity",
+            expr("CASE WHEN id % 9 = 0 THEN CAST(NULL AS INT) ELSE CAST(pmod(id, 20) + 1 AS INT) END"))
+          .withColumn("amount",
+            expr("CASE WHEN id % 15 = 0 THEN CAST(NULL AS INT) ELSE CAST(1000 + pmod(id, 50) AS INT) END"))
+          .drop("id")
+          .coalesce(1)
+          .write
+          .option("parquet.dictionary.page.size", "4096")
+          .mode("errorifexists").parquet(overflowPath)
+      } finally {
+        if (previousDictionarySize != null) hadoopConf.set("parquet.dictionary.page.size", previousDictionarySize)
+        else hadoopConf.unset("parquet.dictionary.page.size")
+      }
+      val overflowFile = singlePartFile(overflowPath)
+
+      def buildExec(
+          files: Seq[String],
+          catDimDF: org.apache.spark.sql.DataFrame,
+          regionDimDF: org.apache.spark.sql.DataFrame): MetalParquetGroupedAggregateExec =
+        MetalParquetGroupedAggregateExec(
+          outputAttributes, files, GroupedExecKeyColumns, GroupedExecMeasureColumns, aggSpecs,
+          groupKeyDimensionIndex,
+          Seq(catDimDF.queryExecution.executedPlan, regionDimDF.queryExecution.executedPlan),
+          nativeLibrary, metalLibrary)
+
+      def decimalCents(decimal: java.math.BigDecimal): Long = decimal.movePointRight(2).setScale(0).longValueExact()
+
+      type GroupKey = (Int, String, Long)
+      type MergedTuple = (Option[Long], Long, Option[Double], Long, Long) // sumQ, countQ, avgSum, avgCount, countStar
+      type FinalTuple = (Option[Long], Long, Option[Double], Long) // sumQ, countQ, avg, countStar
+
+      def sparkReference(
+          files: Seq[String],
+          catDimDF: org.apache.spark.sql.DataFrame,
+          regionDimDF: org.apache.spark.sql.DataFrame): Map[GroupKey, FinalTuple] = {
+        val fact = spark.read.parquet(files: _*)
+        val enriched = fact
+          .join(catDimDF, fact("cat_key") === catDimDF("cat_key"))
+          .join(regionDimDF, fact("region_key") === regionDimDF("region_key"))
+        val referenceAgg = enriched.groupBy("major", "brand", "listPrice").agg(
+          sum(col("quantity")).as("sumQuantity"),
+          count(col("quantity")).as("countQuantity"),
+          avg(col("amount")).as("avgAmount"),
+          count(lit(1)).as("countStar")
+        ).collect()
+        referenceAgg.map { row =>
+          val key: GroupKey = (row.getInt(0), row.getString(1), decimalCents(row.getDecimal(2)))
+          val sumQuantity = if (row.isNullAt(3)) None else Some(row.getLong(3))
+          val countQuantity = row.getLong(4)
+          val avgAmount = if (row.isNullAt(5)) None else Some(row.getDouble(5))
+          val countStar = row.getLong(6)
+          key -> (sumQuantity, countQuantity, avgAmount, countStar)
+        }.toMap
+      }
+
+      def mergeAndFinalize(collected: Array[InternalRow]): Map[GroupKey, FinalTuple] = {
+        val merged = mutable.LinkedHashMap.empty[GroupKey, MergedTuple]
+        collected.foreach { row =>
+          val major = row.getInt(0)
+          val brand = row.getUTF8String(1).toString
+          val listPriceCents = decimalCents(row.getDecimal(2, 7, 2).toJavaBigDecimal)
+          val key: GroupKey = (major, brand, listPriceCents)
+          val sumQuantity = if (row.isNullAt(3)) None else Some(row.getLong(3))
+          val countQuantity = row.getLong(4)
+          val avgSum = if (row.isNullAt(5)) None else Some(row.getDouble(5))
+          val avgCount = row.getLong(6)
+          val countStar = row.getLong(7)
+          val existing = merged.getOrElse(key, (None, 0L, None, 0L, 0L))
+          val combinedSum = (existing._1, sumQuantity) match {
+            case (None, None) => None
+            case (a, b) => Some(a.getOrElse(0L) + b.getOrElse(0L))
+          }
+          val combinedAvgSum = (existing._3, avgSum) match {
+            case (None, None) => None
+            case (a, b) => Some(a.getOrElse(0.0) + b.getOrElse(0.0))
+          }
+          merged(key) = (combinedSum, existing._2 + countQuantity, combinedAvgSum, existing._4 + avgCount, existing._5 + countStar)
+        }
+        merged.view.mapValues { case (sumQ, countQ, avgSum, avgCount, countStar) =>
+          val finalAvg = if (avgCount > 0) Some(avgSum.getOrElse(0.0) / avgCount) else None
+          (sumQ, countQ, finalAvg, countStar)
+        }.toMap
+      }
+
+      def compare(
+          caseName: String,
+          files: Seq[String],
+          catDimDF: org.apache.spark.sql.DataFrame,
+          regionDimDF: org.apache.spark.sql.DataFrame,
+          minCpuFallback: Option[Long] = None): Unit = {
+        val exec = buildExec(files, catDimDF, regionDimDF)
+        val collected = exec.execute().collect()
+        val actual = mergeAndFinalize(collected)
+        val reference = sparkReference(files, catDimDF, regionDimDF)
+
+        val cpuFallback = exec.metrics("cpuFallbackRowGroups").value
+        val numRowGroups = exec.metrics("numRowGroups").value
+        println(
+          s"""{"mode":"agg-exec","case":"$caseName","groupsActual":${actual.size},""" +
+            s""""groupsExpected":${reference.size},"numRowGroups":$numRowGroups,""" +
+            s""""cpuFallbackRowGroups":$cpuFallback}""")
+
+        require(reference.nonEmpty, s"$caseName: expected the reference join+groupBy to produce at least one group")
+        require(actual.keySet == reference.keySet,
+          s"$caseName: group key sets differ. actualOnly=${actual.keySet -- reference.keySet} " +
+            s"expectedOnly=${reference.keySet -- actual.keySet}")
+        var mismatches = 0
+        actual.foreach { case (key, value) =>
+          if (value != reference(key)) {
+            mismatches += 1
+            println(
+              s"""{"mode":"agg-exec","case":"$caseName","mismatchKey":"$key",""" +
+                s""""actual":"$value","expected":"${reference(key)}"}""")
+          }
+        }
+        println(s"""{"mode":"agg-exec","case":"$caseName","mismatches":$mismatches,"match":${mismatches == 0}}""")
+        if (mismatches != 0) sys.exit(1)
+        minCpuFallback.foreach { min =>
+          require(cpuFallback >= min, s"$caseName: expected cpuFallbackRowGroups >= $min, got $cpuFallback")
+        }
+      }
+
+      // Case A: a single, dictionary-friendly file -- the normal (dense)
+      // GroupSpace path.
+      compare("main", Seq(mainFile), catDim, regionDim)
+
+      // Case B: main + a dictionary-overflow file -- per-row-group CPU
+      // fallback (cpuFallbackRowGroups >= 1), combined result still exact.
+      compare(
+        "dictionary-overflow-cpu-fallback", Seq(mainFile, overflowFile), catDim, regionDim,
+        minCpuFallback = Some(1))
+
+      // Case C: cat_key = 1 appears TWICE in the (attributed) catDim with
+      // DIFFERENT attribute tuples -- GroupSpace.build rejects this
+      // (Left), forcing the whole-operator CPU hash-join + hash-aggregate
+      // fallback. Real join fan-out means fact rows with cat_key = 1 now
+      // belong to TWO groups; the Spark reference join naturally produces
+      // that fan-out too, so an exact match here proves the fallback's
+      // semantics are correct, not just non-crashing.
+      val catRowsDuplicated = catRows :+ ((1, 9, "other", BigDecimal(50.00)))
+      val catDimDuplicated = catRowsDuplicated.toDF("cat_key", "major", "brand", "listPrice")
+        .withColumn("listPrice", col("listPrice").cast(DecimalType(7, 2)))
+      compare("whole-operator-cpu-duplicate-key", Seq(mainFile), catDimDuplicated, regionDim)
+    } finally {
+      spark.stop()
+    }
   }
 
   // Task 5: drive MetalParquetMembershipCountExec directly (it is not yet

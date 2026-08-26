@@ -13,7 +13,9 @@ import org.apache.parquet.hadoop.ParquetFileReader
 import org.apache.parquet.hadoop.util.HadoopInputFile
 
 import org.apache.spark.sql.{Row, SparkSession}
+import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.AttributeReference
+import org.apache.spark.sql.functions.{col, count, expr, lit, sum}
 import org.apache.spark.sql.types.{IntegerType, LongType, StructField, StructType}
 
 // Round-trips a dictionary-encoded Parquet file through the CPU page parser
@@ -589,35 +591,46 @@ object ParquetDecodeSmoke {
     }
   }
 
-  // --- Task 3: grouped aggregation on the GPU --------------------------------
+  // --- Task 4: driver-side group-space builder + grouped aggregation on the
+  // GPU --------------------------------------------------------------------
   //
-  // Two join-key columns spanning a 3 x 4 = 12 group space (g0 contributes the
-  // PREMULTIPLIED component value * 4, g1 the component itself, so the group id
-  // is the plain sum of the two codes) and three measure columns. g0 carries a
-  // fourth value (3) that is deliberately NOT a member -- its code is -1 -- so
-  // the kernel's code-gate is exercised alongside the null-gate, and g1 carries
-  // a duplicate-build-key factor of 2 for value 1.
-  private val AggregateKeyColumns = Seq("g0", "g1")
+  // Two dimensions, joined against a synthetic fact table exactly like a
+  // real broadcast-side build: `region` is attribute-free (it contributes
+  // NO group component, only a membership gate and a duplicate-build-key
+  // multiplicity factor -- region key 2 appears twice on the build side) and
+  // `category` carries 2 attributes (major, minor). Distinct join key 13
+  // deliberately shares its attribute tuple with key 10, proving
+  // GroupSpace.build groups by ATTRIBUTE TUPLE, not by join-key identity: a
+  // fact row joining on either key lands in the very same accumulator (and,
+  // since key 10 is quantity-positive and key 13 quantity-negative -- see
+  // writeAggregateDataset -- their contributions actually offset within that
+  // one group). Key 14 is a dimension row with no matching fact rows at all,
+  // so its group must come back all zeros; key 15 is a fact-side value with
+  // no matching dimension row, exercising the code-gate (as opposed to the
+  // null-gate) on the attributed dimension.
+  //
+  // GroupSpace.build assigns the dense group ids (in VALUE space); this test
+  // then does by hand what Task 5 will do generically -- translate the
+  // resulting value-keyed maps into dict-id-indexed tables for the kernel --
+  // and treats an ACTUAL Spark join + groupBy over the same data as the
+  // reference, rather than a hand-derived expectation: that is what proves
+  // GroupSpace's code assignment, radix packing, and factor semantics match
+  // real join semantics.
+  private val AggregateKeyColumns = Seq("region_key", "category_key")
   private val AggregateMeasureColumns = Seq("quantity", "price", "amount")
-  private val AggregateMeasureIsDecimal = Seq(false, true, false)
-  private val AggregateRadix = 4
-  private val AggregateGroupCount = 12
   // count(*), sum(quantity), sum(price_unscaled), sum(amount), count(quantity)
   // -- all three aggregate kinds (0 = count-star, 1 = sum, 2 = count-col).
   private val AggregateKinds = Array(0, 1, 1, 1, 2)
   private val AggregateSlots = Array(0, 0, 1, 2, 0)
-  // (g0 = 2, g1 = 3) is never written (see writeAggregateDataset), so this
-  // group must come back all zeros.
-  private val AggregateEmptyGroup = 2 * AggregateRadix + 3
 
-  /** -1 for a non-member key, else the column's premultiplied group component. */
-  private def aggregateCode(column: Int, value: Int): Int =
-    if (column == 0) { if (value >= 0 && value <= 2) value * AggregateRadix else -1 }
-    else { if (value >= 0 && value <= 3) value else -1 }
+  // Region dimension (attribute-free): key 2 appears twice, so its factor is
+  // 2. Fact-side region_key also carries a value (4) with no dimension row
+  // at all, exercising the code-gate on the attribute-free dimension too.
+  private val RegionDimensionKeys = Seq(1, 2, 2, 3)
 
-  /** Duplicate-build-key multiplicity; only g1 has one (2 for key value 1). */
-  private def aggregateFactor(column: Int, value: Int): Int =
-    if (column == 1 && value == 1) 2 else 1
+  // Category dimension (2 attributes: major, minor). Keys 10 and 13 share
+  // the tuple (1, 1) -- see the comment above. Key 14 gets no fact rows.
+  private val CategoryDimensionRows = Seq((10, 1, 1), (11, 1, 2), (12, 2, 1), (13, 1, 1), (14, 3, 1))
 
   private def runAggregateMode(nativeLibrary: String, metalLibrary: String, rows: Int): Unit = {
     val spark = SparkSession.builder().appName("spark-metal-parquet-aggregate-smoke").getOrCreate()
@@ -625,61 +638,90 @@ object ParquetDecodeSmoke {
     val tempDir = Files.createTempDirectory("spark-metal-parquet-aggregate-smoke")
     try {
       SparkMetalNative.ensureInitialized(nativeLibrary, metalLibrary)
+
+      // Step 2 (build-reject checks): pure GroupSpace.build unit assertions,
+      // no I/O -- run first since they don't need the dataset below.
+      checkGroupSpaceBuildRejections()
+
       val path = tempDir.resolve("data-aggregate").toString
       writeAggregateDataset(spark, path, rows)
       val partFile = singlePartFile(path)
 
       val aggregateCount = AggregateKinds.length
-      val projection = AggregateKeyColumns ++ AggregateMeasureColumns
-      val referenceRows = spark.read.parquet(path).select(projection.head, projection.tail: _*).collect()
-      require(referenceRows.length == rows,
-        s"reference row count ${referenceRows.length} did not match $rows")
 
-      // Reference: the same gate (both keys non-null AND both codes >= 0), the
-      // same factor product, and the same per-aggregate null policy the kernel
-      // applies, computed entirely in Scala over Spark's own read.
-      val expected = new Array[Long](AggregateGroupCount * aggregateCount)
-      for (sparkRow <- referenceRows) {
-        if (!sparkRow.isNullAt(0) && !sparkRow.isNullAt(1)) {
-          val code0 = aggregateCode(0, sparkRow.getInt(0))
-          val code1 = aggregateCode(1, sparkRow.getInt(1))
-          if (code0 >= 0 && code1 >= 0) {
-            val group = code0 + code1
-            val factor =
-              aggregateFactor(0, sparkRow.getInt(0)).toLong * aggregateFactor(1, sparkRow.getInt(1))
-            for (aggregate <- 0 until aggregateCount) {
-              val index = group * aggregateCount + aggregate
-              if (AggregateKinds(aggregate) == 0) {
-                expected(index) += factor
-              } else {
-                val columnIndex = AggregateKeyColumns.length + AggregateSlots(aggregate)
-                if (!sparkRow.isNullAt(columnIndex)) {
-                  if (AggregateKinds(aggregate) == 1) {
-                    val value =
-                      if (AggregateMeasureIsDecimal(AggregateSlots(aggregate)))
-                        sparkRow.getDecimal(columnIndex).unscaledValue().intValue()
-                      else sparkRow.getInt(columnIndex)
-                    expected(index) += value.toLong * factor
-                  } else {
-                    expected(index) += factor
-                  }
-                }
-              }
-            }
-          }
+      // The group space, built from VALUE-keyed dimension rows (not
+      // dictionary ids -- see GroupSpace's own doc comment).
+      val regionDimensionRows: Array[(Int, InternalRow)] =
+        RegionDimensionKeys.map(key => (key, InternalRow())).toArray
+      val categoryDimensionRows: Array[(Int, InternalRow)] =
+        CategoryDimensionRows.map { case (key, major, minor) => (key, InternalRow(major, minor)) }.toArray
+      val built = GroupSpace.build(
+        Seq(
+          GroupSpace.Dimension(regionDimensionRows, attributeCount = 0),
+          GroupSpace.Dimension(categoryDimensionRows, attributeCount = 2)),
+        maxGroups = 1024) match {
+        case Right(b) => b
+        case Left(reason) => throw new RuntimeException(s"GroupSpace.build unexpectedly rejected: $reason")
+      }
+      // region contributes 1 component (attribute-free) x category's 4
+      // distinct attribute tuples (10 and 13 collapse together) = 4 groups.
+      require(built.groupCount == 4,
+        s"expected 4 groups (1 region component x 4 category tuples), got ${built.groupCount}")
+
+      // Reference: an ACTUAL Spark join (region and category dimension
+      // tables against the fact file) + groupBy(major, minor), not a
+      // hand-derived formula. Spark's own equi-join already implements the
+      // null-gate (a null key never matches) and the code-gate (region_key
+      // = 4 / category_key = 15 match no dimension row); its groupBy
+      // already implements the ignore-nulls sum/count(column) policy the
+      // kernel is expected to match.
+      import spark.implicits._
+      val fact = spark.read.parquet(path)
+      val regionDim = RegionDimensionKeys.toDF("region_key_b")
+      val categoryDim = CategoryDimensionRows.toDF("category_key_b", "major", "minor")
+      val enriched = fact
+        .join(regionDim, fact("region_key") === regionDim("region_key_b"))
+        .join(categoryDim, fact("category_key") === categoryDim("category_key_b"))
+        .withColumn("price_unscaled", expr("CAST(price * 100 AS INT)"))
+      val referenceAgg = enriched.groupBy("major", "minor").agg(
+        count(lit(1)).as("cnt"),
+        sum(col("quantity")).as("sumQuantity"),
+        sum(col("price_unscaled")).as("sumPriceUnscaled"),
+        sum(col("amount")).as("sumAmount"),
+        count(col("quantity")).as("countQuantity")
+      ).collect()
+      val referenceMap: Map[(Int, Int), Array[Long]] = referenceAgg.map { row =>
+        def longOrZero(index: Int): Long = if (row.isNullAt(index)) 0L else row.getLong(index)
+        (row.getInt(0), row.getInt(1)) ->
+          Array(longOrZero(2), longOrZero(3), longOrZero(4), longOrZero(5), longOrZero(6))
+      }.toMap
+
+      // Fold the reference map into a group-major array via groupTuples --
+      // this is what actually exercises groupTuples as the output contract,
+      // not just codesByKey/factorsByKey.
+      val expected = new Array[Long](built.groupCount * aggregateCount)
+      for (group <- 0 until built.groupCount) {
+        val categoryTuple = built.groupTuples(group)(1)
+        val values = referenceMap.getOrElse((categoryTuple.getInt(0), categoryTuple.getInt(1)), new Array[Long](5))
+        for (aggregate <- 0 until aggregateCount) {
+          expected(group * aggregateCount + aggregate) = values(aggregate)
         }
       }
 
-      // The dataset only earns its keep if it actually reaches the cases this
-      // task is about; assert that on the reference totals, before ever
-      // comparing them to the GPU's.
-      require((0 until aggregateCount).forall(a => expected(AggregateEmptyGroup * aggregateCount + a) == 0L),
-        s"group $AggregateEmptyGroup was expected to receive no rows, got " +
-          (0 until aggregateCount).map(a => expected(AggregateEmptyGroup * aggregateCount + a)).mkString(","))
-      val quantitySums = (0 until AggregateGroupCount).map(g => expected(g * aggregateCount + 1))
+      // The dataset only earns its keep if it actually reaches the cases
+      // this task is about; assert that on the reference totals, before
+      // ever comparing them to the GPU's.
+      val emptyGroup = (0 until built.groupCount).find { g =>
+        val tuple = built.groupTuples(g)(1)
+        tuple.getInt(0) == 3 && tuple.getInt(1) == 1
+      }.getOrElse(throw new RuntimeException("expected a group for category tuple (major=3, minor=1)"))
+      require((0 until aggregateCount).forall(a => expected(emptyGroup * aggregateCount + a) == 0L),
+        s"group $emptyGroup (category key 14, tuple (3,1)) was expected to receive no rows, got " +
+          (0 until aggregateCount).map(a => expected(emptyGroup * aggregateCount + a)).mkString(","))
+      val quantitySums = (0 until built.groupCount).map(g => expected(g * aggregateCount + 1))
       require(quantitySums.exists(_ < 0L),
         s"expected at least one negative per-group sum(quantity), got $quantitySums")
-      val amountSums = (0 until AggregateGroupCount).map(g => expected(g * aggregateCount + 3))
+      val amountSums = (0 until built.groupCount).map(g => expected(g * aggregateCount + 3))
       require(amountSums.exists(_ > 4294967296L),
         s"expected a per-group sum(amount) above 2^32, got $amountSums")
       require(amountSums.exists(_ < -4294967296L),
@@ -724,12 +766,17 @@ object ParquetDecodeSmoke {
               val dictionaryValues =
                 Array.tabulate(dictionaryPage.getDictionarySize)(entry => dictionaryBuffer.getInt(entry * 4))
               // Key columns decode to dictionary IDS, so the code/factor
-              // tables handed to the kernel are indexed in dict-id space --
-              // rebuilt per row group, since each column chunk has its own
-              // dictionary.
-              codeTables(columnIndex) = dictionaryValues.map(aggregateCode(columnIndex, _))
+              // tables handed to the kernel must be indexed in dict-id space
+              // -- rebuilt per row group, since each column chunk has its
+              // own dictionary. GroupSpace's maps are VALUE-keyed, so this
+              // is exactly the translation Task 5 will make generic: a
+              // dict id with no entry in codesByKey is not a member (-1);
+              // one with no entry in factorsByKey has multiplicity 1.
+              val codeMap = built.codesByKey(columnIndex)
+              codeTables(columnIndex) = dictionaryValues.map(value => codeMap.getOrElse(value, -1))
+              val factorMap = built.factorsByKey(columnIndex)
               factorTables(columnIndex) =
-                if (columnIndex == 1) dictionaryValues.map(aggregateFactor(columnIndex, _)) else null
+                if (factorMap.isEmpty) null else dictionaryValues.map(value => factorMap.getOrElse(value, 1))
 
               val hasDefLevels = descriptor.getMaxDefinitionLevel > 0
               var rowOffset = 0
@@ -797,7 +844,7 @@ object ParquetDecodeSmoke {
             // Release, and the handle must not be touched again.
             NativeBridge.parquetRowGroupAggregate(
               streamHandle, rowGroupHandle, codeTables, factorTables,
-              AggregateGroupCount, AggregateSlots, AggregateKinds)
+              built.groupCount, AggregateSlots, AggregateKinds)
             rowGroups += 1
             coveredRows += rowGroupRows
             pageReadStore = reader.readNextRowGroup()
@@ -823,7 +870,7 @@ object ParquetDecodeSmoke {
       val matched = mismatches == 0
       println(
         s"""{"mode":"aggregate","rows":$rows,"rowGroups":$rowGroups,""" +
-          s""""groups":$AggregateGroupCount,"aggregates":$aggregateCount,""" +
+          s""""groups":${built.groupCount},"aggregates":$aggregateCount,""" +
           s""""mismatches":$mismatches,"match":$matched,""" +
           s""""maxAmountSum":${amountSums.max},"minAmountSum":${amountSums.min}}""")
       if (!matched) {
@@ -845,41 +892,90 @@ object ParquetDecodeSmoke {
   }
 
   /**
-   * g0 in 0..3 (3 is a non-member: its code is -1), g1 in 0..3, with nulls on
-   * two different moduli so both the null-gate and the code-gate drop rows.
-   * (g0 = 2, g1 = 3) is remapped to (2, 2) so that one group of the 12 is
-   * guaranteed to receive no rows at all.
+   * Step 2 of the brief: GroupSpace.build build-reject unit checks, run
+   * inside the aggregate smoke mode (no separate test runner in this
+   * project -- see run-parquet-decode-smoke-test.sh).
+   */
+  private def checkGroupSpaceBuildRejections(): Unit = {
+    // A duplicate join key in an ATTRIBUTED dimension (attributeCount > 0)
+    // must be rejected: unlike an attribute-free dimension, there is no
+    // factor to fold a repeated key into once it carries attributes.
+    val duplicateKeyDimension = GroupSpace.Dimension(
+      Array((1, InternalRow(10)), (1, InternalRow(20))), attributeCount = 1)
+    val duplicateKeyResult = GroupSpace.build(Seq(duplicateKeyDimension), maxGroups = 1000)
+    require(duplicateKeyResult.isLeft,
+      s"expected a duplicate join key in an attributed dimension to be rejected, got $duplicateKeyResult")
+
+    // An oversized group space (the mixed-radix product exceeds maxGroups)
+    // must be rejected: 50 x 50 = 2500 groups against a cap of 100.
+    val bigDimension0 = GroupSpace.Dimension(
+      Array.tabulate(50)(i => (i, InternalRow(i))), attributeCount = 1)
+    val bigDimension1 = GroupSpace.Dimension(
+      Array.tabulate(50)(i => (i + 1000, InternalRow(i))), attributeCount = 1)
+    val oversizedResult = GroupSpace.build(Seq(bigDimension0, bigDimension1), maxGroups = 100)
+    require(oversizedResult.isLeft,
+      s"expected a 50x50=2500-group space to be rejected by maxGroups=100, got $oversizedResult")
+
+    // An empty dimension (zero collected rows) must be rejected.
+    val emptyDimension = GroupSpace.Dimension(Array.empty, attributeCount = 0)
+    val emptyResult = GroupSpace.build(Seq(emptyDimension), maxGroups = 1000)
+    require(emptyResult.isLeft, s"expected an empty dimension to be rejected, got $emptyResult")
+
+    println(
+      s"""{"mode":"aggregate","case":"group-space-build-rejections",""" +
+        s""""duplicateKeyRejected":${duplicateKeyResult.isLeft},""" +
+        s""""oversizedRejected":${oversizedResult.isLeft},""" +
+        s""""emptyDimensionRejected":${emptyResult.isLeft}}""")
+  }
+
+  /**
+   * region_key in {1,2,3,4} (4 is a non-member -- no region dimension row --
+   * so the code-gate is exercised); category_key in {10,11,12,13,14,15} (14
+   * is a dimension row with no fact rows at all -- one group is guaranteed
+   * to come back all zeros; 15 is a fact value with no dimension row, a
+   * second, independent exercise of the code-gate). Nulls fall on two
+   * different moduli (43, 47) so both the null-gate and the code-gate drop
+   * rows independently.
    *
-   * amount is ~1e6 per row and negative for the whole g1 = 3 dimension, so with
-   * ~rows/16 rows per group the per-group totals run past +/-2^32 in both
-   * directions -- the hi-word/carry path the split 32-bit atomics have to get
-   * right. quantity is negative for the whole g1 = 1 dimension (which is also
-   * the factor-2 dimension), giving negative per-group sums, and is null every
-   * 13th row so the sum/count(col) null policy is exercised; price is null
-   * every 11th row on a different modulus; amount is never null, so its
-   * measure plane also covers the no-nulls (mask bit clear) path.
+   * amount is ~1e6 per row and negative for category_key = 12, so with
+   * ~rows/5 rows per category the per-group totals run past +/-2^32 in both
+   * directions -- the hi-word/carry path the split 32-bit atomics have to
+   * get right. quantity is negative for category_key IN (11, 13) (13 is one
+   * of the two keys that collapse into the (major=1, minor=1) group with
+   * key 10, so that group's quantity sum mixes positive and negative
+   * contributions from two distinct join keys) and null every 13th row, so
+   * the sum/count(col) null policy is exercised; price is null every 11th
+   * row on a different modulus; amount is never null, so its measure plane
+   * also covers the no-nulls (mask bit clear) path.
    *
-   * A small parquet.block.size splits the file into several row groups so the
-   * per-stream partial table accumulates across command buffers.
+   * A small parquet.block.size splits the file into several row groups so
+   * the per-stream partial table accumulates across command buffers.
    */
   private def writeAggregateDataset(spark: SparkSession, path: String, rows: Int): Unit = {
     val hadoopConf = spark.sparkContext.hadoopConfiguration
     val previousBlockSize = hadoopConf.get("parquet.block.size")
     hadoopConf.setInt("parquet.block.size", 65536)
     try {
-      spark.range(rows)
+      val base = spark.range(rows)
         .selectExpr(
-          "CASE WHEN id % 37 = 0 THEN CAST(NULL AS INT) ELSE CAST(pmod(id, 4) AS INT) END AS g0",
-          "CASE WHEN id % 41 = 0 THEN CAST(NULL AS INT) " +
-            "WHEN pmod(id, 4) = 2 AND pmod(id div 4, 4) = 3 THEN 2 " +
-            "ELSE CAST(pmod(id div 4, 4) AS INT) END AS g1",
-          "CASE WHEN id % 13 = 0 THEN CAST(NULL AS INT) " +
-            "WHEN pmod(id div 4, 4) = 1 THEN CAST(-(pmod(id, 50) + 1) AS INT) " +
-            "ELSE CAST(pmod(id, 50) + 1 AS INT) END AS quantity",
-          "CASE WHEN id % 11 = 0 THEN CAST(NULL AS DECIMAL(7,2)) " +
-            "ELSE CAST(pmod(id, 300) + 100 AS DECIMAL(7,2)) END AS price",
-          "CASE WHEN pmod(id div 4, 4) = 3 THEN CAST(-(1000000 + pmod(id, 7) * 13) AS INT) " +
-            "ELSE CAST(1000000 + pmod(id, 7) * 13 AS INT) END AS amount")
+          "id",
+          "CASE WHEN id % 43 = 0 THEN CAST(NULL AS INT) ELSE CAST(pmod(id, 4) + 1 AS INT) END AS region_key",
+          "CASE WHEN id % 47 = 0 THEN CAST(NULL AS INT) " +
+            "ELSE CASE pmod(id, 5) " +
+            "WHEN 0 THEN 10 WHEN 1 THEN 11 WHEN 2 THEN 12 WHEN 3 THEN 13 ELSE 15 END " +
+            "END AS category_key")
+      base
+        .withColumn("quantity",
+          expr("CASE WHEN id % 13 = 0 THEN CAST(NULL AS INT) " +
+            "WHEN category_key IN (11, 13) THEN CAST(-(pmod(id, 50) + 1) AS INT) " +
+            "ELSE CAST(pmod(id, 50) + 1 AS INT) END"))
+        .withColumn("price",
+          expr("CASE WHEN id % 11 = 0 THEN CAST(NULL AS DECIMAL(7,2)) " +
+            "ELSE CAST(pmod(id, 300) + 100 AS DECIMAL(7,2)) END"))
+        .withColumn("amount",
+          expr("CASE WHEN category_key = 12 THEN CAST(-(1000000 + pmod(id, 7) * 13) AS INT) " +
+            "ELSE CAST(1000000 + pmod(id, 7) * 13 AS INT) END"))
+        .drop("id")
         .coalesce(1)
         .write
         .option("parquet.page.size", "8192")

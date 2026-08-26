@@ -108,6 +108,23 @@ Initial kernels:
 5. scaled-integer arithmetic;
 6. global reductions.
 
+The implemented q96 slice recognizes a deliberately narrow physical-plan
+region: three build-right broadcast inner equi-joins over distinct integer fact
+columns followed by a partial `count(1)`. It collects the three filtered
+dimension-key columns, scans the Parquet fact columns as `ColumnarBatch` input,
+and performs all three membership tests plus the partial count in one Metal
+dispatch per batch. This removes three row-oriented hash joins and their
+`ColumnarToRow` transition from the fact-side hot path.
+
+Two membership kernels preserve both speed and SQL join multiplicity:
+
+- unique build keys use dense one-byte presence maps;
+- duplicate build keys use dense four-byte multiplicity maps and multiply the
+  three match counts.
+
+Null fact keys never match. Empty key sets return zero. On-heap vectors and key
+domains wider than 16,777,216 entries execute through an exact CPU fallback.
+
 ## Numeric policy
 
 - Begin with 32-bit and 64-bit integers.
@@ -141,3 +158,8 @@ An operator remains on the CPU when any required expression, data type, semantic
 The current prototype always falls back when `spark.sql.ansi.enabled=true`.
 Its first Metal kernel implements Spark's non-ANSI 32-bit integer wrapping, not
 ANSI overflow exceptions.
+
+The three-way broadcast-membership/count replacement currently requires
+`spark.sql.adaptive.enabled=false`; with AQE enabled it remains on Spark's CPU
+plan. This is a temporary capability boundary until build-side key extraction is
+integrated with adaptive broadcast query stages.

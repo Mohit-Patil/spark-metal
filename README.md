@@ -13,7 +13,10 @@ The project evaluates four related but distinct paths before committing the Spar
 - **Core ML and the Apple Neural Engine** for model-graph workloads and as a boundary study for SQL-shaped graphs.
 - **Spark ML and SynapseML patterns** for batching, transformer lifecycle, and integration with Spark pipelines.
 
-Direct Metal is the provisional primary candidate for SQL execution because it exposes general GPU compute. The other paths remain part of the research and benchmark matrix rather than being treated as interchangeable APIs.
+Direct Metal is the selected primary backend for SQL execution because it exposes
+general GPU compute, explicit buffers, and command scheduling. MLX remains a
+useful numerical reference; Core ML/ANE and Spark ML remain relevant to model
+inference, but are not substitutes for a Spark SQL execution engine.
 
 ## Current status
 
@@ -21,12 +24,16 @@ Direct Metal is the provisional primary candidate for SQL execution because it e
 - First test host detected: 16 GB MacBook Air with Apple M5.
 - Xcode and the Metal compiler: available.
 - OpenJDK 21 and Apache Spark 4.2.0: installed and ARM64 smoke-tested.
-- A Spark 4.2 columnar rule, JNI bridge, and fused Metal partial aggregate: working.
+- Two Spark 4.2 columnar plan replacements, a JNI bridge, and three Metal kernels: working.
 - Integer null semantics: validated through Spark and independently through JNI.
 - Controlled 32-million-row synthetic Spark comparison: correct but currently about 5% slower than CPU.
+- Exact q96-shaped three-join/count comparison over 33,554,432 fact rows: 0.202 s
+  CPU median versus 0.178 s Metal median, or **1.13x**, with five warm-ups and
+  eleven measured runs.
 - MLX 0.32.1 comparison: exact, but its GPU did not beat its compiled CPU path through 8.4 million rows.
 - Core ML 9.0 capability probe: CPU/GPU execution is possible, but the tested SQL-shaped graph cannot use the Neural Engine or produce Spark's required 64-bit sum.
-- TPC-DS baseline: not yet generated.
+- TPC-DS scale-factor-10 data and official query result: not yet generated; the
+  kit remains behind its explicit licence-acceptance gate.
 
 ## Project principles
 
@@ -44,18 +51,20 @@ Direct Metal is the provisional primary candidate for SQL execution because it e
 - [Benchmark protocol](docs/BENCHMARK_PROTOCOL.md)
 - [Direct Metal prototype](docs/METAL_PROTOTYPE.md)
 - [Prototype results](docs/PROTOTYPE_RESULTS.md)
+- [TPC-DS q96 target](docs/TPCDS_Q96_TARGET.md)
 - [Roadmap](docs/ROADMAP.md)
 - [First host environment](docs/environment/first-host.md)
 
 ## Near-term milestone
 
-The next milestone is a reproducible vanilla Spark baseline:
+The next milestone is the licensed, reproducible TPC-DS q96 proof:
 
 1. Review and explicitly accept the TPC-DS kit licence.
 2. Generate TPC-DS scale factor 10 in Parquet.
-3. Execute the full query set where practical.
-4. Capture plans, correctness hashes, Spark metrics, and repeated runtimes.
-5. Select one numerical query fragment for MLX and Metal feasibility experiments.
+3. Run q96 through the controlled CPU and Metal configurations.
+4. Verify the result hash and that the Metal operator appears in the physical plan.
+5. Confirm or reject the required 10% median end-to-end improvement, then expand
+   to the wider query set where practical.
 
 ## Local setup
 
@@ -86,6 +95,14 @@ scripts/run-coreml-capability-probe.sh
 scripts/run-jni-smoke-test.sh
 scripts/run-spark-plugin-smoke-test.sh
 scripts/run-spark-synthetic-benchmark.sh
+scripts/run-q96-membership-smoke-test.sh
+Q96_SYNTHETIC_WARMUPS=5 Q96_SYNTHETIC_RUNS=11 scripts/run-q96-synthetic-benchmark.sh
+```
+
+After scale-factor-10 Parquet data exists, run the paired comparison with:
+
+```bash
+scripts/run-tpcds-comparison.sh --queries q96 --warmups 2 --runs 7
 ```
 
 Performance numbers produced here are research results and are not comparable to

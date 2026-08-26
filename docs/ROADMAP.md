@@ -25,7 +25,7 @@
 - [ ] Evaluate MPSGraph if it reduces implementation work.
 - [x] Run Core ML compute-unit and integer-semantics experiment.
 - [x] Record the direct-Metal crossover batch sizes.
-- [ ] Select the primary backend after the remaining comparisons.
+- [x] Select direct Metal as the primary SQL backend; retain MLX and Core ML as controls.
 
 ## M3 — Spark columnar vertical slice
 
@@ -35,10 +35,12 @@
 - [x] Implement integer filter and projection.
 - [x] Implement global partial reductions.
 - [x] Fuse filter, projection, and reduction.
+- [x] Fuse three integer broadcast-membership joins and partial count.
+- [x] Preserve null and duplicate-key join semantics for that slice.
 
 ## M4 — TPC-DS proof
 
-- [ ] Select candidate TPC-DS plan regions from the baseline.
+- [x] Select q96's three broadcast joins plus partial count as the first candidate.
 - [ ] Execute at least one region on the Apple GPU.
 - [ ] Validate exact output.
 - [ ] Tune batching and memory reuse.

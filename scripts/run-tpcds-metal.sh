@@ -10,12 +10,20 @@ source "${script_dir}/project-env.sh"
 data_dir="${TPCDS_PARQUET_DIR:-${repo_root}/benchmark-data/tpcds-sf10-parquet}"
 queries_dir="${repo_root}/.tools/spark-assets/sql/core/src/test/resources/tpcds"
 run_id="$(date -u '+%Y%m%dT%H%M%SZ')"
-output_dir="${TPCDS_RESULT_DIR:-${repo_root}/benchmark-results/cpu-${run_id}}"
+output_dir="${TPCDS_RESULT_DIR:-${repo_root}/benchmark-results/metal-${run_id}}"
 
+if [[ ! -d "${data_dir}" ]]; then
+  echo "TPC-DS SF10 Parquet data is missing: ${data_dir}" >&2
+  echo "Generate it only after explicitly accepting the TPC-DS kit EULA." >&2
+  exit 1
+fi
 if [[ ! -d "${queries_dir}" ]]; then
   echo "Pinned Spark queries are missing. Run scripts/fetch-spark-tpcds-assets.sh." >&2
   exit 1
 fi
+
+"${script_dir}/build-spark-plugin.sh"
+build_root="${repo_root}/build/spark-plugin"
 
 spark-submit \
   --master 'local[8]' \
@@ -27,11 +35,14 @@ spark-submit \
   --conf spark.sql.parquet.enableVectorizedReader=true \
   --conf spark.sql.parquet.columnarReaderBatchSize=1048576 \
   --conf spark.sql.columnVector.offheap.enabled=true \
+  --conf spark.sql.extensions=io.github.mohitpatil.sparkmetal.SparkMetalExtensions \
+  --conf "spark.metal.nativeLibrary=${build_root}/libsparkmetal.dylib" \
+  --conf "spark.metal.metalLibrary=${build_root}/kernels.metallib" \
   "${repo_root}/benchmarks/tpcds/run_queries.py" \
   --data-dir "${data_dir}" \
   --queries-dir "${queries_dir}" \
   --output-dir "${output_dir}" \
-  --label cpu \
+  --label metal \
   "$@"
 
 echo "Results written under ${output_dir}."

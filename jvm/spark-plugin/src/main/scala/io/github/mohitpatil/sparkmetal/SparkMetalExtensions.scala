@@ -8,7 +8,8 @@ final class SparkMetalExtensions extends (SparkSessionExtensions => Unit) {
       new SparkMetalColumnarRule(
         session.conf.get("spark.metal.nativeLibrary"),
         session.conf.get("spark.metal.metalLibrary"),
-        session.conf.get("spark.sql.ansi.enabled").toBoolean)
+        session.conf.get("spark.sql.ansi.enabled").toBoolean,
+        session.conf.get("spark.sql.adaptive.enabled").toBoolean)
     }
   }
 }

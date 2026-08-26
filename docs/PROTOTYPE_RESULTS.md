@@ -75,6 +75,32 @@ result are verified, but this is not yet a performance win. This negative result
 is retained because it shows that a fast kernel alone does not overcome Parquet
 decode, column ownership, synchronization, scheduling, and final Spark work.
 
+## Spark SQL q96-shaped comparison
+
+This second Spark test executes the unmodified q96 SQL text over synthetic
+tables with 33,554,432 `store_sales` rows and small dimension tables. Vanilla
+Spark uses three broadcast hash joins and a partial global count. The plugin
+replaces that complete fact-side region with a single columnar operator that
+performs three dense membership checks and the count using Metal.
+
+Both configurations use separate local Spark processes, eight local cores,
+off-heap column vectors, one-million-row Parquet batches, AQE disabled, five
+warm-ups, and eleven measured runs.
+
+| Configuration | Median end-to-end time | Result |
+|---|---:|---:|
+| Vanilla Spark CPU | 201.910 ms | 720 |
+| Spark Metal | 178.462 ms | 720 |
+
+Observed end-to-end speedup: **1.13x**. This crosses the project's provisional
+10% performance threshold on the synthetic plan shape. It is not the goal result:
+the success gate explicitly requires the licensed TPC-DS scale-factor-10 data.
+
+The q96 edge-case test also matches at 60 rows after introducing null fact keys
+and a duplicated matching dimension key. The implementation uses a compact
+one-byte presence-map kernel when build keys are unique and a separate
+multiplicity kernel when they are not.
+
 ## Correctness evidence
 
 - Native CPU and Metal results match for non-power-of-two input sizes.
@@ -86,6 +112,10 @@ decode, column ownership, synchronization, scheduling, and final Spark work.
 - MLX CPU and GPU results match the independent 64-bit reference.
 - The Core ML probe deliberately demonstrates and records its 32-bit semantic
   mismatch instead of treating an overflowing result as valid.
+- The q96-shaped CPU and Metal results match for the normal dataset and for a
+  dataset containing null fact keys and duplicate build keys.
+- With adaptive execution enabled, the q96-shaped rule is verified to remain on
+  the CPU rather than attempting an unsafe adaptive-plan replacement.
 
 ## Remaining success gate
 

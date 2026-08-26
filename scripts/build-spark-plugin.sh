@@ -43,11 +43,13 @@ java -cp "${SPARK_HOME}/jars/*" scala.tools.nsc.Main \
   "${plugin_root}/scala/io/github/mohitpatil/sparkmetal/SparkMetalNative.scala" \
   "${plugin_root}/scala/io/github/mohitpatil/sparkmetal/SharedBufferPool.scala" \
   "${plugin_root}/scala/io/github/mohitpatil/sparkmetal/MetalFusedSumExec.scala" \
+  "${plugin_root}/scala/io/github/mohitpatil/sparkmetal/MetalFusedMembershipCountExec.scala" \
   "${plugin_root}/scala/io/github/mohitpatil/sparkmetal/SparkMetalColumnarRule.scala" \
   "${plugin_root}/scala/io/github/mohitpatil/sparkmetal/SparkMetalExtensions.scala" \
   "${plugin_root}/scala/io/github/mohitpatil/sparkmetal/PluginSmoke.scala" \
   "${plugin_root}/scala/io/github/mohitpatil/sparkmetal/AnsiFallbackSmoke.scala" \
-  "${plugin_root}/scala/io/github/mohitpatil/sparkmetal/SyntheticBenchmark.scala"
+  "${plugin_root}/scala/io/github/mohitpatil/sparkmetal/SyntheticBenchmark.scala" \
+  "${plugin_root}/scala/io/github/mohitpatil/sparkmetal/Q96SyntheticBenchmark.scala"
 
 jar --create \
   --file "${build_root}/spark-metal-plugin.jar" \

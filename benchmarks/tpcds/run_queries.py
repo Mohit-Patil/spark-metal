@@ -23,6 +23,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--queries", default="q1", help="Comma-separated query names or 'all'")
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--runs", type=int, default=5)
+    parser.add_argument("--label", default="cpu")
     return parser.parse_args()
 
 
@@ -66,7 +67,7 @@ def main() -> None:
     queries = select_queries(args.queries_dir, args.queries)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    spark = SparkSession.builder.appName("spark-metal-tpcds-cpu").getOrCreate()
+    spark = SparkSession.builder.appName(f"spark-metal-tpcds-{args.label}").getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
     summary: dict[str, object] = {
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -76,6 +77,7 @@ def main() -> None:
         "queries_dir": str(args.queries_dir.resolve()),
         "warmups": args.warmups,
         "runs": args.runs,
+        "label": args.label,
         "queries": {},
     }
     try:

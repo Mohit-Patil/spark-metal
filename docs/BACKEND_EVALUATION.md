@@ -6,7 +6,7 @@ Core ML, MLX, Spark ML, SynapseML, and Metal occupy different layers. The projec
 
 | Path | Device | General kernels | SQL fit | Spark integration value | Planned role |
 |---|---|---:|---:|---:|---|
-| Direct Metal compute | Apple GPU | High | High, if kernels are implemented | Requires a native bridge and Spark plugin | Provisional primary execution backend |
+| Direct Metal compute | Apple GPU | High | High, if kernels are implemented | Requires a native bridge and Spark plugin | Selected primary SQL execution backend |
 | MLX | CPU and Apple GPU | Tensor/array operations | Medium for numerical prototypes; low for full SQL semantics | Python and C++ APIs can prototype batch operations | Feasibility and crossover experiments |
 | Core ML | CPU, GPU, and Neural Engine selected by the runtime | Model graphs | Low for relational SQL | Useful for model inference transformers | Boundary study and possible ML inference extension |
 | Apple Neural Engine | Neural Engine | Restricted through supported public APIs | Very low for general SQL | No public general-purpose Spark kernel path | Not the primary TPC-DS backend |
@@ -89,7 +89,7 @@ For each workload, record:
 - correctness differences;
 - minimum batch size that beats the CPU control.
 
-## Provisional conclusions to validate
+## Conclusions
 
 ### Metal
 
@@ -97,11 +97,14 @@ Metal is the only supported Apple API in this set that provides the general comp
 
 ### MLX
 
-MLX should make early numerical experiments much faster to write. It may demonstrate whether unified-memory GPU execution is promising before the Spark plugin exists. It is not expected to provide Spark-compatible joins, decimals, null masks, or physical-plan replacement by itself.
+MLX makes numerical experiments much faster to write and provides a useful
+compiled CPU/GPU control. It does not provide Spark-compatible joins, decimals,
+null masks, Catalyst physical-plan replacement, or Neural Engine execution by
+itself, so it is not the production SQL path.
 
 ### Core ML and the Neural Engine
 
-Core ML is optimized around compiled model graphs. The runtime controls placement across permitted compute units, and the public API is not a general SQL kernel interface. The project will still test whether a small static numerical graph can express a representative fused operation, but this is a research comparison rather than the assumed implementation.
+Core ML is optimized around compiled model graphs. The runtime controls placement across permitted compute units, and the public API is not a general SQL kernel interface. The completed capability probe confirms that this SQL-shaped integer graph neither reaches the Neural Engine nor preserves the required 64-bit aggregate semantics.
 
 ### Spark ML and SynapseML
 
@@ -109,9 +112,11 @@ These projects are valuable at the integration layer: model/session reuse, batch
 
 ## Decision gate
 
-Direct Metal remains the primary SQL-backend candidate because it is the only
-evaluated path that provides the necessary kernel, integer, memory, and Spark
-integration control. It is not yet a proven winner: the controlled end-to-end
-Spark comparison is currently slower than vanilla CPU Spark, and the TPC-DS
-success gate remains open. MLX remains a compact feasibility/reference backend;
-Core ML and Spark ML remain inference-layer options rather than TPC-DS engines.
+Direct Metal is the primary SQL backend because it is the only evaluated path
+that provides the necessary kernel, integer, memory, and Spark integration
+control. The first single-expression Spark experiment is 0.95x, while the wider
+q96-shaped fusion is 1.13x, demonstrating why whole-plan-region replacement is
+the useful level of acceleration. The official TPC-DS success gate remains open.
+MLX remains a compact feasibility/reference backend; Core ML, the Neural Engine,
+Spark ML, and SynapseML remain model-inference or integration-layer options
+rather than TPC-DS execution engines.

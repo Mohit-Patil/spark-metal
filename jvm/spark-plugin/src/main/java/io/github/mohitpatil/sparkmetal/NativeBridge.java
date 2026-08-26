@@ -33,4 +33,19 @@ public final class NativeBridge {
             int multiplier,
             int addend);
 
+    public static native long membershipCount3Address(
+            long input0Address,
+            long null0Address,
+            boolean hasNull0,
+            long input1Address,
+            long null1Address,
+            boolean hasNull1,
+            long input2Address,
+            long null2Address,
+            boolean hasNull2,
+            int count,
+            int[] keys0,
+            int[] keys1,
+            int[] keys2);
+
 }

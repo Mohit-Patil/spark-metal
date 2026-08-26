@@ -150,7 +150,95 @@ zero-copy references held across `next()` read overwritten data; the streamed
 path therefore copies each batch into pooled Metal staging buffers at submit
 time.
 
+## GPU Parquet decode on TPC-DS scale-factor-10 q96 (2026-08-26)
+
+`MetalParquetMembershipCount` replaces the whole fact-side region — the Parquet
+scan included — for eligible plans, decoding dictionary-encoded data pages on the
+GPU instead of consuming Spark's vectorized reader output. Same protocol as
+above: five warm-ups, eleven measured runs per configuration, identical Spark
+settings, separate local Spark processes.
+
+| Configuration | Median end-to-end time | Speedup |
+|---|---:|---:|
+| Vanilla Spark CPU | 204.3 ms | — |
+| Spark Metal, GPU Parquet decode | 125.9 ms | **1.62x** |
+
+`all_results_match: true`, `metal_operator_present: true`,
+`success_gate_met: true`, `MetalParquetMembershipCount` in the executed plan,
+`numRowGroups = 30`, `numPagesDecoded = 4380`, `cpuFallbackRowGroups = 0`,
+`splitPlanTime = 0`. Raw data:
+`benchmark-results/comparison-20260826T120124Z`. An immediately preceding run of
+the same build measured 205.4 ms against 133.3 ms, or **1.54x**
+(`benchmark-results/comparison-20260826T115726Z`); run-to-run spread on this
+host is roughly ±0.06x.
+
+**This is above the project's 1.10x success gate but below the 1.8x checkpoint
+and the 2.0x target set for this milestone.** It is reported as what it is.
+
+### Head-to-head against the previous fused path
+
+Both operators measured on the same `-O2` build and the same host state:
+
+| Workload | CPU | GPU Parquet decode | Fused (`parquetScan.enabled=false`) |
+|---|---:|---:|---:|
+| TPC-DS SF10 q96 | 198.6 ms | **133.3 ms (1.49x)** | 165.5 ms (1.20x) |
+| 33.5M-row synthetic q96 | 170.1 ms | 111.5 ms (1.53x) | **97.1 ms (1.75x)** |
+
+The GPU Parquet path wins on real SF10 data by 24% of wall time and loses on the
+synthetic shape. The synthetic fact columns have small dictionaries, no nulls,
+and long runs, so Spark's vectorized reader is already close to optimal there and
+the extra per-page CPU staging is pure overhead. SF10 `store_sales` has ~4.6%
+nulls and larger dictionaries — about 1,650 value runs and 2,200 definition-level
+segments per 20,000-value page — which is where decoding on the GPU pays.
+`spark.metal.parquetScan.enabled` therefore stays **default true**, since SF10 is
+the benchmark the project is measured against. The fused path remains one config
+flag away.
+
+### What actually cost the time
+
+The first working version of this path measured **0.39x on SF10 and 0.69x on the
+synthetic shape — slower than CPU** — with only ~13 ms of `metalTime`. None of
+the eight fixes that followed touched a GPU kernel's arithmetic. Measured one at
+a time:
+
+| Change | SF10 q96 median | Synthetic median |
+|---|---:|---:|
+| Starting point (Task 6 as delivered) | 508 ms (0.39x) | 229 ms (0.69x) |
+| One command buffer per row group, not per page | — | 204 ms (0.79x) |
+| Shared `Configuration`, parallel footer reads | — | 152 ms (1.04x) |
+| Bucketed staging pool, chunked commits, parser scratch reuse | — | 141 ms (1.10x) |
+| Prefix-only staging reclaim | — | 135 ms (1.12x) |
+| `setRequestedSchema` — read 3 columns, not 23 | 425 ms (0.47x) | — |
+| Build the native library with `-O2` | 343 ms (0.58x) | — |
+| Size threadgroups to the page's real runs | 275 ms (0.72x) | — |
+| Cache footer reads across executions | 126-133 ms (1.54-1.62x) | 112 ms (1.53x) |
+
+The two largest single wins were not in the design at all:
+
+- **The JNI library had no `-O` flag**, so clang defaulted to `-O0`. The bridge
+  does real per-page CPU work (`parseDataPageV1` walks every run of every page),
+  and unoptimized that cost ~300 µs per 20,000-value page — 95% of the path's
+  per-task budget, roughly 35-50 ns for a single `vector::push_back`. Adding
+  `-O2` cut native page submit from 1370 ms to 323 ms.
+- **`ParquetEligibility.check` runs during planning**, so it re-opened and
+  re-read all 30 Parquet footers on *every execution of every query*: ~130 ms of
+  driver time per run, against a ~200 ms query. Memoising verdicts and row-group
+  enumeration on `(path, length, modification time)` took the SF10 median from
+  275 ms to 133 ms in one change.
+
+The per-page lesson generalises: at 4,380 pages per query, anything costing tens
+of microseconds per page is a first-order term. A per-page `MTLCommandBuffer`
+commit cost ~87 µs. A staging pool served first-fit from a flat list handed each
+page's ~1 KB work-item request the recycled ~32 KB page buffer, so every page
+buffer had to be allocated fresh. `parseDataPageV1` freed both its output
+vectors per page by resetting with `out = PageRuns{}`. A fixed 256-wide
+threadgroup per run left 95% of its threads idle on data whose runs average 11
+values. None of these are visible in `metalTime`.
+
 ## Success gate
 
 The gate — an unmodified TPC-DS scale-factor-10 query with a correct result
-and at least a 10% median end-to-end improvement — **is met by q96 at 1.52x**.
+and at least a 10% median end-to-end improvement — **is met by q96 at 1.62x**
+with the GPU Parquet decode path, and was previously met at 1.52x by the fused
+path. The 1.8x checkpoint and 2.0x target for the GPU Parquet decode milestone
+were **not** reached.

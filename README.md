@@ -26,16 +26,25 @@ inference, but are not substitutes for a Spark SQL execution engine.
 - OpenJDK 21 and Apache Spark 4.2.0: installed and ARM64 smoke-tested.
 - Two Spark 4.2 columnar plan replacements, a JNI bridge, and three Metal kernels: working.
 - Integer null semantics: validated through Spark and independently through JNI.
-- **TPC-DS scale-factor-10 q96: 1.52x median end-to-end speedup** (CPU 206.4 ms
-  vs Metal 135.7 ms; five warm-ups, eleven measured runs per configuration)
+- **TPC-DS scale-factor-10 q96: 1.62x median end-to-end speedup** (CPU 204.3 ms
+  vs Metal 125.9 ms; five warm-ups, eleven measured runs per configuration)
   with an exact result-hash, row-count, and schema match — the project's 1.10x
-  success gate is met.
-- The q96 operator streams each fact batch to the GPU asynchronously as the
-  Parquet reader produces it, resolves dictionary-encoded columns through
-  per-dictionary membership tables, and shares the prepared dimension maps
-  across all partition tasks.
-- Exact q96-shaped three-join/count comparison over 33,554,432 synthetic fact
-  rows: **1.41x** under the same protocol.
+  success gate is met. The 1.8x checkpoint and 2.0x target set for the GPU
+  Parquet decode milestone were not reached.
+- The q96 fact-side region — the Parquet scan included — runs as a single
+  operator that decodes dictionary-encoded data pages on the GPU
+  (`MetalParquetMembershipCount`, `spark.metal.parquetScan.enabled`, default
+  true). It reads `(file, row group)` splits directly, expands each page's
+  RLE/bit-packed runs into GPU-resident id and validity planes, and counts
+  membership over those planes; any page the parser rejects falls back to a CPU
+  recount of that row group.
+- The earlier fused operator remains, one flag away, for plans whose fact-side
+  scan is ineligible. It streams Spark's own vectorized batches to the GPU and
+  met the same gate at 1.52x.
+- Head-to-head on one build: the GPU Parquet path wins on SF10 (1.49x vs 1.20x)
+  and loses on the 33.5-million-row synthetic q96 shape (1.53x vs 1.75x), whose
+  small dictionaries, absent nulls, and long runs already suit Spark's
+  vectorized reader.
 - MLX 0.32.1 comparison: exact, but its GPU did not beat its compiled CPU path through 8.4 million rows.
 - Core ML 9.0 capability probe: CPU/GPU execution is possible, but the tested SQL-shaped graph cannot use the Neural Engine or produce Spark's required 64-bit sum.
 

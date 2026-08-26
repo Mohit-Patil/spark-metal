@@ -156,12 +156,16 @@ size_t stagingBucketSize(size_t length) {
 id<MTLBuffer> acquireStagingBuffer(MembershipStream *stream, size_t length) {
     // Reclaim only the completed *prefix* rather than rescanning the whole
     // list. Entries are appended in command-buffer commit order and the one
-    // shared queue completes command buffers in that same order, so the first
-    // entry that is not yet complete is followed only by entries that are not
-    // yet complete either -- stopping there reclaims exactly as much, and never
-    // reclaims a buffer the GPU still reads. It matters because -[MTLCommandBuffer
-    // status] is a real property read, and the Parquet path calls this twice per
-    // page: a full rescan made it O(pages^2) status reads per row group.
+    // shared queue completes command buffers in that order, so in the common
+    // case the first incomplete entry is followed only by incomplete ones and
+    // stopping there reclaims everything a full scan would. (Entries pushed by
+    // parquetRowGroupRelease can be keyed to an older command buffer than the
+    // ones already listed; the only effect is that they wait one more call to
+    // be reclaimed.) Reclaiming early is impossible either way: every entry is
+    // checked for MTLCommandBufferStatusCompleted before it is freed. This
+    // matters because -[MTLCommandBuffer status] is a real property read and
+    // the Parquet path calls this twice per page, so a full rescan cost
+    // O(pages^2) status reads per row group.
     size_t reclaimed = 0;
     while (reclaimed < stream->pendingStaging.size() &&
            stream->pendingStaging[reclaimed].second.status == MTLCommandBufferStatusCompleted) {

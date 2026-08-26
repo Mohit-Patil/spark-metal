@@ -13,6 +13,8 @@ import org.apache.parquet.hadoop.ParquetFileReader
 import org.apache.parquet.hadoop.util.HadoopInputFile
 
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.catalyst.expressions.AttributeReference
+import org.apache.spark.sql.types.LongType
 
 // Round-trips a dictionary-encoded Parquet file through the CPU page parser
 // and the GPU expansion kernels, then checks the decoded (dictionary id,
@@ -23,6 +25,17 @@ object ParquetDecodeSmoke {
   private val DictionaryEncodings = Set(Encoding.PLAIN_DICTIONARY, Encoding.RLE_DICTIONARY)
 
   def main(arguments: Array[String]): Unit = {
+    if (arguments.nonEmpty && arguments(0) == "exec") {
+      require(arguments.length >= 3,
+        "Usage: ParquetDecodeSmoke exec NATIVE_LIB METAL_LIB [ROWS]")
+      val rows = if (arguments.length > 3) arguments(3).toInt else 100003
+      runExecMode(arguments(1), arguments(2), rows)
+    } else {
+      runDecodeAndCountMode(arguments)
+    }
+  }
+
+  private def runDecodeAndCountMode(arguments: Array[String]): Unit = {
     require(arguments.length >= 2, "Usage: ParquetDecodeSmoke NATIVE_LIB METAL_LIB [ROWS]")
     val nativeLibrary = arguments(0)
     val metalLibrary = arguments(1)
@@ -293,6 +306,103 @@ object ParquetDecodeSmoke {
       println(s"""{"expectedCount":$expectedCount,"actualCount":$actualCount}""")
       require(actualCount == expectedCount,
         s"GPU row-group membership count $actualCount did not match expected $expectedCount")
+    } finally {
+      spark.stop()
+    }
+  }
+
+  // Task 5: drive MetalParquetMembershipCountExec directly (it is not yet
+  // reachable from the planner -- that's Task 6) over the same Task 3/4
+  // dataset, and compare its count against an equivalent DataFrame join
+  // count computed entirely by Spark's own engine.
+  private def runExecMode(nativeLibrary: String, metalLibrary: String, rows: Int): Unit = {
+    val spark = SparkSession.builder().appName("spark-metal-parquet-decode-smoke-exec").getOrCreate()
+    spark.sparkContext.setLogLevel("WARN")
+    val tempDir = Files.createTempDirectory("spark-metal-parquet-decode-smoke-exec")
+    val path = tempDir.resolve("data").toString
+    try {
+      writeDataset(spark, path, rows)
+      val partFile = Files.list(java.nio.file.Path.of(path)).iterator().asScala
+        .map(_.toString)
+        .find(_.endsWith(".parquet"))
+        .getOrElse(throw new RuntimeException(s"No .parquet part file found under $path"))
+
+      // Member set: values 50..199 in every column. writeDataset's k0/k1/k2
+      // all start their non-null range at +50 (see the memberLow comment in
+      // runDecodeAndCountMode), so this range is non-empty for every
+      // column, giving a non-zero expected count; and every column also
+      // carries id % 17 == 0 (plus k0's wide contiguous range) nulls, so a
+      // key set alone does not make the join count -- null fact rows must
+      // be correctly excluded for the counts to match.
+      val memberLow = 50
+      val memberHigh = 199
+      import spark.implicits._
+      val fact = spark.read.parquet(path).select("k0", "k1", "k2")
+
+      def check(caseName: String, keyValues: Seq[Int]): Unit = {
+        val dim0 = keyValues.toDF("k0j")
+        val dim1 = keyValues.toDF("k1j")
+        val dim2 = keyValues.toDF("k2j")
+
+        val outputAttribute = AttributeReference("count", LongType, nullable = false)()
+        val exec = MetalParquetMembershipCountExec(
+          outputAttribute,
+          Seq(partFile),
+          Columns,
+          Seq(
+            dim0.queryExecution.executedPlan,
+            dim1.queryExecution.executedPlan,
+            dim2.queryExecution.executedPlan),
+          nativeLibrary,
+          metalLibrary)
+
+        val partitionCounts = exec.executeColumnar().mapPartitions { batches =>
+          batches.map { batch =>
+            val value = batch.column(0).getLong(0)
+            batch.close()
+            value
+          }
+        }.collect()
+        val actualCount = partitionCounts.sum
+
+        val expectedCount = fact
+          .join(dim0, fact("k0") === dim0("k0j"))
+          .join(dim1, fact("k1") === dim1("k1j"))
+          .join(dim2, fact("k2") === dim2("k2j"))
+          .count()
+
+        println(
+          s"""{"mode":"exec","case":"$caseName","rows":$rows,""" +
+            s""""expectedCount":$expectedCount,"actualCount":$actualCount}""")
+        require(expectedCount > 0, s"$caseName: expected join count must be non-zero")
+        require(actualCount == expectedCount,
+          s"$caseName: MetalParquetMembershipCountExec count $actualCount did not match " +
+            s"expected $expectedCount")
+      }
+
+      // Unique keys 50..199: every column's non-null range starts at +50
+      // (see the memberLow comment in runDecodeAndCountMode), so this range
+      // is non-empty for every column; and every column also carries
+      // id % 17 == 0 (plus k0's wide contiguous range) nulls, so a key
+      // match alone does not make the count -- null fact rows must be
+      // correctly excluded. All keys are unique, so this exercises the
+      // presence-table path and, with dense small-integer domains, the GPU
+      // stream (parquetRowGroupBegin/parquetDecodePage/parquetRowGroupCount).
+      check("unique-dense", memberLow to memberHigh)
+
+      // Duplicate every key twice in all three dimensions: each matching
+      // fact row now has build-side multiplicity 2 per column, so a
+      // qualifying row contributes 2*2*2=8 to the count instead of 1. This
+      // exercises the multiplicity-table path (MembershipTables.multiplicity)
+      // instead of the presence-table path, on the same GPU stream.
+      check("duplicate-dense", (memberLow to memberHigh) ++ (memberLow to memberHigh))
+
+      // One key far outside the fact table's actual value range (max ~950)
+      // blows the dense-domain span (max - min + 1 <= 16M) without changing
+      // which fact rows match, forcing denseDomains = false for all three
+      // columns and driving every row group through the CPU
+      // (ColumnReadStoreImpl) fallback path instead of the GPU stream.
+      check("sparse-cpu-fallback", (memberLow to memberHigh) :+ 20000000)
     } finally {
       spark.stop()
     }

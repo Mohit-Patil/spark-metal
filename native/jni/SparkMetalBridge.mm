@@ -1246,6 +1246,10 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetDecodePage(
             static_cast<uintptr_t>(streamHandle));
         auto *rowGroup = reinterpret_cast<ParquetRowGroup *>(
             static_cast<uintptr_t>(rowGroupHandle));
+        if (rowGroup->stream != stream) {
+            throwRuntime(environment, @"Row group does not belong to the given stream");
+            return;
+        }
 
         // Guard against writing past the ids/validity planes: a corrupt
         // file, an unexpected writer, or a rowOffset accounting slip on the
@@ -1409,6 +1413,10 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetRowGroupRead(
             static_cast<uintptr_t>(streamHandle));
         auto *rowGroup = reinterpret_cast<ParquetRowGroup *>(
             static_cast<uintptr_t>(rowGroupHandle));
+        if (rowGroup->stream != stream) {
+            throwRuntime(environment, @"Row group does not belong to the given stream");
+            return;
+        }
         for (id<MTLCommandBuffer> commandBuffer : stream->commandBuffers) {
             [commandBuffer waitUntilCompleted];
             if (commandBuffer.status == MTLCommandBufferStatusError) {
@@ -1496,6 +1504,10 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetRowGroupCount(
             static_cast<uintptr_t>(streamHandle));
         auto *rowGroup = reinterpret_cast<ParquetRowGroup *>(
             static_cast<uintptr_t>(rowGroupHandle));
+        if (rowGroup->stream != stream) {
+            throwRuntime(environment, @"Row group does not belong to the given stream");
+            return;
+        }
         PreparedMembershipCount3 *prepared = stream->prepared;
 
         jbyteArray presenceArrays[3] = {dictPresence0, dictPresence1, dictPresence2};

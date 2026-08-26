@@ -112,6 +112,8 @@ object Q96SyntheticBenchmark {
         acceleratorMetrics = query.queryExecution.executedPlan.collectFirst {
           case node: MetalFusedMembershipCountExec =>
             node.metrics.map { case (name, metric) => name -> metric.value }
+          case node: MetalParquetMembershipCountExec =>
+            node.metrics.map { case (name, metric) => name -> metric.value }
         }.getOrElse(Map.empty)
       }
       val sorted = timings.sorted
@@ -120,7 +122,8 @@ object Q96SyntheticBenchmark {
       } else {
         sorted(sorted.length / 2)
       }
-      val accelerated = finalPlan.contains("MetalFusedMembershipCount")
+      val accelerated = finalPlan.contains("MetalFusedMembershipCount") ||
+        finalPlan.contains("MetalParquetMembershipCount")
       require(accelerated == expectMetal,
         s"Unexpected q96 accelerator state; expected=$expectMetal, plan=$finalPlan")
       val escapedPlan = finalPlan

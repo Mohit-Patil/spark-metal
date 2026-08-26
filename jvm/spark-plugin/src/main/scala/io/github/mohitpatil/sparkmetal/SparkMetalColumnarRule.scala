@@ -8,6 +8,7 @@ import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.{ColumnarRule, FileSourceScanExec, FilterExec, ProjectExec, SparkPlan}
 import org.apache.spark.sql.execution.adaptive.BroadcastQueryStageExec
 import org.apache.spark.sql.execution.aggregate.HashAggregateExec
+import org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeExec, ReusedExchangeExec}
 import org.apache.spark.sql.execution.joins.BroadcastHashJoinExec
 import org.apache.spark.sql.types.{IntegerType, LongType}
@@ -30,7 +31,8 @@ final class SparkMetalColumnarRule(
     nativeLibrary: String,
     metalLibrary: String,
     ansiEnabled: Boolean,
-    adaptiveEnabled: Boolean)
+    adaptiveEnabled: Boolean,
+    parquetScanEnabled: Boolean)
     extends ColumnarRule {
 
   override def preColumnarTransitions: Rule[SparkPlan] = new Rule[SparkPlan] {
@@ -59,15 +61,65 @@ final class SparkMetalColumnarRule(
         if (ordinals.contains(-1)) {
           None
         } else {
-          Some(MetalFusedMembershipCountExec(
-            aggregate.output.head,
-            ordinals,
-            tree.joins.map(_.keyPlan),
-            nativeLibrary,
-            metalLibrary,
-            tree.factPlan))
+          val keyPlans = tree.joins.map(_.keyPlan)
+          parquetMembershipCountExec(aggregate.output.head, tree.factPlan, ordinals, keyPlans)
+            .orElse(Some(MetalFusedMembershipCountExec(
+              aggregate.output.head,
+              ordinals,
+              keyPlans,
+              nativeLibrary,
+              metalLibrary,
+              tree.factPlan)))
         }
       }
+    }
+  }
+
+  /**
+   * When the fact-side plan is a bare Parquet [[FileSourceScanExec]] eligible
+   * for the GPU Parquet decode path (Tasks 1-4), emit
+   * [[MetalParquetMembershipCountExec]] instead, which decodes pages
+   * straight off disk on the GPU rather than routing through the CPU
+   * columnar scan + row conversion the fused path relies on. The scan's own
+   * `IsNotNull` data filters over the three key columns are dropped: q96's
+   * joins are inner joins on these keys, and both Metal operators already
+   * drop null-key rows, so the filters are subsumed. Falls back to `None`
+   * (letting the fused path proceed) whenever the region does not match
+   * these conditions exactly, `spark.metal.parquetScan.enabled` is false, or
+   * `ParquetEligibility.check` rejects the files.
+   */
+  private def parquetMembershipCountExec(
+      outputAttribute: Attribute,
+      factPlan: SparkPlan,
+      ordinals: Seq[Int],
+      keyPlans: Seq[SparkPlan]): Option[SparkPlan] = {
+    if (!parquetScanEnabled) {
+      return None
+    }
+    factPlan match {
+      case scan: FileSourceScanExec =>
+        val relation = scan.relation
+        val isEligibleShape =
+          relation.fileFormat.isInstanceOf[ParquetFileFormat] &&
+            relation.partitionSchema.isEmpty &&
+            relation.bucketSpec.isEmpty &&
+            scan.output.length == 3 &&
+            scan.output.forall(_.dataType == IntegerType) &&
+            ordinals.toSet == scan.output.indices.toSet &&
+            scan.dataFilters.forall(isOnlyNotNullPredicate)
+        if (!isEligibleShape) {
+          None
+        } else {
+          val columnNames = ordinals.map(scan.output(_).name)
+          val files = relation.location.inputFiles.toSeq
+          if (ParquetEligibility.check(files, columnNames).isRight) {
+            Some(MetalParquetMembershipCountExec(
+              outputAttribute, files, columnNames, keyPlans, nativeLibrary, metalLibrary))
+          } else {
+            None
+          }
+        }
+      case _ => None
     }
   }
 

@@ -290,8 +290,11 @@ object ParquetDecodeSmoke {
         } finally {
           countReader.close()
         }
-        actualCount = NativeBridge.membershipCount3StreamFinish(countStreamHandle)
+        // Set the flag before calling Finish: Finish deletes the native
+        // stream even when it throws, so the finally block's Abort must
+        // never fire afterward -- it would touch an already-deleted stream.
         countStreamFinished = true
+        actualCount = NativeBridge.membershipCount3StreamFinish(countStreamHandle)
       } finally {
         // Mirror the first pass's finally-abort: on any failure above (a
         // thrown exception before StreamFinish), abort the stream instead

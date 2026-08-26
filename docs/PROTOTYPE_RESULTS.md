@@ -177,7 +177,7 @@ and the 2.0x target set for this milestone.** It is reported as what it is.
 
 ### Head-to-head against the previous fused path
 
-Both operators measured on the same `-O2` build and the same host state:
+Both operators measured on the same `-O2` build and the same host state. The earlier 1.52x headline result (above) was measured against a JNI library unknowingly compiled at `-O0` and under a different host state; same-build head-to-head comparisons are the only directly comparable numbers:
 
 | Workload | CPU | GPU Parquet decode | Fused (`parquetScan.enabled=false`) |
 |---|---:|---:|---:|

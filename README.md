@@ -24,6 +24,8 @@ Direct Metal is the provisional primary candidate for SQL execution because it e
 - A Spark 4.2 columnar rule, JNI bridge, and fused Metal partial aggregate: working.
 - Integer null semantics: validated through Spark and independently through JNI.
 - Controlled 32-million-row synthetic Spark comparison: correct but currently about 5% slower than CPU.
+- MLX 0.32.1 comparison: exact, but its GPU did not beat its compiled CPU path through 8.4 million rows.
+- Core ML 9.0 capability probe: CPU/GPU execution is possible, but the tested SQL-shaped graph cannot use the Neural Engine or produce Spark's required 64-bit sum.
 - TPC-DS baseline: not yet generated.
 
 ## Project principles
@@ -77,6 +79,10 @@ The native and Spark integration checks do not require TPC-DS data:
 
 ```bash
 scripts/run-metal-microbenchmark.sh
+scripts/setup-mlx.sh
+scripts/run-mlx-microbenchmark.sh
+scripts/setup-coreml.sh
+scripts/run-coreml-capability-probe.sh
 scripts/run-jni-smoke-test.sh
 scripts/run-spark-plugin-smoke-test.sh
 scripts/run-spark-synthetic-benchmark.sh

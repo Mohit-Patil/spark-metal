@@ -14,6 +14,58 @@ Core ML, MLX, Spark ML, SynapseML, and Metal occupy different layers. The projec
 | SynapseML ONNXModel | ONNX Runtime, commonly CPU/CUDA in its Spark API | Model inference | Low for SQL; high for inference | Demonstrates batched native inference in Spark | Integration reference and possible experiment |
 | MPS / MPSGraph | Apple GPU numerical and graph operations | Numerical/graph oriented | Medium for selected primitives | Requires native bridging | Evaluate only if it shortens Metal implementation |
 
+## Observed evidence on the first host
+
+### MLX 0.32.1
+
+The same deterministic integer workload used by the direct Metal prototype now
+has a compiled MLX implementation. MLX executes exact `int32` element-wise work
+and an `int64` reduction on either its CPU or GPU backend. With five warm-ups and
+25 measured runs, the GPU did not beat MLX's compiled CPU path at any tested
+size through 8,388,608 rows. At that largest size the medians were 1.923 ms on
+CPU, 1.978 ms on GPU with a pre-existing MLX array, and 2.204 ms on GPU including
+Python-array materialization.
+
+This is useful negative evidence. It confirms that unified memory alone does not
+remove dispatch, framework, synchronization, or ownership costs, and it exposes
+that the original Swift loop is not a sufficient best-CPU control. The
+end-to-end vanilla Spark baseline remains the authoritative comparison.
+
+MLX currently documents CPU and GPU devices, shared array storage, lazy
+evaluation, and graph compilation; it does not expose the Neural Engine as a
+general execution device. See the official [MLX overview](https://ml-explore.github.io/mlx/),
+[unified-memory guide](https://ml-explore.github.io/mlx/build/html/usage/unified_memory.html),
+and [compilation guide](https://ml-explore.github.io/mlx/build/html/usage/compile.html).
+
+### Core ML 9.0 and the Neural Engine
+
+The executable Core ML probe builds the same static predicate, projection, and
+reduction as an ML Program. For 4,194,304 rows, Core ML's compute plan lists CPU
+and GPU support for every non-constant operation and prefers the GPU. It does
+not list the Neural Engine for comparison, multiplication, addition, selection,
+or reduction, even though the Neural Engine is present on the host.
+
+The graph also cannot cast to `int64`; its supported cast types stop at `int32`.
+Consequently the correct Spark-compatible sum 3,128,594,400 becomes
+-1,166,372,896 through 32-bit overflow. Chunking and merging on the host could
+avoid this one overflow, but would not turn Core ML into a general SQL execution
+engine or provide ANE execution for these operators.
+
+Core ML remains relevant for a future Spark ML inference transformer. Apple
+documents that `ComputeUnit.ALL` permits CPU, GPU, and Neural Engine and that the
+runtime partitions supported model graphs across them; placement is not a
+general kernel API. See [Core ML compute units](https://apple.github.io/coremltools/docs-guides/source/model-prediction.html)
+and [typed execution](https://apple.github.io/coremltools/docs-guides/source/typed-execution.html).
+
+### Spark ML / MLlib
+
+Spark ML is a schema-aware DataFrame API for feature transforms, algorithms,
+pipelines, tuning, and model persistence. It can define a future Core ML-backed
+inference transformer and teach us executor lifecycle patterns, but it does not
+replace Catalyst/Tungsten SQL operators or select Apple hardware. The official
+[MLlib guide](https://spark.apache.org/docs/latest/ml-guide) describes this
+library boundary.
+
 ## Evaluation criteria
 
 Each executable backend prototype will be measured on the same representative workloads:
@@ -57,5 +109,9 @@ These projects are valuable at the integration layer: model/session reuse, batch
 
 ## Decision gate
 
-Direct Metal becomes the committed SQL backend only after it beats the controlled CPU implementation for the fused representative workload including buffer and synchronization costs. MLX or another path may be retained as a prototype backend if it wins materially or reduces implementation risk.
-
+Direct Metal remains the primary SQL-backend candidate because it is the only
+evaluated path that provides the necessary kernel, integer, memory, and Spark
+integration control. It is not yet a proven winner: the controlled end-to-end
+Spark comparison is currently slower than vanilla CPU Spark, and the TPC-DS
+success gate remains open. MLX remains a compact feasibility/reference backend;
+Core ML and Spark ML remain inference-layer options rather than TPC-DS engines.

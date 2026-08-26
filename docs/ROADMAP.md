@@ -20,10 +20,10 @@
 
 - [x] Implement a common representative workload.
 - [x] Run CPU reference.
-- [ ] Run MLX GPU prototype.
+- [x] Run MLX CPU/GPU prototype.
 - [x] Run direct Metal prototype.
 - [ ] Evaluate MPSGraph if it reduces implementation work.
-- [ ] Run Core ML compute-unit experiment where the graph is representable.
+- [x] Run Core ML compute-unit and integer-semantics experiment.
 - [x] Record the direct-Metal crossover batch sizes.
 - [ ] Select the primary backend after the remaining comparisons.
 

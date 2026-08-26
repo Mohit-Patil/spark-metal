@@ -16,7 +16,8 @@ import org.apache.spark.sql.{Row, SparkSession}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.AttributeReference
 import org.apache.spark.sql.functions.{col, count, expr, lit, sum}
-import org.apache.spark.sql.types.{DoubleType, IntegerType, LongType, StringType, StructField, StructType}
+import org.apache.spark.sql.types.{
+  DateType, Decimal, DecimalType, DoubleType, IntegerType, LongType, StringType, StructField, StructType}
 import org.apache.spark.unsafe.types.UTF8String
 
 // Round-trips a dictionary-encoded Parquet file through the CPU page parser
@@ -599,22 +600,33 @@ object ParquetDecodeSmoke {
   // real broadcast-side build: `region` is attribute-free (it contributes
   // NO group component, only a membership gate and a duplicate-build-key
   // multiplicity factor -- region key 2 appears twice on the build side) and
-  // `category` carries 2 attributes of TWO DIFFERENT TYPES: major (int) and
-  // brand (string -- TPC-DS group keys are frequently strings, e.g. q3/q42/
-  // q52/q55 group by i_brand/i_category, so GroupSpace must handle a string
-  // attribute, not just int32). Distinct join key 13 deliberately shares its
-  // FULL attribute tuple (major = 1, brand = "acme") with key 10 -- and
-  // "acme" alone is deliberately reused by key 12 with a DIFFERENT major, so
-  // string-value equality contributing to a tuple match is exercised without
-  // the string alone being sufficient for a match -- proving GroupSpace.build
-  // groups by the whole ATTRIBUTE TUPLE (value-compared, not reference- or
-  // position-compared), not by join-key identity: a fact row joining on
-  // either key 10 or key 13 lands in the very same accumulator (and, since
-  // key 10 is quantity-positive and key 13 quantity-negative -- see
-  // writeAggregateDataset -- their contributions actually offset within that
-  // one group). Key 14 is a dimension row with no matching fact rows at all,
-  // so its group must come back all zeros; key 15 is a fact-side value with
-  // no matching dimension row, exercising the code-gate (as opposed to the
+  // `category` carries 4 attributes spanning FOUR DIFFERENT TYPES: major
+  // (int), brand (string), listPrice (decimal(7,2)), launchDate (date).
+  // TPC-DS group keys are frequently strings (q3/q42/q52/q55 group by
+  // i_brand/i_category) and decimals/dates are common dimension attributes
+  // too, so GroupSpace's positive path needs to actually exercise all of
+  // those -- not just int32 -- and DecimalType in particular is the only
+  // parameterized extractor (getDecimal(ordinal, precision, scale)): a wrong
+  // precision/scale against the row's real layout would silently produce a
+  // wrong value rather than fail loudly, so it needs its own coverage, not
+  // an assumption that "it's just like the other types."
+  //
+  // Distinct join key 13 deliberately shares its FULL attribute tuple
+  // (major=1, brand="acme", listPrice=19.99, launchDate=2020-01-15) with key
+  // 10 -- proving GroupSpace.build groups by the whole ATTRIBUTE TUPLE
+  // (value-compared across every type in it), not by join-key identity: a
+  // fact row joining on either key 10 or key 13 lands in the very same
+  // accumulator (and, since key 10 is quantity-positive and key 13
+  // quantity-negative -- see writeAggregateDataset -- their contributions
+  // actually offset within that one group). Crucially, listPrice/launchDate
+  // are NOT unique per (major, brand): key 11 shares key 10's exact
+  // listPrice AND launchDate but has a different brand ("globex"), and key
+  // 14 shares key 12's exact listPrice AND launchDate but has a different
+  // major/brand -- both prove that a decimal/date match alone is NOT enough
+  // to collapse two keys into one group; every field in the tuple must
+  // match. Key 14 is a dimension row with no matching fact rows at all, so
+  // its group must come back all zeros; key 15 is a fact-side value with no
+  // matching dimension row, exercising the code-gate (as opposed to the
   // null-gate) on the attributed dimension.
   //
   // GroupSpace.build assigns the dense group ids (in VALUE space); this test
@@ -636,12 +648,22 @@ object ParquetDecodeSmoke {
   // at all, exercising the code-gate on the attribute-free dimension too.
   private val RegionDimensionKeys = Seq(1, 2, 2, 3)
 
-  // Category dimension (2 attributes: major: Int, brand: String). Keys 10
-  // and 13 share the tuple (1, "acme") -- see the comment above; key 12
-  // reuses the "acme" string with a different major, a distinct tuple. Key
-  // 14 gets no fact rows.
-  private val CategoryDimensionRows =
-    Seq((10, 1, "acme"), (11, 1, "globex"), (12, 2, "acme"), (13, 1, "acme"), (14, 3, "initech"))
+  // Category dimension: (joinKey, major: Int, brand: String,
+  // listPriceCents: unscaled decimal(7,2), launchDate: ISO date string) --
+  // a single source of truth both the GroupSpace-side InternalRows and the
+  // Spark reference DataFrame below are derived from, so the two can never
+  // silently drift apart. Distinct attribute tuples: (1,"acme",19.99,
+  // 2020-01-15) [keys 10, 13 -- collapse], (1,"globex",19.99,2020-01-15)
+  // [key 11], (2,"acme",29.99,2021-06-01) [key 12], (3,"initech",29.99,
+  // 2021-06-01) [key 14, no fact rows] -- 4 distinct tuples, same as before
+  // GroupSpace was extended, so the group count (and every downstream
+  // group-count-dependent assertion/kernel limit) is unchanged.
+  private val CategoryDimensionData: Seq[(Int, Int, String, Long, String)] = Seq(
+    (10, 1, "acme", 1999L, "2020-01-15"),
+    (11, 1, "globex", 1999L, "2020-01-15"),
+    (12, 2, "acme", 2999L, "2021-06-01"),
+    (13, 1, "acme", 1999L, "2020-01-15"),
+    (14, 3, "initech", 2999L, "2021-06-01"))
 
   private def runAggregateMode(nativeLibrary: String, metalLibrary: String, rows: Int): Unit = {
     val spark = SparkSession.builder().appName("spark-metal-parquet-aggregate-smoke").getOrCreate()
@@ -665,51 +687,81 @@ object ParquetDecodeSmoke {
       val regionDimensionRows: Array[(Int, InternalRow)] =
         RegionDimensionKeys.map(key => (key, InternalRow())).toArray
       val categoryDimensionRows: Array[(Int, InternalRow)] =
-        CategoryDimensionRows.map { case (key, major, brand) =>
-          (key, InternalRow(major, UTF8String.fromString(brand)))
+        CategoryDimensionData.map { case (key, major, brand, listPriceCents, launchDateIso) =>
+          val launchDateEpochDay = java.sql.Date.valueOf(launchDateIso).toLocalDate.toEpochDay.toInt
+          (key, InternalRow(
+            major, UTF8String.fromString(brand), Decimal(listPriceCents, 7, 2), launchDateEpochDay))
         }.toArray
+      // Dimension order here (region, then category) MUST match
+      // AggregateKeyColumns' order (region_key, then category_key) below:
+      // built.codesByKey(i)/built.factorsByKey(i) is dimension i's map, and
+      // it is used to translate AggregateKeyColumns(i)'s dictionary values
+      // into the i-th code/factor table passed to
+      // NativeBridge.parquetRowGroupAggregate -- dimension i and key column
+      // i are the SAME column, just at two different stages of translation.
       val built = GroupSpace.build(
         Seq(
           GroupSpace.Dimension(regionDimensionRows, attributeCount = 0),
           GroupSpace.Dimension(
-            categoryDimensionRows, attributeCount = 2, attributeTypes = Seq(IntegerType, StringType))),
+            categoryDimensionRows,
+            attributeCount = 4,
+            attributeTypes = Seq(IntegerType, StringType, DecimalType(7, 2), DateType))),
         maxGroups = 1024) match {
         case Right(b) => b
         case Left(reason) => throw new RuntimeException(s"GroupSpace.build unexpectedly rejected: $reason")
       }
+      require(built.codesByKey.length == AggregateKeyColumns.length,
+        s"GroupSpace dimension count ${built.codesByKey.length} must match " +
+          s"AggregateKeyColumns.length ${AggregateKeyColumns.length} (dimension i == key column i)")
       // region contributes 1 component (attribute-free) x category's 4
       // distinct attribute tuples (10 and 13 collapse together) = 4 groups.
       require(built.groupCount == 4,
         s"expected 4 groups (1 region component x 4 category tuples), got ${built.groupCount}")
 
       // Reference: an ACTUAL Spark join (region and category dimension
-      // tables against the fact file) + groupBy(major, brand), not a
-      // hand-derived formula. Spark's own equi-join already implements the
-      // null-gate (a null key never matches) and the code-gate (region_key
-      // = 4 / category_key = 15 match no dimension row); its groupBy
-      // already implements the ignore-nulls sum/count(column) policy the
-      // kernel is expected to match, and groups by the string attribute
-      // exactly the same way real TPC-DS-shaped queries (q3/q42/q52/q55)
-      // group by i_brand/i_category.
+      // tables against the fact file) + groupBy(major, brand, listPrice,
+      // launchDate), not a hand-derived formula. Spark's own equi-join
+      // already implements the null-gate (a null key never matches) and the
+      // code-gate (region_key = 4 / category_key = 15 match no dimension
+      // row); its groupBy already implements the ignore-nulls sum/
+      // count(column) policy the kernel is expected to match, and groups by
+      // the string/decimal/date attributes exactly the same way real
+      // TPC-DS-shaped queries (q3/q42/q52/q55 group by i_brand/i_category)
+      // would.
       import spark.implicits._
       val fact = spark.read.parquet(path)
       val regionDim = RegionDimensionKeys.toDF("region_key_b")
-      val categoryDim = CategoryDimensionRows.toDF("category_key_b", "major", "brand")
+      val categoryDim = CategoryDimensionData.map { case (key, major, brand, listPriceCents, launchDateIso) =>
+        (key, major, brand, BigDecimal(listPriceCents, 2), java.sql.Date.valueOf(launchDateIso))
+      }.toDF("category_key_b", "major", "brand", "listPrice", "launchDate")
       val enriched = fact
         .join(regionDim, fact("region_key") === regionDim("region_key_b"))
         .join(categoryDim, fact("category_key") === categoryDim("category_key_b"))
         .withColumn("price_unscaled", expr("CAST(price * 100 AS INT)"))
-      val referenceAgg = enriched.groupBy("major", "brand").agg(
+      val referenceAgg = enriched.groupBy("major", "brand", "listPrice", "launchDate").agg(
         count(lit(1)).as("cnt"),
         sum(col("quantity")).as("sumQuantity"),
         sum(col("price_unscaled")).as("sumPriceUnscaled"),
         sum(col("amount")).as("sumAmount"),
         count(col("quantity")).as("countQuantity")
       ).collect()
-      val referenceMap: Map[(Int, String), Array[Long]] = referenceAgg.map { row =>
+      // listPrice/launchDate are folded into the map key as exact,
+      // scale/timezone-independent canonical values (unscaled cents,
+      // epoch-day) so they compare equal to GroupSpace's own catalyst-level
+      // representations below regardless of the DecimalType precision/scale
+      // Spark inferred for this DataFrame (which need not match the
+      // DecimalType(7,2) GroupSpace was told about -- only the numeric
+      // value has to agree).
+      def decimalCents(decimal: java.math.BigDecimal): Long =
+        decimal.movePointRight(2).setScale(0).longValueExact()
+      val referenceMap: Map[(Int, String, Long, Int), Array[Long]] = referenceAgg.map { row =>
         def longOrZero(index: Int): Long = if (row.isNullAt(index)) 0L else row.getLong(index)
-        (row.getInt(0), row.getString(1)) ->
-          Array(longOrZero(2), longOrZero(3), longOrZero(4), longOrZero(5), longOrZero(6))
+        val key = (
+          row.getInt(0),
+          row.getString(1),
+          decimalCents(row.getDecimal(2)),
+          row.getDate(3).toLocalDate.toEpochDay.toInt)
+        key -> Array(longOrZero(4), longOrZero(5), longOrZero(6), longOrZero(7), longOrZero(8))
       }.toMap
 
       // Fold the reference map into a group-major array via groupTuples --
@@ -718,7 +770,11 @@ object ParquetDecodeSmoke {
       val expected = new Array[Long](built.groupCount * aggregateCount)
       for (group <- 0 until built.groupCount) {
         val categoryTuple = built.groupTuples(group)(1)
-        val key = (categoryTuple.getInt(0), categoryTuple.getUTF8String(1).toString)
+        val key = (
+          categoryTuple.getInt(0),
+          categoryTuple.getUTF8String(1).toString,
+          decimalCents(categoryTuple.getDecimal(2, 7, 2).toJavaBigDecimal),
+          categoryTuple.getInt(3))
         val values = referenceMap.getOrElse(key, new Array[Long](5))
         for (aggregate <- 0 until aggregateCount) {
           expected(group * aggregateCount + aggregate) = values(aggregate)

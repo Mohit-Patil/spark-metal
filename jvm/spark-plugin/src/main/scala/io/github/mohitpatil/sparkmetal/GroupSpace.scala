@@ -50,6 +50,11 @@ private[sparkmetal] object GroupSpace {
   case class Built(
       groupCount: Int,
       // per dimension: joinKey -> premultiplied component code (unique keys).
+      // IMPORTANT: every Seq here is in the SAME order `dimensions` was
+      // passed to `build`, i.e. codesByKey(i)/factorsByKey(i)/groupTuples(_)(i)
+      // is dimension i -- callers driving NativeBridge.parquetRowGroupAggregate
+      // must keep their key-column order aligned with that SAME dimension
+      // order (key column i's code/factor table comes from dimension i).
       codesByKey: Seq[Map[Int, Int]],
       // per dimension: joinKey -> multiplicity factor. Populated only for
       // attribute-free dimensions (where duplicate join keys are allowed and

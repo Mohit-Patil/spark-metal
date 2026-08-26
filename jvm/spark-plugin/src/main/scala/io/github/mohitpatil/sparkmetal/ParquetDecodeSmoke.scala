@@ -46,6 +46,7 @@ object ParquetDecodeSmoke {
       val decodedIsNull = Array.fill(Columns.length)(new Array[Boolean](rows))
 
       var coveredRows = 0
+      var fullyNullPages = 0
       val reader = ParquetFileReader.open(HadoopInputFile.fromPath(new Path(partFile), new Configuration()))
       try {
         val descriptors = Columns.map { name =>
@@ -77,6 +78,11 @@ object ParquetDecodeSmoke {
 
               val hasDefLevels = descriptor.getMaxDefinitionLevel > 0
 
+              // Tracks each page's (rowStart, rowCount) within the row group
+              // so we can later detect a page that decoded to all-null rows
+              // (exercising the entirely-null-page path in parquetDecodePage).
+              val pageRanges = scala.collection.mutable.ArrayBuffer.empty[(Int, Int)]
+
               var rowOffset = 0
               var rawPage = pageReader.readPage()
               while (rawPage != null) {
@@ -92,6 +98,7 @@ object ParquetDecodeSmoke {
                 }
                 val pageBytes = dataPage.getBytes.toByteArray
                 val valueCount = dataPage.getValueCount
+                pageRanges += ((rowOffset, valueCount))
 
                 NativeBridge.parquetDecodePage(
                   streamHandle, rowGroupHandle, columnIndex,
@@ -115,6 +122,13 @@ object ParquetDecodeSmoke {
                   decodedValues(columnIndex)(globalRow) = dictionaryValues(idsOut(row))
                 } else {
                   decodedIsNull(columnIndex)(globalRow) = true
+                }
+              }
+
+              for ((pageStart, pageCount) <- pageRanges) {
+                if (pageCount > 0 &&
+                    (pageStart until pageStart + pageCount).forall(row => validityOut(row) != 0)) {
+                  fullyNullPages += 1
                 }
               }
             }
@@ -150,20 +164,47 @@ object ParquetDecodeSmoke {
       }
 
       val matched = mismatches == 0
-      println(s"""{"rows":$rows,"mismatches":$mismatches,"match":$matched}""")
+      val coveredFullyNullPage = fullyNullPages > 0
+      println(
+        s"""{"rows":$rows,"mismatches":$mismatches,"match":$matched,""" +
+          s""""fullyNullPages":$fullyNullPages}""")
       if (!matched) sys.exit(1)
+      if (!coveredFullyNullPage) {
+        throw new RuntimeException(
+          "No fully-null Parquet data page was observed; the entirely-null-page " +
+            "path in parquetDecodePage was not exercised by this run")
+      }
     } finally {
       spark.stop()
     }
   }
 
   private def writeDataset(spark: SparkSession, path: String, rows: Int): Unit = {
+    // k0 additionally goes null for a long contiguous id range (on top of the
+    // modulo pattern), guaranteeing at least one data page that is 100% null
+    // -- exercising the entirely-null-page path in
+    // parquetDecodePage/scatter_segments. k1/k2 keep the plain modulo-null
+    // pattern so the mixed-null-page path stays covered too.
+    //
+    // A dictionary-encoded int column packs to only a few bits/value, so the
+    // default 1MB parquet.page.size can fit all 100k+ rows in a single page.
+    // Forcing small (8KB) pages isn't enough on its own either: parquet-mr
+    // additionally caps every page at 20,000 rows (DEFAULT_PAGE_ROW_COUNT_LIMIT),
+    // and RLE-encodes a long null run so cheaply that a page straddling the
+    // start of the null run rides that 20,000-row cap deep into the run
+    // before cutting. The null range here (70,001 rows) is wide enough that,
+    // even after that first straddling page, at least one subsequent
+    // 20,000-row-capped page starts and ends fully inside the null run.
     spark.range(rows)
       .selectExpr(
-        "CASE WHEN id % 17 = 0 THEN CAST(NULL AS INT) ELSE CAST(pmod(id, 900) + 50 AS INT) END AS k0",
+        "CASE WHEN id BETWEEN 20000 AND 90000 THEN CAST(NULL AS INT) " +
+          "WHEN id % 17 = 0 THEN CAST(NULL AS INT) " +
+          "ELSE CAST(pmod(id, 900) + 50 AS INT) END AS k0",
         "CASE WHEN id % 17 = 0 THEN CAST(NULL AS INT) ELSE CAST(pmod(id, 850) + 50 AS INT) END AS k1",
         "CASE WHEN id % 17 = 0 THEN CAST(NULL AS INT) ELSE CAST(pmod(id, 700) + 50 AS INT) END AS k2")
       .coalesce(1)
-      .write.mode("errorifexists").parquet(path)
+      .write
+      .option("parquet.page.size", "8192")
+      .mode("errorifexists").parquet(path)
   }
 }

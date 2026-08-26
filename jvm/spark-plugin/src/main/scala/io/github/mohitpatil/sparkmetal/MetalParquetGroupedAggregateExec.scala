@@ -382,6 +382,15 @@ case class MetalParquetGroupedAggregateExec(
             val measureDescriptors = measureColumnNames.map(name => descriptorFor(schema, split.file, name))
 
             var rowGroupHandle = 0L
+            // Distinct from rowGroupHandle == 0L, which is also the
+            // never-allocated starting value (e.g. parquetRowGroupBeginAggregate
+            // itself throwing before ever assigning a handle) -- that case
+            // must still fall back to a fresh CPU recompute below, exactly
+            // like any other pre-success failure. aggregateLanded is the ONLY
+            // signal for "the GPU aggregate already succeeded for this row
+            // group," set true in the same statement that zeroes
+            // rowGroupHandle on success.
+            var aggregateLanded = false
             try {
               val pageReadStore = reader.readRowGroup(split.rowGroupIndex)
               try {
@@ -414,12 +423,14 @@ case class MetalParquetGroupedAggregateExec(
                 // The handle is consumed by a successful Aggregate call --
                 // clear it immediately so that if pageReadStore.close()
                 // (below, in this same finally) throws, the catch block
-                // below (rowGroupHandle == 0L) does not release an
+                // below (guarded by aggregateLanded, not by rowGroupHandle
+                // itself -- see that var's declaration) does not release an
                 // already-consumed handle (a use-after-free) and rethrows
                 // instead of double-counting this row group by recomputing
                 // it on the CPU on top of its already-landed GPU
                 // contribution.
                 rowGroupHandle = 0L
+                aggregateLanded = true
                 localRowGroups += 1
               } finally {
                 pageReadStore.close()
@@ -434,15 +445,20 @@ case class MetalParquetGroupedAggregateExec(
                 // already fed to the failed GPU pass cannot be re-read, so
                 // the CPU recompute uses a fresh PageReadStore.
                 //
-                // rowGroupHandle == 0L here means the GPU aggregate already
-                // landed successfully for this row group (it is zeroed
-                // immediately after parquetRowGroupAggregate succeeds, above)
-                // and this exception came from pageReadStore.close() itself,
-                // AFTER that success. Falling back to a CPU recompute in that
-                // case would add this row group's contribution a second time
-                // on top of the one the GPU already committed, so there is
-                // nothing safe to do but propagate the close() failure.
-                if (rowGroupHandle == 0L) throw e
+                // aggregateLanded (NOT rowGroupHandle == 0L -- that is also
+                // the never-allocated starting value, true when
+                // parquetRowGroupBeginAggregate itself threw before ever
+                // assigning a handle, which must still fall through to the
+                // CPU recompute below like any other pre-success failure)
+                // means the GPU aggregate already landed successfully for
+                // this row group (set true in the same statement that zeroes
+                // rowGroupHandle on success, above) and this exception came
+                // from pageReadStore.close() itself, AFTER that success.
+                // Falling back to a CPU recompute in that case would add this
+                // row group's contribution a second time on top of the one
+                // the GPU already committed, so there is nothing safe to do
+                // but propagate the close() failure.
+                if (aggregateLanded) throw e
                 logWarning(s"Row group ${split.file}#${split.rowGroupIndex} fell back to CPU", e)
                 NativeBridge.parquetRowGroupRelease(rowGroupHandle)
                 localFallbacks += 1

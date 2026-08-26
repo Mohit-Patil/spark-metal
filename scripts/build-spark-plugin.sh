@@ -41,6 +41,7 @@ java -cp "${SPARK_HOME}/jars/*" scala.tools.nsc.Main \
   -classpath "${SPARK_HOME}/jars/*:${classes}" \
   -d "${classes}" \
   "${plugin_root}/scala/io/github/mohitpatil/sparkmetal/SparkMetalNative.scala" \
+  "${plugin_root}/scala/io/github/mohitpatil/sparkmetal/ParquetEligibility.scala" \
   "${plugin_root}/scala/io/github/mohitpatil/sparkmetal/SharedBufferPool.scala" \
   "${plugin_root}/scala/io/github/mohitpatil/sparkmetal/MetalFusedSumExec.scala" \
   "${plugin_root}/scala/io/github/mohitpatil/sparkmetal/MetalFusedMembershipCountExec.scala" \

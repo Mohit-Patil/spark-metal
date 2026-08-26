@@ -1255,7 +1255,15 @@ object ParquetDecodeSmoke {
       def decimalCents(decimal: java.math.BigDecimal): Long = decimal.movePointRight(2).setScale(0).longValueExact()
 
       type GroupKey = (Int, String, Long)
-      type MergedTuple = (Option[Long], Long, Option[Double], Long, Long) // sumQ, countQ, avgSum, avgCount, countStar
+      // avgSum is a plain (never-null) Double, NOT Option[Double]: per
+      // Average.initialValues == (0, 0L) and its non-coalescing merge, the
+      // partial avg-sum buffer this operator emits must never be null (see
+      // buildOutputRow's CRITICAL comment) -- modeling it as an Option here
+      // would let a reintroduced null slip through a lenient
+      // getOrElse(0.0)-style merge instead of failing loudly. sumQuantity
+      // stays Option[Long]: Sum's buffer genuinely starts null and its
+      // merge DOES coalesce.
+      type MergedTuple = (Option[Long], Long, Double, Long, Long) // sumQ, countQ, avgSum, avgCount, countStar
       type FinalTuple = (Option[Long], Long, Option[Double], Long) // sumQ, countQ, avg, countStar
 
       def sparkReference(
@@ -1282,31 +1290,44 @@ object ParquetDecodeSmoke {
         }.toMap
       }
 
-      def mergeAndFinalize(collected: Array[InternalRow]): Map[GroupKey, FinalTuple] = {
+      def mergeAndFinalize(caseName: String, collected: Array[InternalRow]): Map[GroupKey, FinalTuple] = {
         val merged = mutable.LinkedHashMap.empty[GroupKey, MergedTuple]
         collected.foreach { row =>
           val major = row.getInt(0)
           val brand = row.getUTF8String(1).toString
           val listPriceCents = decimalCents(row.getDecimal(2, 7, 2).toJavaBigDecimal)
           val key: GroupKey = (major, brand, listPriceCents)
+          // Sum's partial buffer genuinely starts null (coalescing merge,
+          // per Sum.mergeExpressions): null iff this partial's non-null
+          // count was zero.
           val sumQuantity = if (row.isNullAt(3)) None else Some(row.getLong(3))
           val countQuantity = row.getLong(4)
-          val avgSum = if (row.isNullAt(5)) None else Some(row.getDouble(5))
+          // Avg's partial sum must NEVER be null (Average.initialValues is
+          // (0, 0L), and its mergeExpressions is a plain, NON-coalescing
+          // Add) -- assert that contract here, at the point every partial
+          // row is actually read, rather than letting a violation surface
+          // several steps later as a confusing final-answer mismatch.
+          require(!row.isNullAt(5),
+            s"$caseName: avg sum partial buffer was null -- Average.initialValues is (0, 0L), never null")
+          val avgSum = row.getDouble(5)
           val avgCount = row.getLong(6)
           val countStar = row.getLong(7)
-          val existing = merged.getOrElse(key, (None, 0L, None, 0L, 0L))
+          val existing = merged.getOrElse(key, (None, 0L, 0.0, 0L, 0L))
           val combinedSum = (existing._1, sumQuantity) match {
             case (None, None) => None
             case (a, b) => Some(a.getOrElse(0L) + b.getOrElse(0L))
           }
-          val combinedAvgSum = (existing._3, avgSum) match {
-            case (None, None) => None
-            case (a, b) => Some(a.getOrElse(0.0) + b.getOrElse(0.0))
-          }
+          // Plain (non-coalescing) add, exactly matching Average's real
+          // mergeExpressions -- both operands are guaranteed non-null by
+          // the require above, so there is nothing to coalesce; if a future
+          // regression ever DID let a null slip through as a garbage 0.0,
+          // this is the same arithmetic Spark's own merge would apply, not
+          // a more lenient stand-in for it.
+          val combinedAvgSum = existing._3 + avgSum
           merged(key) = (combinedSum, existing._2 + countQuantity, combinedAvgSum, existing._4 + avgCount, existing._5 + countStar)
         }
         merged.view.mapValues { case (sumQ, countQ, avgSum, avgCount, countStar) =>
-          val finalAvg = if (avgCount > 0) Some(avgSum.getOrElse(0.0) / avgCount) else None
+          val finalAvg = if (avgCount > 0) Some(avgSum / avgCount) else None
           (sumQ, countQ, finalAvg, countStar)
         }.toMap
       }
@@ -1316,10 +1337,12 @@ object ParquetDecodeSmoke {
           files: Seq[String],
           catDimDF: org.apache.spark.sql.DataFrame,
           regionDimDF: org.apache.spark.sql.DataFrame,
-          minCpuFallback: Option[Long] = None): Unit = {
+          minCpuFallback: Option[Long] = None,
+          exactCpuFallback: Option[Long] = None,
+          requireGpuCpuMix: Boolean = false): Unit = {
         val exec = buildExec(files, catDimDF, regionDimDF)
         val collected = exec.execute().collect()
-        val actual = mergeAndFinalize(collected)
+        val actual = mergeAndFinalize(caseName, collected)
         val reference = sparkReference(files, catDimDF, regionDimDF)
 
         val cpuFallback = exec.metrics("cpuFallbackRowGroups").value
@@ -1347,17 +1370,29 @@ object ParquetDecodeSmoke {
         minCpuFallback.foreach { min =>
           require(cpuFallback >= min, s"$caseName: expected cpuFallbackRowGroups >= $min, got $cpuFallback")
         }
+        exactCpuFallback.foreach { expected =>
+          require(cpuFallback == expected,
+            s"$caseName: expected cpuFallbackRowGroups == $expected (pure GPU path), got $cpuFallback")
+        }
+        if (requireGpuCpuMix) {
+          require(cpuFallback > 0 && cpuFallback < numRowGroups,
+            s"$caseName: expected a genuine MIX of GPU-successful and CPU-fallback row groups, " +
+              s"got cpuFallbackRowGroups=$cpuFallback of numRowGroups=$numRowGroups")
+        }
       }
 
       // Case A: a single, dictionary-friendly file -- the normal (dense)
-      // GroupSpace path.
-      compare("main", Seq(mainFile), catDim, regionDim)
+      // GroupSpace path. exactCpuFallback = 0 proves the GPU path actually
+      // ran (not just that the final answer happened to match).
+      compare("main", Seq(mainFile), catDim, regionDim, exactCpuFallback = Some(0))
 
       // Case B: main + a dictionary-overflow file -- per-row-group CPU
       // fallback (cpuFallbackRowGroups >= 1), combined result still exact.
+      // requireGpuCpuMix proves this is a genuine MIX (mainFile's row group
+      // still GPU-successful), not every row group silently falling back.
       compare(
         "dictionary-overflow-cpu-fallback", Seq(mainFile, overflowFile), catDim, regionDim,
-        minCpuFallback = Some(1))
+        minCpuFallback = Some(1), requireGpuCpuMix = true)
 
       // Case C: cat_key = 1 appears TWICE in the (attributed) catDim with
       // DIFFERENT attribute tuples -- GroupSpace.build rejects this
@@ -1370,9 +1405,80 @@ object ParquetDecodeSmoke {
       val catDimDuplicated = catRowsDuplicated.toDF("cat_key", "major", "brand", "listPrice")
         .withColumn("listPrice", col("listPrice").cast(DecimalType(7, 2)))
       compare("whole-operator-cpu-duplicate-key", Seq(mainFile), catDimDuplicated, regionDim)
+
+      // Case D (regression for the CRITICAL avg-null-partial bug): cat_key
+      // = 7 ("avgnull" dimension row) receives fact rows from TWO SEPARATE
+      // FILES -- forcing >= 2 splits/partitions (numPartitions =
+      // min(splits.length, defaultParallelism), and a 2-element Seq sliced
+      // into 2 partitions gets exactly one element each) so this ONE group
+      // genuinely spans a partition boundary. One file's rows all have a
+      // NULL amount (that partition's avg(amount) internal (sum, count) is
+      // (0, 0) for this group -- exactly the case that used to emit a null
+      // avg-sum); the other file's rows have a real, non-null amount. If
+      // buildOutputRow ever regresses to gating avg's sum on
+      // non-null-count again, the all-null-amount partition's partial row
+      // emits a null avg-sum, mergeAndFinalize's non-coalescing add
+      // propagates that null forever, and the final avg comes out None --
+      // but Spark's OWN real end-to-end answer for this group is
+      // non-null (the OTHER file's rows have real amounts), so `compare`
+      // fails on a group-value mismatch instead of silently passing.
+      val catRowsWithAvgNull = catRows :+ ((7, 77, "avgnull", BigDecimal(1.23)))
+      val catDimWithAvgNull = catRowsWithAvgNull.toDF("cat_key", "major", "brand", "listPrice")
+        .withColumn("listPrice", col("listPrice").cast(DecimalType(7, 2)))
+      val avgNullPath = tempDir.resolve("data-avg-null-part").toString
+      writeAvgSplitDataset(spark, avgNullPath, rowsInPart = 200, amountNull = true)
+      val avgNullFile = singlePartFile(avgNullPath)
+      val avgValuePath = tempDir.resolve("data-avg-value-part").toString
+      writeAvgSplitDataset(spark, avgValuePath, rowsInPart = 200, amountNull = false)
+      val avgValueFile = singlePartFile(avgValuePath)
+      compare("cross-partition-avg-null", Seq(avgNullFile, avgValueFile), catDimWithAvgNull, regionDim)
+
+      // Case E: an unsupported dimension attribute type (DoubleType) must
+      // throw driver-side, at doExecute(), NOT route into the
+      // whole-operator CPU fallback -- that fallback's attributeValue()
+      // would otherwise crash with an unhandled IllegalStateException deep
+      // inside an executor task the first time it tried to key its hash
+      // map by that value, which is a much worse failure mode than a clear
+      // driver-side throw naming the offending type.
+      val badAttributeDim = Seq((1, 1.5d)).toDF("cat_key", "badAttr")
+      val badOutputAttributes = Seq(
+        AttributeReference("badAttr", DoubleType, nullable = true)(),
+        AttributeReference("countStar", LongType, nullable = false)())
+      val badAggSpecs = Seq(GroupedAggregateShape.AggSpec(
+        "count", GroupedAggregateShape.CountStar, unscaled = false, sumDataType = LongType))
+      val badExec = MetalParquetGroupedAggregateExec(
+        badOutputAttributes, Seq(mainFile), Seq("cat_key"), Seq.empty, badAggSpecs, Seq((0, 0)),
+        Seq(badAttributeDim.queryExecution.executedPlan), nativeLibrary, metalLibrary)
+      val threwIllegalState = try {
+        badExec.execute()
+        false
+      } catch {
+        case _: IllegalStateException => true
+      }
+      println(s"""{"mode":"agg-exec","case":"unsupported-attribute-type-throws","threw":$threwIllegalState}""")
+      require(threwIllegalState,
+        "expected an unsupported dimension attribute type to throw IllegalStateException at doExecute(), " +
+          "not fall back or silently succeed")
     } finally {
       spark.stop()
     }
+  }
+
+  /**
+   * One partition-sized file for the cross-partition avg-null regression
+   * case: every row is cat_key = 7 / region_key = 10 (both guaranteed
+   * matches), quantity always non-null, and amount either ALWAYS null
+   * (`amountNull = true`) or always non-null (`amountNull = false`).
+   */
+  private def writeAvgSplitDataset(
+      spark: SparkSession, path: String, rowsInPart: Int, amountNull: Boolean): Unit = {
+    val base = spark.range(rowsInPart)
+      .selectExpr("id", "CAST(7 AS INT) AS cat_key", "CAST(10 AS INT) AS region_key")
+      .withColumn("quantity", expr("CAST(pmod(id, 10) + 1 AS INT)"))
+    val withAmount =
+      if (amountNull) base.withColumn("amount", expr("CAST(NULL AS INT)"))
+      else base.withColumn("amount", expr("CAST(500 + pmod(id, 20) AS INT)"))
+    withAmount.drop("id").coalesce(1).write.mode("errorifexists").parquet(path)
   }
 
   // Task 5: drive MetalParquetMembershipCountExec directly (it is not yet

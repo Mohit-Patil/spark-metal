@@ -82,6 +82,19 @@ case class MetalParquetGroupedAggregateExec(
   require(measureColumnNames.length <= 4,
     s"MetalParquetGroupedAggregateExec supports at most 4 measure columns, got ${measureColumnNames.length}")
   require(aggSpecs.nonEmpty, "MetalParquetGroupedAggregateExec requires at least one aggregate")
+  groupKeyDimensionIndex.foreach { case (dimensionIndex, attributeIndex) =>
+    require(dimensionIndex >= 0 && dimensionIndex < keyColumnNames.length,
+      s"groupKeyDimensionIndex entry ($dimensionIndex, $attributeIndex): dimension index out of range " +
+        s"[0, ${keyColumnNames.length})")
+    // keyPlans' output schema is resolved at construction time (before any
+    // execution), so the attribute index can be validated up front too --
+    // ordinal 0 of a keyPlan's output is the join key, ordinals 1.. are its
+    // group-key attributes (see collectDimensions).
+    val attributeCount = keyPlans(dimensionIndex).output.length - 1
+    require(attributeIndex >= 0 && attributeIndex < attributeCount,
+      s"groupKeyDimensionIndex entry ($dimensionIndex, $attributeIndex): attribute index out of range " +
+        s"[0, $attributeCount) for dimension $dimensionIndex")
+  }
 
   private val DictionaryEncodings: Set[Encoding] = Set(Encoding.PLAIN_DICTIONARY, Encoding.RLE_DICTIONARY)
 
@@ -108,6 +121,12 @@ case class MetalParquetGroupedAggregateExec(
     val dimensionTime = longMetric("dimensionTime")
     val (dimensions, dimensionNanos) = collectDimensions()
     dimensionTime += dimensionNanos / 1000000
+    // Captured once, on the driver, for BOTH execution paths: a dimension's
+    // OWN attribute types (not outputAttributes' declared types) are what a
+    // dimension's attribute row was actually encoded with (UnsafeProjection
+    // in collectDimensions), so reading it back must use the SAME types --
+    // outputAttributes is validated for arity only (see the require below).
+    val dimensionAttributeTypes: Seq[Seq[DataType]] = dimensions.map(_.attributeTypes)
 
     val (aggKinds, aggMeasureSlots, aggSlotMappings, occupancySlot) =
       MetalParquetGroupedAggregateExec.buildInternalAggPlan(aggSpecs, measureColumnNames)
@@ -134,11 +153,27 @@ case class MetalParquetGroupedAggregateExec(
     builtEither match {
       case Right(built) =>
         numGroups += built.groupCount
-        executeWithGroupSpace(built, aggKinds, aggMeasureSlots, aggSlotMappings, occupancySlot, internalAggCount)
+        executeWithGroupSpace(
+          built, dimensionAttributeTypes, aggKinds, aggMeasureSlots, aggSlotMappings, occupancySlot,
+          internalAggCount)
+      // An unsupported dimension attribute type is a planning defect, not a
+      // runtime data condition: GroupedAggregateShape/Task 6's matcher is
+      // expected to reject any such region before this operator is ever
+      // constructed, so this throws driver-side (loudly, at doExecute time)
+      // rather than routing into the whole-operator CPU fallback, which
+      // would otherwise crash INSIDE an executor task the first time
+      // attributeValue() hit the same unsupported type (IllegalStateException
+      // from deep inside a Spark task is a much worse failure mode than a
+      // clear driver-side throw naming the type).
+      case Left(reason) if reason.contains("unsupported attribute type") =>
+        throw new IllegalStateException(
+          s"MetalParquetGroupedAggregateExec: GroupSpace.build rejected a dimension attribute type " +
+            s"($reason) -- this should have been rejected at planning time, not reached construction")
       case Left(reason) =>
         logWarning(s"MetalParquetGroupedAggregateExec: GroupSpace.build rejected the dimensions " +
           s"($reason); falling back to a whole-operator CPU hash-join + hash-aggregate")
-        executeWholeOperatorCpuFallback(dimensions, aggKinds, aggMeasureSlots, aggSlotMappings, occupancySlot)
+        executeWholeOperatorCpuFallback(
+          dimensions, dimensionAttributeTypes, aggKinds, aggMeasureSlots, aggSlotMappings, occupancySlot)
     }
   }
 
@@ -205,6 +240,7 @@ case class MetalParquetGroupedAggregateExec(
 
   private def executeWithGroupSpace(
       built: GroupSpace.Built,
+      dimensionAttributeTypes: Seq[Seq[DataType]],
       aggKinds: Array[Int],
       aggMeasureSlots: Array[Int],
       aggSlotMappings: Seq[AggSlotMapping],
@@ -224,7 +260,6 @@ case class MetalParquetGroupedAggregateExec(
     val totalCells = groupCount * internalAggCount
 
     splitRDD.mapPartitions { splitIterator =>
-      val partitionStarted = System.nanoTime()
       SparkMetalNative.ensureInitialized(nativeLibrary, metalLibrary)
       val splitsInPartition = splitIterator.toArray
       val readers = mutable.Map.empty[String, ParquetFileReader]
@@ -243,13 +278,29 @@ case class MetalParquetGroupedAggregateExec(
       var localFallbacks = 0L
       var parseNanos = 0L
       var metalNanos = 0L
-      val cpuFallbackBuffer = new Array[Long](totalCells)
+      // Allocated lazily -- only once this partition actually needs a
+      // per-row-group CPU fallback -- since eagerly allocating it up front
+      // would cost up to groupCount * internalAggCount * 8 bytes (as much
+      // as 32MB, half the 64MB budget check's own ceiling) on the common
+      // path where every row group decodes cleanly on the GPU.
+      var cpuFallbackBuffer: Array[Long] = null
+      def cpuFallback(): Array[Long] = {
+        if (cpuFallbackBuffer == null) cpuFallbackBuffer = new Array[Long](totalCells)
+        cpuFallbackBuffer
+      }
 
-      val preparedHandle = NativeBridge.prepareMembershipCount3(Array(1), Array(1), Array(1))
-      val streamHandle = NativeBridge.membershipCount3StreamBegin(preparedHandle)
+      var preparedHandle = 0L
+      var streamHandle = 0L
       var streamFinished = false
       var gpuBuffer: Array[Long] = null
       try {
+        // preparedHandle/streamHandle acquisition lives INSIDE this try (not
+        // before it) so that a throw from membershipCount3StreamBegin --
+        // after prepareMembershipCount3 already succeeded -- still reaches
+        // the outer finally's release rather than leaking the prepared
+        // handle.
+        preparedHandle = NativeBridge.prepareMembershipCount3(Array(1), Array(1), Array(1))
+        streamHandle = NativeBridge.membershipCount3StreamBegin(preparedHandle)
         try {
           splitsInPartition.foreach { split =>
             val reader = readerFor(split.file)
@@ -286,6 +337,14 @@ case class MetalParquetGroupedAggregateExec(
                   streamHandle, rowGroupHandle, codeTables, factorTables, groupCount,
                   aggMeasureSlots, aggKinds)
                 metalNanos += System.nanoTime() - metalStarted
+                // The handle is consumed by a successful Aggregate call --
+                // clear it immediately so that if pageReadStore.close()
+                // (below, in this same finally) throws, the catch block
+                // does not release an already-consumed handle (a
+                // use-after-free) AND does not double-count this row group
+                // by recomputing it on the CPU on top of its already-landed
+                // GPU contribution.
+                rowGroupHandle = 0L
                 localRowGroups += 1
               } finally {
                 pageReadStore.close()
@@ -295,10 +354,10 @@ case class MetalParquetGroupedAggregateExec(
                 // The native decoder rejected a page (or some other runtime
                 // surprise) partway through this row group. The handle is
                 // consumed by parquetRowGroupAggregate ONLY on success, so a
-                // handle that was actually opened here must be released
-                // explicitly; pages already fed to the failed GPU pass
-                // cannot be re-read, so the CPU recompute uses a fresh
-                // PageReadStore.
+                // handle that was actually opened here but not yet consumed
+                // (rowGroupHandle != 0L) must be released explicitly; pages
+                // already fed to the failed GPU pass cannot be re-read, so
+                // the CPU recompute uses a fresh PageReadStore.
                 logWarning(s"Row group ${split.file}#${split.rowGroupIndex} fell back to CPU", e)
                 if (rowGroupHandle != 0L) {
                   NativeBridge.parquetRowGroupRelease(rowGroupHandle)
@@ -309,7 +368,7 @@ case class MetalParquetGroupedAggregateExec(
                 try {
                   aggregateRowGroupOnCpu(
                     freshStore, schema, keyDescriptors, measureDescriptors,
-                    built.codesByKey, built.factorsByKey, aggKinds, aggMeasureSlots, cpuFallbackBuffer)
+                    built.codesByKey, built.factorsByKey, aggKinds, aggMeasureSlots, cpuFallback())
                 } finally {
                   freshStore.close()
                 }
@@ -324,13 +383,15 @@ case class MetalParquetGroupedAggregateExec(
           gpuBuffer = NativeBridge.parquetAggregateStreamFinish(streamHandle)
           metalNanos += System.nanoTime() - finishStarted
         } finally {
-          if (!streamFinished) {
+          if (streamHandle != 0L && !streamFinished) {
             NativeBridge.parquetAggregateStreamAbort(streamHandle)
           }
         }
       } finally {
         readers.values.foreach(_.close())
-        NativeBridge.releaseMembershipCount3(preparedHandle)
+        if (preparedHandle != 0L) {
+          NativeBridge.releaseMembershipCount3(preparedHandle)
+        }
         metalTime += metalNanos / 1000000
         decodeParseTime += parseNanos / 1000000
         numRowGroups += localRowGroups
@@ -338,28 +399,40 @@ case class MetalParquetGroupedAggregateExec(
         cpuFallbackRowGroups += localFallbacks
       }
 
-      // gpuBuffer is zero-length when every row group in this partition fell
-      // back to the CPU (parquetAggregateStreamFinish never saw a
-      // successful Aggregate call); either way, add the CPU-fallback
-      // contributions on top, since a group's total is genuinely the sum
-      // of whatever rows reached it via either path.
-      val combined = new Array[Long](totalCells)
-      if (gpuBuffer != null && gpuBuffer.length == totalCells) {
-        var i = 0
-        while (i < totalCells) {
-          combined(i) = gpuBuffer(i) + cpuFallbackBuffer(i)
-          i += 1
+      // parquetAggregateStreamFinish's contract: zero-length iff no row
+      // group ever reached a successful Aggregate call on this stream,
+      // otherwise exactly groupCount * internalAggCount. Anything else
+      // would mean the native/JVM group-space size agreement was violated
+      // -- a real corruption bug, not a legitimate runtime condition, so it
+      // is a hard `require` rather than a silently-tolerated branch.
+      require(gpuBuffer != null, "parquetAggregateStreamFinish returned null unexpectedly")
+      val resultBuffer: Array[Long] =
+        if (gpuBuffer.length == totalCells) {
+          // Combine in place into gpuBuffer (a fresh array this task
+          // exclusively owns) instead of allocating a third same-sized
+          // array -- cpuFallbackBuffer is the only other one, and it is
+          // itself allocated only when actually needed (see cpuFallback()).
+          if (cpuFallbackBuffer != null) {
+            var i = 0
+            while (i < totalCells) {
+              gpuBuffer(i) += cpuFallbackBuffer(i)
+              i += 1
+            }
+          }
+          gpuBuffer
+        } else {
+          require(gpuBuffer.isEmpty,
+            s"parquetAggregateStreamFinish returned length ${gpuBuffer.length}, expected 0 or $totalCells")
+          if (cpuFallbackBuffer != null) cpuFallbackBuffer else new Array[Long](totalCells)
         }
-      } else {
-        System.arraycopy(cpuFallbackBuffer, 0, combined, 0, totalCells)
-      }
 
       val outputRows = mutable.ArrayBuffer.empty[InternalRow]
       var g = 0
       while (g < groupCount) {
         val base = g * internalAggCount
-        if (combined(base + occupancySlot) > 0L) {
-          outputRows += buildOutputRow(built.groupTuples(g), combined, base, aggSlotMappings)
+        if (resultBuffer(base + occupancySlot) > 0L) {
+          outputRows += buildOutputRow(
+            built.groupTuples(g), dimensionAttributeTypes, resultBuffer, base, aggSlotMappings)
         }
         g += 1
       }
@@ -605,6 +678,7 @@ case class MetalParquetGroupedAggregateExec(
    */
   private def executeWholeOperatorCpuFallback(
       dimensions: Seq[GroupSpace.Dimension],
+      dimensionAttributeTypes: Seq[Seq[DataType]],
       aggKinds: Array[Int],
       aggMeasureSlots: Array[Int],
       aggSlotMappings: Seq[AggSlotMapping],
@@ -617,7 +691,6 @@ case class MetalParquetGroupedAggregateExec(
     val dimensionMultimaps: Seq[Map[Int, IndexedSeq[InternalRow]]] = dimensions.map { dimension =>
       dimension.rows.groupBy(_._1).view.mapValues(_.map(_._2).toIndexedSeq).toMap
     }
-    val dimensionAttributeTypes: Seq[Seq[DataType]] = dimensions.map(_.attributeTypes)
 
     val splits = enumerateSplits()
     val numPartitions = math.max(1, math.min(splits.length, sparkContext.defaultParallelism))
@@ -669,7 +742,7 @@ case class MetalParquetGroupedAggregateExec(
       // GPU path's dense, pre-sized array, which can hold never-touched
       // groups).
       val outputRows = groupMap.values.map { case (attributeRows, buffer) =>
-        buildOutputRow(attributeRows, buffer, 0, aggSlotMappings)
+        buildOutputRow(attributeRows, dimensionAttributeTypes, buffer, 0, aggSlotMappings)
       }.toArray
       numOutputRows += outputRows.length
       outputRows.iterator
@@ -776,8 +849,10 @@ case class MetalParquetGroupedAggregateExec(
    * [[GroupSpace.attributeValue]] (which is private to that object): this
    * is the SAME dispatch, needed here both to key the whole-operator CPU
    * fallback's hash map and to read a dimension attribute back out for
-   * output-row construction (using `outputAttributes`' declared type, which
-   * Task 6 constructs to match the dimension's own attribute type).
+   * output-row construction -- ALWAYS with the dimension's OWN attribute
+   * type (`dimensionAttributeTypes`), never `outputAttributes`' declared
+   * type (see `buildOutputRow`'s doc for why the two must not be
+   * conflated).
    */
   private def attributeValue(row: InternalRow, ordinal: Int, dataType: DataType): Any = {
     if (row.isNullAt(ordinal)) {
@@ -823,17 +898,38 @@ case class MetalParquetGroupedAggregateExec(
 
   /**
    * Builds one partial output row for an occupied group: group-key values
-   * (per `groupKeyDimensionIndex`, reading `outputAttributes`' declared
-   * type off the matching dimension's attribute row) followed by, per
-   * `aggSlotMappings` in order, each aggregate's user-visible buffer
-   * value(s) -- one column for sum/count, two (sum, count) for avg's
-   * unevaluated partial buffer. `buffer`/`base` let the same function serve
-   * both the GPU path's dense `groupCount * internalAggCount` array (one
-   * group's window starts at `base`) and the whole-operator CPU fallback's
-   * per-group `Array[Long]` (`base == 0`).
+   * (per `groupKeyDimensionIndex`, reading the DIMENSION's own attribute
+   * type -- `dimensionAttributeTypes`, NOT `outputAttributes`' declared
+   * type -- off the matching dimension's attribute row; a dimension's
+   * attribute row was encoded with its own type in `collectDimensions`, and
+   * `UnsafeRow.getDecimal(ordinal, precision, scale)` decodes differently
+   * depending on the precision/scale it is told, so reading it back with a
+   * mismatched type would silently corrupt the value. `outputAttributes` is
+   * used for arity only (validated in `doExecute`), never for how to READ a
+   * dimension attribute) followed by, per `aggSlotMappings` in order, each
+   * aggregate's user-visible buffer value(s) -- one column for sum/count,
+   * two (sum, count) for avg's unevaluated partial buffer.
+   *
+   * CRITICAL: avg's sum component must NEVER be null. Spark's
+   * `Average.initialValues` is `(0, 0L)` (zero, not null) and its
+   * `mergeExpressions` is a plain, NON-coalescing `Add` -- so a null
+   * avg-sum emitted by one partition would poison the merged sum to null
+   * across every other partition's real contribution once Spark's own
+   * downstream final aggregate merges them, even though this group's true
+   * answer is non-null. `sum`'s buffer, by contrast, genuinely starts null
+   * and its merge DOES coalesce, so only `sum` keeps the
+   * null-iff-non-null-count-is-zero gate; `avg` always emits its exact
+   * int64 sum (0 when its paired count is 0, matching `Average`'s initial
+   * value exactly).
+   *
+   * `buffer`/`base` let the same function serve both the GPU path's dense
+   * `groupCount * internalAggCount` array (one group's window starts at
+   * `base`) and the whole-operator CPU fallback's per-group `Array[Long]`
+   * (`base == 0`).
    */
   private def buildOutputRow(
       dimensionAttributeRows: Array[InternalRow],
+      dimensionAttributeTypes: Seq[Seq[DataType]],
       buffer: Array[Long],
       base: Int,
       aggSlotMappings: Seq[AggSlotMapping]): InternalRow = {
@@ -842,7 +938,8 @@ case class MetalParquetGroupedAggregateExec(
     while (k < groupKeyDimensionIndex.length) {
       val (dimensionIndex, attributeIndex) = groupKeyDimensionIndex(k)
       values(k) = attributeValue(
-        dimensionAttributeRows(dimensionIndex), attributeIndex, outputAttributes(k).dataType)
+        dimensionAttributeRows(dimensionIndex), attributeIndex,
+        dimensionAttributeTypes(dimensionIndex)(attributeIndex))
       k += 1
     }
     var outputIndex = groupKeyDimensionIndex.length
@@ -851,15 +948,20 @@ case class MetalParquetGroupedAggregateExec(
         case "count" =>
           values(outputIndex) = buffer(base + mapping.countSlot)
           outputIndex += 1
-        case "sum" | "avg" =>
+        case "sum" =>
           val nonNull = buffer(base + mapping.countSlot) > 0L
           values(outputIndex) =
             if (nonNull) convertSum(buffer(base + mapping.sumSlot), outputAttributes(outputIndex).dataType) else null
           outputIndex += 1
-          if (mapping.function == "avg") {
-            values(outputIndex) = buffer(base + mapping.countSlot)
-            outputIndex += 1
-          }
+        case "avg" =>
+          // Unconditional -- see the CRITICAL note above. buffer(sumSlot)
+          // is already exactly 0 when the paired count is 0 (an
+          // accumulator that was never added to), matching
+          // Average.initialValues's (0, 0L) precisely.
+          values(outputIndex) = convertSum(buffer(base + mapping.sumSlot), outputAttributes(outputIndex).dataType)
+          outputIndex += 1
+          values(outputIndex) = buffer(base + mapping.countSlot)
+          outputIndex += 1
       }
     }
     new GenericInternalRow(values)

@@ -1456,7 +1456,8 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetDecodePage(
             [encoder setBuffer:rowGroup->ids[column] offset:0 atIndex:2];
             [encoder setBytes:&params length:sizeof(params) atIndex:3];
             [encoder dispatchThreadgroups:MTLSizeMake(runs.items.size(), 1, 1)
-                     threadsPerThreadgroup:MTLSizeMake(sparkmetal::kDecodeChunk, 1, 1)];
+                     threadsPerThreadgroup:MTLSizeMake(
+                         sparkmetal::decodeThreadgroupWidth(runs.maxItemCount), 1, 1)];
         } else {
             rowGroup->columnHasNulls[column] = true;
             size_t valuesBytes = std::max<size_t>(
@@ -1488,7 +1489,8 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetDecodePage(
                 [encoder setBuffer:valuesBuffer offset:0 atIndex:2];
                 [encoder setBytes:&expandParams length:sizeof(expandParams) atIndex:3];
                 [encoder dispatchThreadgroups:MTLSizeMake(runs.items.size(), 1, 1)
-                         threadsPerThreadgroup:MTLSizeMake(sparkmetal::kDecodeChunk, 1, 1)];
+                         threadsPerThreadgroup:MTLSizeMake(
+                             sparkmetal::decodeThreadgroupWidth(runs.maxItemCount), 1, 1)];
             }
 
             id<MTLBuffer> segmentsBuffer = acquireStagingBuffer(
@@ -1514,7 +1516,8 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetDecodePage(
             [encoder setBuffer:rowGroup->validity[column] offset:0 atIndex:3];
             [encoder setBytes:&scatterParams length:sizeof(scatterParams) atIndex:4];
             [encoder dispatchThreadgroups:MTLSizeMake(runs.segments.size(), 1, 1)
-                     threadsPerThreadgroup:MTLSizeMake(sparkmetal::kDecodeChunk, 1, 1)];
+                     threadsPerThreadgroup:MTLSizeMake(
+                         sparkmetal::decodeThreadgroupWidth(runs.maxSegmentCount), 1, 1)];
         }
 
         // No endEncoding / commit here: the encoder stays open for the next

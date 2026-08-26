@@ -65,9 +65,16 @@ for name, cpu_result in cpu["queries"].items():
         "metal_median_seconds": metal_result["median_seconds"],
         "speedup": speedup,
         "result_match": matches,
-        "metal_operator_present": "MetalFusedMembershipCount" in open(
-            f"{sys.argv[2].rsplit('/', 1)[0]}/{name}-plan.txt", encoding="utf-8"
-        ).read(),
+        # Either membership-count operator counts: the GPU Parquet scan
+        # (MetalParquetMembershipCount) replaces the fused one wherever the
+        # fact-side scan is eligible, so hardcoding the fused name reported a
+        # false negative for every accelerated plan that used the Parquet path.
+        "metal_operator_present": any(
+            operator in open(
+                f"{sys.argv[2].rsplit('/', 1)[0]}/{name}-plan.txt", encoding="utf-8"
+            ).read()
+            for operator in ("MetalFusedMembershipCount", "MetalParquetMembershipCount")
+        ),
         "accelerator_metrics": metal_result.get("accelerator_metrics", {}),
     }
     comparison["all_results_match"] &= matches

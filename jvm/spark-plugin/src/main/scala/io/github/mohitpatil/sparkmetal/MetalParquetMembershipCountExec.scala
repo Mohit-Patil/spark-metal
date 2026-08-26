@@ -144,8 +144,18 @@ case class MetalParquetMembershipCountExec(
       val readers = mutable.Map.empty[String, ParquetFileReader]
 
       def readerFor(file: String): ParquetFileReader =
-        readers.getOrElseUpdate(file, ParquetFileReader.open(HadoopInputFile.fromPath(
-          new Path(file), MetalParquetMembershipCountExec.sharedConfiguration)))
+        readers.getOrElseUpdate(file, {
+          val opened = ParquetFileReader.open(HadoopInputFile.fromPath(
+            new Path(file), MetalParquetMembershipCountExec.sharedConfiguration))
+          // Without this, readRowGroup pulls EVERY column chunk of the row
+          // group off disk -- all 23 columns of store_sales when this operator
+          // reads 3 -- because a reader opened without a projection requests
+          // the whole file schema. On TPC-DS SF10 that was ~88ms per task of
+          // pure wasted I/O against a ~200ms CPU query.
+          opened.setRequestedSchema(columnDescriptors(
+            file, opened.getFooter.getFileMetaData.getSchema).asJava)
+          opened
+        })
 
       try {
         val streamHandle =
@@ -155,10 +165,7 @@ case class MetalParquetMembershipCountExec(
           splitsInPartition.foreach { split =>
             val reader = readerFor(split.file)
             val schema = reader.getFooter.getFileMetaData.getSchema
-            val descriptors = columnNames.map { name =>
-              schema.getColumns.asScala.find(_.getPath()(0) == name)
-                .getOrElse(throw new RuntimeException(s"${split.file}: missing column $name"))
-            }
+            val descriptors = columnDescriptors(split.file, schema)
 
             if (streamHandle != 0L) {
               var rowGroupHandle = 0L
@@ -415,17 +422,30 @@ case class MetalParquetMembershipCountExec(
     }
   }
 
-  private def footerSplits(
-      file: String, configuration: Configuration): Seq[ParquetMembershipSplit] = {
-    val reader = ParquetFileReader.open(HadoopInputFile.fromPath(new Path(file), configuration))
-    try {
-      reader.getFooter.getBlocks.asScala.zipWithIndex.map { case (block, index) =>
-        ParquetMembershipSplit(file, index, block.getRowCount)
-      }.toSeq
-    } finally {
-      reader.close()
+  /** Resolves this operator's three key columns in one file's schema. */
+  private def columnDescriptors(file: String, schema: MessageType): Seq[ColumnDescriptor] =
+    columnNames.map { name =>
+      schema.getColumns.asScala.find(_.getPath()(0) == name)
+        .getOrElse(throw new RuntimeException(s"$file: missing column $name"))
     }
-  }
+
+  /**
+   * One file's row groups, memoised across executions like the eligibility
+   * verdict next to it and invalidated the same way -- planning re-reads these
+   * footers for every execution of every query over the same files.
+   */
+  private def footerSplits(
+      file: String, configuration: Configuration): Seq[ParquetMembershipSplit] =
+    ParquetEligibility.cachedByFileVersion(file) {
+      val reader = ParquetFileReader.open(HadoopInputFile.fromPath(new Path(file), configuration))
+      try {
+        reader.getFooter.getBlocks.asScala.zipWithIndex.map { case (block, index) =>
+          ParquetMembershipSplit(file, index, block.getRowCount)
+        }.toSeq
+      } finally {
+        reader.close()
+      }
+    }
 
   override protected def withNewChildrenInternal(newChildren: IndexedSeq[SparkPlan]): SparkPlan =
     copy(keyPlans = newChildren)
@@ -440,5 +460,5 @@ private[sparkmetal] object MetalParquetMembershipCountExec {
    * thread-safe for mutation, but nothing here mutates it, and parquet-mr only
    * reads from it.
    */
-  lazy val sharedConfiguration: Configuration = new Configuration()
+  def sharedConfiguration: Configuration = ParquetEligibility.sharedConfiguration
 }

@@ -77,6 +77,45 @@ int main() {
     std::vector<int32_t> values2; expand(runs2, page2, values2);
     for (uint32_t i = 0; i < 12; ++i) assert(values2[i] == int32_t(i & 1));
 
+    // Bit-packed *definition* levels with scattered nulls -- the shape real
+    // data takes (TPC-DS store_sales) and the one the transition-scanning
+    // expansion in parseDataPageV1 exists for. 9 groups = 72 rows:
+    //   byte 0xFF -> rows 0-7 defined
+    //   byte 0xEB -> 1,1,0,1,0,1,1,1 (LSB first) for rows 8-15
+    //   byte 0x00 -> rows 16-23 null
+    //   6x 0xFF   -> rows 24-71 defined
+    // The first window therefore has to stop at a transition 10 bits in, later
+    // ones start mid-byte, and the last spans 48 bits of a short (6-byte)
+    // window -- covering every branch of the window walk.
+    std::vector<uint8_t> def4;
+    appendUleb(def4, (9 << 1) | 1);
+    def4.push_back(0xFF); def4.push_back(0xEB); def4.push_back(0x00);
+    for (int i = 0; i < 6; ++i) def4.push_back(0xFF);
+    std::vector<uint8_t> page4;
+    page4.push_back(uint8_t(def4.size())); page4.push_back(0); page4.push_back(0); page4.push_back(0);
+    page4.insert(page4.end(), def4.begin(), def4.end());
+    page4.push_back(2);                                    // value bit width
+    appendUleb(page4, 62 << 1); page4.push_back(3);        // RLE 62 x id 3
+    size_t page4Length = page4.size(); pad(page4);
+    PageRuns runs4;
+    assert(parseDataPageV1(page4.data(), page4Length, 72, true, runs4));
+    assert(!runs4.allValid && runs4.nonNullCount == 62);
+    const uint32_t expectedRows[7]   = {0, 10, 11, 12, 13, 16, 24};
+    const uint32_t expectedCounts[7] = {10, 1, 1, 1, 3, 8, 48};
+    const uint32_t expectedValid[7]  = {1, 0, 1, 0, 1, 0, 1};
+    const uint32_t expectedValueStarts[7] = {0, 0, 10, 0, 11, 0, 14};
+    assert(runs4.segments.size() == 7);
+    for (uint32_t s = 0; s < 7; ++s) {
+        assert(runs4.segments[s].rowStart == expectedRows[s]);
+        assert(runs4.segments[s].count == expectedCounts[s]);
+        assert(runs4.segments[s].valid == expectedValid[s]);
+        if (runs4.segments[s].valid) {
+            assert(runs4.segments[s].valueStart == expectedValueStarts[s]);
+        }
+    }
+    std::vector<int32_t> values4; expand(runs4, page4, values4);
+    for (uint32_t i = 0; i < 62; ++i) assert(values4[i] == 3);
+
     // Unsupported: bit width > 24 must be rejected.
     std::vector<uint8_t> page3(page2); page3[4 + def2.size()] = 30;
     PageRuns runs3;

@@ -19,8 +19,14 @@ xcrun -sdk macosx metal \
 xcrun -sdk macosx metallib \
   "${build_root}/kernels.air" \
   -o "${build_root}/kernels.metallib"
+# -O2 is not optional. Without an -O flag clang defaults to -O0, and the JNI
+# bridge does real CPU work per Parquet page (parseDataPageV1's run walk).
+# Unoptimized, that walk cost ~300us per 20k-value page -- roughly 35-50ns for
+# every vector push_back -- and made up 95% of the GPU decode path's per-task
+# time on TPC-DS SF10 q96.
 xcrun clang++ \
   -std=c++17 \
+  -O2 \
   -fobjc-arc \
   -dynamiclib \
   -framework Foundation \

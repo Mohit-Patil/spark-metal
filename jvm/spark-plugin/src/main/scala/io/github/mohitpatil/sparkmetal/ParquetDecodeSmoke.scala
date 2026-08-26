@@ -12,9 +12,9 @@ import org.apache.parquet.column.page.DataPageV1
 import org.apache.parquet.hadoop.ParquetFileReader
 import org.apache.parquet.hadoop.util.HadoopInputFile
 
-import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.{Row, SparkSession}
 import org.apache.spark.sql.catalyst.expressions.AttributeReference
-import org.apache.spark.sql.types.LongType
+import org.apache.spark.sql.types.{IntegerType, LongType, StructField, StructType}
 
 // Round-trips a dictionary-encoded Parquet file through the CPU page parser
 // and the GPU expansion kernels, then checks the decoded (dictionary id,
@@ -336,7 +336,9 @@ object ParquetDecodeSmoke {
           files: Seq[String],
           keyValues: Seq[Int],
           minRowGroups: Option[Int] = None,
-          minFiles: Option[Int] = None): Unit = {
+          minFiles: Option[Int] = None,
+          minCpuFallbackRowGroups: Option[Int] = None,
+          requirePartialFallback: Boolean = false): Unit = {
         val dim0 = keyValues.toDF("k0j")
         val dim1 = keyValues.toDF("k1j")
         val dim2 = keyValues.toDF("k2j")
@@ -366,6 +368,7 @@ object ParquetDecodeSmoke {
         // as part of that action, so this reflects the total across every
         // partition/row-group this run touched.
         val observedRowGroups = exec.metrics("numRowGroups").value
+        val observedCpuFallbacks = exec.metrics("cpuFallbackRowGroups").value
 
         val fact = spark.read.parquet(files: _*).select("k0", "k1", "k2")
         val expectedCount = fact
@@ -376,8 +379,8 @@ object ParquetDecodeSmoke {
 
         println(
           s"""{"mode":"exec","case":"$caseName","rows":$rows,"files":${files.length},""" +
-            s""""numRowGroups":$observedRowGroups,"expectedCount":$expectedCount,""" +
-            s""""actualCount":$actualCount}""")
+            s""""numRowGroups":$observedRowGroups,"cpuFallbackRowGroups":$observedCpuFallbacks,""" +
+            s""""expectedCount":$expectedCount,"actualCount":$actualCount}""")
         require(expectedCount > 0, s"$caseName: expected join count must be non-zero")
         require(actualCount == expectedCount,
           s"$caseName: MetalParquetMembershipCountExec count $actualCount did not match " +
@@ -388,6 +391,15 @@ object ParquetDecodeSmoke {
         }
         minFiles.foreach { min =>
           require(files.length >= min, s"$caseName: expected files >= $min, got ${files.length}")
+        }
+        minCpuFallbackRowGroups.foreach { min =>
+          require(observedCpuFallbacks >= min,
+            s"$caseName: expected cpuFallbackRowGroups >= $min, observed $observedCpuFallbacks")
+        }
+        if (requirePartialFallback) {
+          require(observedCpuFallbacks > 0 && observedCpuFallbacks < observedRowGroups,
+            s"$caseName: expected a MIX of CPU fallback and GPU-successful row groups, " +
+              s"observed $observedCpuFallbacks of $observedRowGroups on CPU")
         }
       }
 
@@ -434,6 +446,14 @@ object ParquetDecodeSmoke {
       // loop's multiple-splits-per-file path (same cached ParquetFileReader,
       // several readRowGroup(index) calls in sequence) the way SF10-shaped
       // data from other writers could.
+      // NOTE: this dataset's row groups turn out to fall back to the CPU
+      // path themselves (parquet-mr abandons the dictionary for most/all
+      // chunks once parquet.block.size is this small -- see
+      // writeDictionaryOverflowDataset below for a much more direct,
+      // deterministic way to force that). That's fine here: this layout's
+      // job is only to prove the multi-row-group-in-one-file split-planning
+      // and reader-reuse path works and the total still matches, regardless
+      // of which path each row group takes.
       val pathMultiRowGroup = tempDir.resolve("data-multi-rowgroup").toString
       writeDataset(spark, pathMultiRowGroup, rows, rowGroupBytes = Some(4096))
       val multiRowGroupFile = listParquetFiles(pathMultiRowGroup)
@@ -446,6 +466,99 @@ object ParquetDecodeSmoke {
       writeDataset(spark, pathMultiFile, rows, partitions = 3)
       val multiFiles = listParquetFiles(pathMultiFile)
       check("multi-file", multiFiles, memberLow to memberHigh, minFiles = Some(2))
+
+      // --- Layout D: required (non-nullable) columns, routed to the CPU
+      // fallback ------------------------------------------------------------
+      // countRowGroupOnCpu classified every row of a `required` column
+      // (maxDefinitionLevel == 0 -- planning-time eligibility admits this,
+      // not just optional maxDef == 1 columns) as null: it compared
+      // getCurrentDefinitionLevel() against the literal 0, but 0 is ALSO
+      // what a required column's reader always returns (it has no
+      // definition-level stream at all), so every row failed the "is this
+      // row null" check and the count silently came out 0. Writing this
+      // dataset via an explicit non-nullable StructType (rather than
+      // relying on Spark's CAST/pmod nullability inference, which is not
+      // guaranteed to propagate non-nullability all the way to the Parquet
+      // writer) and verifying the footer directly locks in that the
+      // dataset actually exercises maxDefinitionLevel == 0. The sparse key
+      // domain (the same trick as sparse-cpu-fallback) forces every row
+      // group through countRowGroupOnCpu -- the exact function that had the
+      // bug.
+      val pathRequired = tempDir.resolve("data-required").toString
+      writeRequiredColumnsDataset(spark, pathRequired, rows)
+      val requiredFile = listParquetFiles(pathRequired)
+      require(requiredFile.length == 1, s"expected exactly 1 part file under $pathRequired, got $requiredFile")
+      locally {
+        val verifyReader = ParquetFileReader.open(
+          HadoopInputFile.fromPath(new Path(requiredFile.head), new Configuration()))
+        try {
+          val columns = verifyReader.getFooter.getFileMetaData.getSchema.getColumns.asScala
+          val maxDefinitionLevels = Columns.map(name =>
+            columns.find(_.getPath()(0) == name).get.getMaxDefinitionLevel)
+          println(
+            s"""{"mode":"exec","case":"required-columns-schema-check",""" +
+              s""""maxDefinitionLevels":${maxDefinitionLevels.mkString("[", ",", "]")}}""")
+          require(maxDefinitionLevels.forall(_ == 0),
+            s"expected all 3 columns required (maxDefinitionLevel == 0), got $maxDefinitionLevels")
+        } finally {
+          verifyReader.close()
+        }
+      }
+      check(
+        "required-columns-cpu-fallback",
+        requiredFile,
+        (memberLow to memberHigh) :+ 20000000,
+        minCpuFallbackRowGroups = Some(1))
+
+      // --- Layout E: mid-run native GPU-decode failure, forcing the
+      // per-row-group catch -> parquetRowGroupRelease -> fresh readRowGroup
+      // -> countRowGroupOnCpu branch, with OTHER row groups in the same run
+      // still succeeding on the GPU -------------------------------------
+      // First attempt: make k0 low-cardinality everywhere except one narrow
+      // id band (raw, high-cardinality id values there), combined with a
+      // small parquet.block.size + parquet.dictionary.page.size, hoping
+      // parquet-mr would abandon the dictionary only for row groups
+      // overlapping that band. Empirically this was extremely sensitive to
+      // exact row counts, block-size checkpoint timing, and where the band
+      // landed relative to row-group boundaries: probing many
+      // (blockSize, dictSize) combinations swung between 0% and 100% of row
+      // groups losing their dictionary with no stable partial-overflow
+      // region, and shifting the row count or band position moved the
+      // cliff unpredictably. Not a reliable foundation for a regression
+      // test.
+      //
+      // Instead: two separate FILES. singleFile (already written and
+      // GPU-validated by the three checks above) contributes a row group
+      // that is guaranteed to decode on the GPU. A second file's k0 is the
+      // raw, strictly increasing `id` -- every value unique -- so its
+      // buffered dictionary size grows linearly and predictably with
+      // record count; parquet-mr's periodic size-check heuristic (which
+      // extrapolates the next checkpoint from the observed bytes/record)
+      // converges reliably onto the true growth rate for a genuinely
+      // unique-valued column, unlike the highly-compressible low-cardinality
+      // data elsewhere in this file, and so reliably catches and abandons
+      // the dictionary partway through -- deterministic regardless of exact
+      // row count, block size, or default parquet.block.size checkpoint
+      // timing. decodeRowGroupColumn's dictionaryPage == null check then
+      // throws for that file's row group (k0 is ordinal 0, so the failure
+      // happens before k1/k2 are ever touched), driving it through the CPU
+      // fallback while singleFile's row group stays on the GPU stream in
+      // the very same run -- unlike sparse-cpu-fallback/
+      // required-columns-cpu-fallback above, which force *every* row group
+      // to skip the GPU stream entirely via denseDomains = false.
+      val pathDictionaryOverflow = tempDir.resolve("data-dictionary-overflow").toString
+      writeDictionaryOverflowDataset(spark, pathDictionaryOverflow, rows)
+      val dictionaryOverflowFile = listParquetFiles(pathDictionaryOverflow)
+      require(dictionaryOverflowFile.length == 1,
+        s"expected exactly 1 part file under $pathDictionaryOverflow, got $dictionaryOverflowFile")
+      check(
+        "dictionary-overflow-cpu-fallback",
+        singleFile ++ dictionaryOverflowFile,
+        memberLow to memberHigh,
+        minRowGroups = Some(2),
+        minFiles = Some(2),
+        minCpuFallbackRowGroups = Some(1),
+        requirePartialFallback = true)
     } finally {
       spark.stop()
     }
@@ -507,6 +620,73 @@ object ParquetDecodeSmoke {
         if (previousBlockSize != null) hadoopConf.set("parquet.block.size", previousBlockSize)
         else hadoopConf.unset("parquet.block.size")
       }
+    }
+  }
+
+  /**
+   * All three columns `required` (non-nullable), with no null CAST anywhere
+   * in the row formula. Built from an explicit non-nullable StructType
+   * rather than relying on Spark's CAST/pmod nullability inference to
+   * propagate all the way to the Parquet writer's schema -- this guarantees
+   * maxDefinitionLevel == 0 for every column, which the exec-mode caller
+   * verifies directly against the written footer.
+   */
+  private def writeRequiredColumnsDataset(spark: SparkSession, path: String, rows: Int): Unit = {
+    val rowRdd = spark.sparkContext.range(0, rows).map { id =>
+      Row(
+        (((id % 900) + 50).toInt),
+        (((id % 850) + 50).toInt),
+        (((id % 700) + 50).toInt))
+    }
+    val schema = StructType(Seq(
+      StructField("k0", IntegerType, nullable = false),
+      StructField("k1", IntegerType, nullable = false),
+      StructField("k2", IntegerType, nullable = false)))
+    spark.createDataFrame(rowRdd, schema)
+      .coalesce(1)
+      .write
+      .option("parquet.page.size", "8192")
+      .mode("errorifexists").parquet(path)
+  }
+
+  /**
+   * k0 is the raw `id` value -- strictly increasing, so every row's value
+   * is unique. A genuinely unique-valued column's buffered dictionary size
+   * grows linearly and predictably with record count (unlike this file's
+   * suite's usual highly-compressible low-cardinality columns, where the
+   * bytes/record estimate used by parquet-mr's periodic size-check
+   * heuristic starts small and is a poor predictor of when a threshold
+   * will actually be crossed). That predictability is what makes this
+   * reliable: with a small parquet.dictionary.page.size, the periodic
+   * checkpoint the writer schedules converges quickly onto the true growth
+   * rate and is guaranteed to catch the threshold being crossed within a
+   * few thousand rows, so parquet-mr abandons the dictionary (falls back
+   * to PLAIN, writing no dictionary page at all) for k0's column chunk --
+   * deterministically, regardless of exact row count or block-size
+   * checkpoint timing. k1/k2 keep normal low-cardinality formulas and stay
+   * dictionary-encoded, but that doesn't matter for whether this file's row
+   * group succeeds: decodeRowGroupColumn processes k0 first (ordinal 0)
+   * and throws immediately once its dictionary page is missing, before k1/
+   * k2 are ever touched.
+   */
+  private def writeDictionaryOverflowDataset(spark: SparkSession, path: String, rows: Int): Unit = {
+    val hadoopConf = spark.sparkContext.hadoopConfiguration
+    val previousDictionarySize = hadoopConf.get("parquet.dictionary.page.size")
+    hadoopConf.setInt("parquet.dictionary.page.size", 4096)
+    try {
+      spark.range(rows)
+        .selectExpr(
+          "CAST(id AS INT) AS k0",
+          "CASE WHEN id % 17 = 0 THEN CAST(NULL AS INT) ELSE CAST(pmod(id, 850) + 50 AS INT) END AS k1",
+          "CASE WHEN id % 17 = 0 THEN CAST(NULL AS INT) ELSE CAST(pmod(id, 700) + 50 AS INT) END AS k2")
+        .coalesce(1)
+        .write
+        .option("parquet.page.size", "8192")
+        .option("parquet.dictionary.page.size", "4096")
+        .mode("errorifexists").parquet(path)
+    } finally {
+      if (previousDictionarySize != null) hadoopConf.set("parquet.dictionary.page.size", previousDictionarySize)
+      else hadoopConf.unset("parquet.dictionary.page.size")
     }
   }
 

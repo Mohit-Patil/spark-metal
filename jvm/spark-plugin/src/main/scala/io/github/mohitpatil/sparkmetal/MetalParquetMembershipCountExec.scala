@@ -149,24 +149,28 @@ case class MetalParquetMembershipCountExec(
               try {
                 val parseStarted = System.nanoTime()
                 val pageReadStore = reader.readRowGroup(split.rowGroupIndex)
-                rowGroupHandle = NativeBridge.parquetRowGroupBegin(streamHandle, split.rowCount.toInt)
-                val tables = descriptors.zipWithIndex.map { case (descriptor, ordinal) =>
-                  decodeRowGroupColumn(
-                    streamHandle, rowGroupHandle, ordinal, split, pageReadStore, descriptor,
-                    multiplicities(ordinal), allKeysUnique, () => localPages += 1)
-                }
-                parseNanos += System.nanoTime() - parseStarted
+                try {
+                  rowGroupHandle = NativeBridge.parquetRowGroupBegin(streamHandle, split.rowCount.toInt)
+                  val tables = descriptors.zipWithIndex.map { case (descriptor, ordinal) =>
+                    decodeRowGroupColumn(
+                      streamHandle, rowGroupHandle, ordinal, split, pageReadStore, descriptor,
+                      multiplicities(ordinal), allKeysUnique, () => localPages += 1)
+                  }
+                  parseNanos += System.nanoTime() - parseStarted
 
-                val metalStarted = System.nanoTime()
-                NativeBridge.parquetRowGroupCount(
-                  streamHandle, rowGroupHandle,
-                  tables(0)._1, tables(0)._2,
-                  tables(1)._1, tables(1)._2,
-                  tables(2)._1, tables(2)._2)
-                metalNanos += System.nanoTime() - metalStarted
-                localRowGroups += 1
+                  val metalStarted = System.nanoTime()
+                  NativeBridge.parquetRowGroupCount(
+                    streamHandle, rowGroupHandle,
+                    tables(0)._1, tables(0)._2,
+                    tables(1)._1, tables(1)._2,
+                    tables(2)._1, tables(2)._2)
+                  metalNanos += System.nanoTime() - metalStarted
+                  localRowGroups += 1
+                } finally {
+                  pageReadStore.close()
+                }
               } catch {
-                case _: RuntimeException =>
+                case e: RuntimeException =>
                   // The native decoder rejected a page (or some other
                   // runtime surprise occurred) partway through this row
                   // group. Release whatever handle exists -- never Release
@@ -174,13 +178,18 @@ case class MetalParquetMembershipCountExec(
                   // consumed by the failed GPU pass -- and recompute this
                   // row group's contribution on the CPU from a fresh
                   // PageReadStore.
+                  logWarning(s"Row group ${split.file}#${split.rowGroupIndex} fell back to CPU", e)
                   if (rowGroupHandle != 0L) {
                     NativeBridge.parquetRowGroupRelease(rowGroupHandle)
                   }
                   localFallbacks += 1
                   localRowGroups += 1
                   val freshStore = reader.readRowGroup(split.rowGroupIndex)
-                  partitionCount += countRowGroupOnCpu(freshStore, schema, descriptors, multiplicities)
+                  try {
+                    partitionCount += countRowGroupOnCpu(freshStore, schema, descriptors, multiplicities)
+                  } finally {
+                    freshStore.close()
+                  }
               }
             } else {
               // Dimension keys are not dense enough for the prepared GPU
@@ -188,7 +197,11 @@ case class MetalParquetMembershipCountExec(
               val pageReadStore = reader.readRowGroup(split.rowGroupIndex)
               localFallbacks += 1
               localRowGroups += 1
-              partitionCount += countRowGroupOnCpu(pageReadStore, schema, descriptors, multiplicities)
+              try {
+                partitionCount += countRowGroupOnCpu(pageReadStore, schema, descriptors, multiplicities)
+              } finally {
+                pageReadStore.close()
+              }
             }
           }
 
@@ -310,6 +323,16 @@ case class MetalParquetMembershipCountExec(
     val readStore = new ColumnReadStoreImpl(
       store, new DummyRecordConverter(schema).getRootConverter, schema, "")
     val readers = descriptors.map(readStore.getColumnReader)
+    // A `required` column (maxDefinitionLevel == 0 -- eligibility admits
+    // this, not just optional maxDef == 1 columns) has NO definition-level
+    // stream at all: getCurrentDefinitionLevel() always returns 0 for it,
+    // which is also the "null" sentinel for an *optional* column. Comparing
+    // against the hardcoded literal 0 therefore misclassifies every row of
+    // a required column as null, zeroing the count silently. The correct
+    // null test is "current < max": for an optional column (max 1) that is
+    // still exactly the 0-vs-1 check; for a required column (max 0) it is
+    // never true, since getCurrentDefinitionLevel() can't exceed 0 either.
+    val maxDefinitionLevels = descriptors.map(_.getMaxDefinitionLevel)
     var count = 0L
     var row = 0L
     val rows = store.getRowCount
@@ -327,7 +350,7 @@ case class MetalParquetMembershipCountExec(
         // producing silently wrong values (and wrong counts) from that
         // point on. Caught by the sparse-cpu-fallback TDD case in
         // ParquetDecodeSmoke's exec mode: 386 vs. an expected 329.
-        if (reader.getCurrentDefinitionLevel == 0) {
+        if (reader.getCurrentDefinitionLevel < maxDefinitionLevels(ordinal)) {
           member = false
         } else {
           val value = reader.getInteger

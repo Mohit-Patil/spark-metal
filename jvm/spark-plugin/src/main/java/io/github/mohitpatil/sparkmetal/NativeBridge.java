@@ -121,4 +121,17 @@ public final class NativeBridge {
     // test and error paths). Task 4 adds the membership variant.
     public static native void parquetRowGroupRelease(long rowGroupHandle);
 
+    /**
+     * Encodes the membership kernel over the row group's planes with per-column
+     * dictionary tables (same contract as membershipCount3StreamSubmit: exactly
+     * one of presence/multiplicity per column, matching the prepared kernel),
+     * commits without waiting, and releases the row-group handle. The result is
+     * accumulated by the existing membershipCount3StreamFinish.
+     */
+    public static native void parquetRowGroupCount(
+            long streamHandle, long rowGroupHandle,
+            byte[] dictPresence0, int[] dictMultiplicity0,
+            byte[] dictPresence1, int[] dictMultiplicity1,
+            byte[] dictPresence2, int[] dictMultiplicity2);
+
 }

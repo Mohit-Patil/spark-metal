@@ -1463,3 +1463,148 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetRowGroupRelease(
         delete rowGroup;
     }
 }
+
+// Runs the membership-count kernel over one row group's decoded planes
+// (Task 3's ids/validity planes, fused with the dictionary-table logic from
+// membershipCount3StreamSubmit) and releases the row-group handle. Commits
+// without waiting; the result is folded into stream->partialBuffers /
+// partialGroupCounts for the existing membershipCount3StreamFinish to
+// accumulate.
+extern "C" JNIEXPORT void JNICALL
+Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetRowGroupCount(
+    JNIEnv *environment,
+    jclass,
+    jlong streamHandle,
+    jlong rowGroupHandle,
+    jbyteArray dictPresence0,
+    jintArray dictMultiplicity0,
+    jbyteArray dictPresence1,
+    jintArray dictMultiplicity1,
+    jbyteArray dictPresence2,
+    jintArray dictMultiplicity2) {
+    @autoreleasepool {
+        if (membershipCountUniquePipeline == nil ||
+            membershipCountMultiplicityPipeline == nil || commandQueue == nil) {
+            throwRuntime(environment, @"NativeBridge.initialize must be called first");
+            return;
+        }
+        if (streamHandle == 0 || rowGroupHandle == 0) {
+            throwRuntime(environment, @"Row-group count requires a stream and a row group");
+            return;
+        }
+        auto *stream = reinterpret_cast<MembershipStream *>(
+            static_cast<uintptr_t>(streamHandle));
+        auto *rowGroup = reinterpret_cast<ParquetRowGroup *>(
+            static_cast<uintptr_t>(rowGroupHandle));
+        PreparedMembershipCount3 *prepared = stream->prepared;
+
+        jbyteArray presenceArrays[3] = {dictPresence0, dictPresence1, dictPresence2};
+        jintArray multiplicityArrays[3] = {dictMultiplicity0, dictMultiplicity1, dictMultiplicity2};
+
+        std::vector<id<MTLBuffer>> usedStaging;
+        id<MTLBuffer> keyBuffers[3];
+        int32_t keyMinimums[3];
+        uint32_t keySpans[3];
+        uint32_t nullMask = 0;
+        for (NSUInteger index = 0; index < 3; ++index) {
+            if (rowGroup->columnHasNulls[index]) {
+                nullMask |= 1u << index;
+            }
+
+            if (presenceArrays[index] == nullptr && multiplicityArrays[index] == nullptr) {
+                throwRuntime(environment, @"Row-group count requires a dictionary table per column");
+                return;
+            }
+            bool presence = presenceArrays[index] != nullptr;
+            if (presence != prepared->allKeysUnique) {
+                throwRuntime(environment, @"Dictionary table type does not match the prepared kernel");
+                return;
+            }
+            jsize length = presence
+                ? environment->GetArrayLength(presenceArrays[index])
+                : environment->GetArrayLength(multiplicityArrays[index]);
+            if (length <= 0) {
+                throwRuntime(environment, @"Dictionary membership table must not be empty");
+                return;
+            }
+            size_t elementBytes = presence ? sizeof(uint8_t) : sizeof(uint32_t);
+            id<MTLBuffer> table = acquireStagingBuffer(
+                stream, static_cast<size_t>(length) * elementBytes);
+            if (table == nil) {
+                throwRuntime(environment, @"Cannot allocate dictionary membership table");
+                return;
+            }
+            if (presence) {
+                environment->GetByteArrayRegion(
+                    presenceArrays[index], 0, length,
+                    static_cast<jbyte *>(table.contents));
+            } else {
+                environment->GetIntArrayRegion(
+                    multiplicityArrays[index], 0, length,
+                    static_cast<jint *>(table.contents));
+            }
+            if (environment->ExceptionCheck()) return;
+            usedStaging.push_back(table);
+            keyBuffers[index] = table;
+            keyMinimums[index] = 0;
+            keySpans[index] = static_cast<uint32_t>(length);
+        }
+
+        constexpr NSUInteger threadsPerGroup = 256;
+        NSUInteger groupCount =
+            (static_cast<NSUInteger>(rowGroup->rowCount) + threadsPerGroup - 1) / threadsPerGroup;
+        NSUInteger partialElementBytes = prepared->allKeysUnique
+            ? sizeof(uint32_t) : sizeof(int64_t);
+        id<MTLBuffer> partialBuffer = [device
+            newBufferWithLength:groupCount * partialElementBytes
+            options:MTLResourceStorageModeShared];
+        if (partialBuffer == nil) {
+            throwRuntime(environment, @"Cannot allocate row-group Metal partial-count buffer");
+            return;
+        }
+        MembershipCountParameters parameters = {
+            rowGroup->rowCount, nullMask,
+            keyMinimums[0], keyMinimums[1], keyMinimums[2],
+            keySpans[0], keySpans[1], keySpans[2]
+        };
+        id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+        [encoder setComputePipelineState:prepared->allKeysUnique
+            ? membershipCountUniquePipeline
+            : membershipCountMultiplicityPipeline];
+        for (NSUInteger index = 0; index < 3; ++index) {
+            [encoder setBuffer:rowGroup->ids[index] offset:0 atIndex:index];
+            [encoder setBuffer:rowGroup->validity[index] offset:0 atIndex:index + 3];
+            [encoder setBuffer:keyBuffers[index] offset:0 atIndex:index + 6];
+        }
+        [encoder setBuffer:partialBuffer offset:0 atIndex:9];
+        [encoder setBytes:&parameters length:sizeof(parameters) atIndex:10];
+        [encoder dispatchThreadgroups:MTLSizeMake(groupCount, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+        [encoder endEncoding];
+        [commandBuffer commit];
+
+        stream->commandBuffers.push_back(commandBuffer);
+        // The dictionary-table staging is scoped to this call, so it returns
+        // to freeStaging once the command buffer completes, same as every
+        // other stream submit.
+        for (id<MTLBuffer> buffer : usedStaging) {
+            stream->pendingStaging.push_back({buffer, commandBuffer});
+        }
+        // The row group's own ids/validity planes outlive parquetDecodePage's
+        // per-page command buffers (they are never pendingStaging entries --
+        // see the ParquetRowGroup comment), so they must be pushed back
+        // explicitly here, keyed to this final command buffer, exactly as
+        // parquetRowGroupRelease does for the non-counting path.
+        for (int column = 0; column < 3; ++column) {
+            stream->pendingStaging.push_back({rowGroup->ids[column], commandBuffer});
+            stream->pendingStaging.push_back({rowGroup->validity[column], commandBuffer});
+        }
+        stream->partialBuffers.push_back(partialBuffer);
+        stream->partialGroupCounts.push_back(groupCount);
+
+        auto &rowGroups = stream->rowGroups;
+        rowGroups.erase(std::remove(rowGroups.begin(), rowGroups.end(), rowGroup), rowGroups.end());
+        delete rowGroup;
+    }
+}

@@ -174,6 +174,100 @@ object ParquetDecodeSmoke {
           "No fully-null Parquet data page was observed; the entirely-null-page " +
             "path in parquetDecodePage was not exercised by this run")
       }
+
+      // Task 4: fuse the row-group decode with the GPU membership count.
+      // Member set is values 100..199 (inclusive) in every column; a row
+      // qualifies iff all three keys are non-null and within that range.
+      // The Task 3 comparison pass above already Read+Released its row
+      // groups, so verifying the fused count requires a second decode pass
+      // into fresh row-group handles.
+      val memberLow = 100
+      val memberHigh = 199
+      var expectedCount = 0L
+      for (row <- 0 until rows) {
+        val sparkRow = referenceRows(row)
+        val qualifies = Columns.indices.forall { columnIndex =>
+          !sparkRow.isNullAt(columnIndex) && {
+            val value = sparkRow.getInt(columnIndex)
+            value >= memberLow && value <= memberHigh
+          }
+        }
+        if (qualifies) expectedCount += 1
+      }
+
+      val countPreparedHandle = NativeBridge.prepareMembershipCount3(Array(1), Array(1), Array(1))
+      val countStreamHandle = NativeBridge.membershipCount3StreamBegin(countPreparedHandle)
+      val countReader = ParquetFileReader.open(HadoopInputFile.fromPath(new Path(partFile), new Configuration()))
+      try {
+        val descriptors = Columns.map { name =>
+          countReader.getFooter.getFileMetaData.getSchema.getColumns.asScala
+            .find(_.getPath()(0) == name)
+            .getOrElse(throw new RuntimeException(s"Missing column $name"))
+        }
+        var pageReadStore = countReader.readNextRowGroup()
+        while (pageReadStore != null) {
+          val rowGroupRows = pageReadStore.getRowCount.toInt
+          val rowGroupHandle = NativeBridge.parquetRowGroupBegin(countStreamHandle, rowGroupRows)
+          val presenceTables = new Array[Array[Byte]](Columns.length)
+          for (columnIndex <- Columns.indices) {
+            val descriptor = descriptors(columnIndex)
+            val pageReader = pageReadStore.getPageReader(descriptor)
+            val dictionaryPage = pageReader.readDictionaryPage()
+            if (dictionaryPage == null) {
+              throw new RuntimeException(
+                s"${Columns(columnIndex)}: expected a dictionary page but found none")
+            }
+            val dictionaryBytes = dictionaryPage.getBytes.toByteArray
+            val dictionaryBuffer = ByteBuffer.wrap(dictionaryBytes).order(ByteOrder.LITTLE_ENDIAN)
+            val dictionarySize = dictionaryPage.getDictionarySize
+            val presence = new Array[Byte](dictionarySize)
+            for (entry <- 0 until dictionarySize) {
+              val value = dictionaryBuffer.getInt(entry * 4)
+              presence(entry) = if (value >= memberLow && value <= memberHigh) 1.toByte else 0.toByte
+            }
+            presenceTables(columnIndex) = presence
+
+            val hasDefLevels = descriptor.getMaxDefinitionLevel > 0
+            var rowOffset = 0
+            var rawPage = pageReader.readPage()
+            while (rawPage != null) {
+              val dataPage = rawPage match {
+                case v1: DataPageV1 => v1
+                case other =>
+                  throw new RuntimeException(
+                    s"${Columns(columnIndex)}: unsupported Parquet page type ${other.getClass}")
+              }
+              if (!DictionaryEncodings.contains(dataPage.getValueEncoding)) {
+                throw new RuntimeException(
+                  s"${Columns(columnIndex)}: unsupported value encoding ${dataPage.getValueEncoding}")
+              }
+              val pageBytes = dataPage.getBytes.toByteArray
+              val valueCount = dataPage.getValueCount
+              NativeBridge.parquetDecodePage(
+                countStreamHandle, rowGroupHandle, columnIndex,
+                pageBytes, pageBytes.length, valueCount, rowOffset, hasDefLevels)
+              rowOffset += valueCount
+              rawPage = pageReader.readPage()
+            }
+            if (rowOffset != rowGroupRows) {
+              throw new RuntimeException(
+                s"${Columns(columnIndex)}: pages covered $rowOffset rows, expected $rowGroupRows")
+            }
+          }
+          NativeBridge.parquetRowGroupCount(
+            countStreamHandle, rowGroupHandle,
+            presenceTables(0), null, presenceTables(1), null, presenceTables(2), null)
+          pageReadStore = countReader.readNextRowGroup()
+        }
+      } finally {
+        countReader.close()
+      }
+      val actualCount = NativeBridge.membershipCount3StreamFinish(countStreamHandle)
+      NativeBridge.releaseMembershipCount3(countPreparedHandle)
+
+      println(s"""{"expectedCount":$expectedCount,"actualCount":$actualCount}""")
+      require(actualCount == expectedCount,
+        s"GPU row-group membership count $actualCount did not match expected $expectedCount")
     } finally {
       spark.stop()
     }

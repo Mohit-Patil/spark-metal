@@ -14,6 +14,37 @@ import org.apache.parquet.hadoop.metadata.CompressionCodecName
 import org.apache.parquet.hadoop.util.HadoopInputFile
 import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName
 
+/**
+ * Identity of one *version* of a Parquet file. Anything memoised against this
+ * recomputes when the file is rewritten, since a rewrite changes its length,
+ * its modification time, or both.
+ */
+private[sparkmetal] final case class FileVersion(
+    path: String, length: Long, modificationTime: Long)
+
+/**
+ * Small bounded LRU behind a lock. The driver-side Parquet caches live for the
+ * lifetime of the JVM and are keyed per file version, so an unbounded map grows
+ * without limit on a long-lived driver that reads many distinct files. The
+ * bound is far above any single query's file count -- TPC-DS SF10 store_sales
+ * is 30 files -- so the caches still hit for the repeated-planning case they
+ * exist for; past the bound the least-recently-used entry is evicted and simply
+ * recomputed.
+ *
+ * java.util.LinkedHashMap in access order reorders on `get` as well as `put`,
+ * so reads mutate and every access has to hold the lock.
+ */
+private[sparkmetal] final class BoundedCache[K, V](maxEntries: Int) {
+  private val entries = new java.util.LinkedHashMap[K, V](16, 0.75f, true) {
+    override def removeEldestEntry(eldest: java.util.Map.Entry[K, V]): Boolean =
+      size() > maxEntries
+  }
+
+  def get(key: K): Option[V] = synchronized(Option(entries.get(key)))
+
+  def put(key: K, value: V): Unit = synchronized(entries.put(key, value))
+}
+
 object ParquetEligibility {
   private val SupportedEncodings: Set[Encoding] = Set(
     Encoding.RLE, Encoding.BIT_PACKED, Encoding.PLAIN_DICTIONARY, Encoding.RLE_DICTIONARY)
@@ -27,45 +58,39 @@ object ParquetEligibility {
    */
   private[sparkmetal] lazy val sharedConfiguration: Configuration = new Configuration()
 
+  /** Shared bound for every driver-side Parquet cache. See [[BoundedCache]]. */
+  private[sparkmetal] val MaxCachedFiles = 512
+
   /**
    * Verdict cache. check() runs on the driver during *planning*, so it repeats
    * for every execution of every query over the same files -- 30 serial footer
-   * reads per plan for TPC-DS SF10 store_sales. The key carries the file's
-   * length and modification time, so a rewritten file is re-checked rather than
-   * answered from a stale verdict.
+   * reads per plan for TPC-DS SF10 store_sales.
+   *
+   * The key is (file version, column names), NOT the file alone. Every check in
+   * checkFile is specific to the requested columns: whether they exist, whether
+   * they are INT32, their nesting, and the codec and encodings of *their* column
+   * chunks. Keyed by file alone, a second query over the same files with
+   * different key columns is answered from the first query's verdict -- a
+   * cached Right lets an ineligible plan past the safety gate, where a
+   * missing-or-non-INT32 column then throws outside the CPU-fallback catch, and
+   * a cached Left wrongly rejects an eligible plan.
+   *
+   * Column names are held as a List so the key's equality is by value.
    */
-  private final case class FileKey(path: String, length: Long, modificationTime: Long)
-  private val verdicts = new ConcurrentHashMap[FileKey, Either[String, Unit]]()
-  private val footerFacts = new ConcurrentHashMap[FileKey, Any]()
+  private val verdicts =
+    new BoundedCache[(FileVersion, List[String]), Either[String, Unit]](MaxCachedFiles)
 
   /**
-   * Memoises anything derived purely from one Parquet file's footer, keyed the
-   * same way as the eligibility verdict so a rewritten file recomputes. Used by
-   * [[MetalParquetMembershipCountExec]] for its row-group enumeration, which
-   * planning would otherwise redo on every execution. Falls back to computing
-   * without caching when the file's status cannot be read.
+   * The version of one file, or None when its status cannot be read -- an
+   * unreadable file is not cacheable, and callers recompute and apply their own
+   * failure handling.
    */
-  private[sparkmetal] def cachedByFileVersion[A](path: String)(compute: => A): A =
-    fileKey(path) match {
-      case None => compute
-      case Some(key) =>
-        val cached = footerFacts.get(key)
-        if (cached != null) cached.asInstanceOf[A]
-        else {
-          val value = compute
-          footerFacts.put(key, value)
-          value
-        }
-    }
-
-  private def fileKey(path: String): Option[FileKey] =
+  private[sparkmetal] def fileVersion(path: String): Option[FileVersion] =
     try {
       val hadoopPath = new Path(path)
       val status = hadoopPath.getFileSystem(sharedConfiguration).getFileStatus(hadoopPath)
-      Some(FileKey(path, status.getLen, status.getModificationTime))
+      Some(FileVersion(path, status.getLen, status.getModificationTime))
     } catch {
-      // An unreadable file is not cacheable; the caller recomputes, and its own
-      // failure handling applies.
       case _: Exception => None
     }
 
@@ -88,21 +113,19 @@ object ParquetEligibility {
     results.collectFirst { case left @ Left(_) => left }.getOrElse(Right(()))
   }
 
-  private def cachedCheckFile(path: String, columnNames: Seq[String]): Either[String, Unit] = {
-    // An unreadable file is not cacheable; fall through to checkFile, whose
-    // caller already treats a thrown failure as "not eligible".
-    fileKey(path) match {
+  private def cachedCheckFile(path: String, columnNames: Seq[String]): Either[String, Unit] =
+    fileVersion(path) match {
       case None => checkFile(path, columnNames)
-      case Some(k) =>
-        val cached = verdicts.get(k)
-        if (cached != null) cached
-        else {
-          val verdict = checkFile(path, columnNames)
-          verdicts.put(k, verdict)
-          verdict
+      case Some(version) =>
+        val key = (version, columnNames.toList)
+        verdicts.get(key) match {
+          case Some(verdict) => verdict
+          case None =>
+            val verdict = checkFile(path, columnNames)
+            verdicts.put(key, verdict)
+            verdict
         }
     }
-  }
 
   private def checkFile(path: String, columnNames: Seq[String]): Either[String, Unit] = {
     val reader = ParquetFileReader.open(

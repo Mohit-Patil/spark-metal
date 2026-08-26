@@ -20,8 +20,12 @@ xcrun -sdk macosx metallib \
   "${build_root}/kernels.air" \
   -o "${build_root}/kernels.metallib"
 
+# -O2 to match build-spark-plugin.sh. Without an -O flag clang defaults to -O0,
+# which made the JNI bridge's per-page CPU work about eight times slower; a
+# smoke test built differently from the shipped library is a measurement trap.
 xcrun clang++ \
   -std=c++17 \
+  -O2 \
   -fobjc-arc \
   -dynamiclib \
   -framework Foundation \

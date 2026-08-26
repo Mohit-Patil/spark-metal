@@ -559,9 +559,70 @@ object ParquetDecodeSmoke {
         minFiles = Some(2),
         minCpuFallbackRowGroups = Some(1),
         requirePartialFallback = true)
+
+      checkEligibilityCacheIsColumnKeyed(spark, tempDir.toString)
     } finally {
       spark.stop()
     }
+  }
+
+  /**
+   * ParquetEligibility.check memoises its per-file verdict so that planning does
+   * not re-read every footer on every execution. Every check it performs is
+   * specific to the requested columns -- existence, INT32-ness, nesting, and the
+   * codec/encodings of *those* column chunks -- so the cache has to be keyed by
+   * (file version, column names) and not by the file alone.
+   *
+   * Both directions of getting that wrong are unsafe, and both are asserted
+   * here on freshly written files so each starts with a cold cache:
+   *
+   *  - Ask for eligible columns, then for a column list containing a missing
+   *    one. Keyed by file alone, the second call returns the cached Right and
+   *    an ineligible plan walks through the safety gate, only to throw later
+   *    from outside the per-row-group CPU-fallback catch.
+   *  - Ask for the missing column first, then for the eligible columns. Keyed
+   *    by file alone, the second call returns the cached Left and a perfectly
+   *    eligible plan is silently refused acceleration.
+   */
+  private def checkEligibilityCacheIsColumnKeyed(spark: SparkSession, tempDir: String): Unit = {
+    def partFileUnder(path: String): String =
+      Files.list(java.nio.file.Path.of(path)).iterator().asScala
+        .map(_.toString)
+        .find(_.endsWith(".parquet"))
+        .getOrElse(throw new RuntimeException(s"No .parquet part file found under $path"))
+
+    val eligible = Columns
+    val withMissingColumn = Columns.dropRight(1) :+ "not_a_column"
+
+    val rightFirstPath = s"$tempDir/eligibility-cache-right-first"
+    writeDataset(spark, rightFirstPath, 20000)
+    val rightFirst = partFileUnder(rightFirstPath)
+    val warmRight = ParquetEligibility.check(Seq(rightFirst), eligible)
+    require(warmRight.isRight, s"expected the eligible column list to pass, got $warmRight")
+    val afterWarmRight = ParquetEligibility.check(Seq(rightFirst), withMissingColumn)
+    require(afterWarmRight.isLeft,
+      "a column list naming a missing column must be rejected even after the same file " +
+        s"passed for different columns, got $afterWarmRight")
+
+    val leftFirstPath = s"$tempDir/eligibility-cache-left-first"
+    writeDataset(spark, leftFirstPath, 20000)
+    val leftFirst = partFileUnder(leftFirstPath)
+    val warmLeft = ParquetEligibility.check(Seq(leftFirst), withMissingColumn)
+    require(warmLeft.isLeft, s"expected the missing column to be rejected, got $warmLeft")
+    val afterWarmLeft = ParquetEligibility.check(Seq(leftFirst), eligible)
+    require(afterWarmLeft.isRight,
+      "an eligible column list must pass even after the same file was rejected for " +
+        s"different columns, got $afterWarmLeft")
+
+    // And the cache must still answer a repeat of the same question the same way.
+    require(ParquetEligibility.check(Seq(rightFirst), eligible).isRight,
+      "repeating an eligible check must stay eligible")
+    require(ParquetEligibility.check(Seq(leftFirst), withMissingColumn).isLeft,
+      "repeating a rejected check must stay rejected")
+
+    println(
+      s"""{"mode":"exec","case":"eligibility-cache-column-keyed",""" +
+        s""""eligibleThenMissing":"Right,Left","missingThenEligible":"Left,Right"}""")
   }
 
   /**

@@ -215,11 +215,14 @@ void commitRowGroup(ParquetRowGroup *rowGroup) {
     [commandBuffer commit];
     rowGroup->lastCommandBuffer = commandBuffer;
     MembershipStream *stream = rowGroup->stream;
-    if (stream == nullptr) return;
-    stream->commandBuffers.push_back(commandBuffer);
-    for (id<MTLBuffer> buffer : rowGroup->pendingStaging) {
-        stream->pendingStaging.push_back({buffer, commandBuffer});
+    if (stream != nullptr) {
+        stream->commandBuffers.push_back(commandBuffer);
+        for (id<MTLBuffer> buffer : rowGroup->pendingStaging) {
+            stream->pendingStaging.push_back({buffer, commandBuffer});
+        }
     }
+    // Cleared even without a stream to hand them to (ARC then frees them),
+    // so the row group never carries a stale list into its next command buffer.
     rowGroup->pendingStaging.clear();
     rowGroup->pagesSinceCommit = 0;
 }

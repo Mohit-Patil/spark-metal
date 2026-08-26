@@ -246,6 +246,9 @@ case class MetalParquetMembershipCountExec(
         }
       } finally {
         readers.values.foreach(_.close())
+        // Recorded here with the rest, so a task that fails partway still
+        // reports the time it spent rather than silently contributing nothing.
+        partitionTime += (System.nanoTime() - partitionStarted) / 1000000
         metalTime += metalNanos / 1000000
         decodeParseTime += parseNanos / 1000000
         rowGroupReadTime += readNanos / 1000000
@@ -258,7 +261,6 @@ case class MetalParquetMembershipCountExec(
         }
       }
 
-      partitionTime += (System.nanoTime() - partitionStarted) / 1000000
       val vector = new OnHeapColumnVector(1, LongType)
       vector.putLong(0, partitionCount)
       Iterator.single(new ColumnarBatch(Array[ColumnVector](vector), 1))
@@ -430,13 +432,16 @@ case class MetalParquetMembershipCountExec(
     }
 
   /**
-   * One file's row groups, memoised across executions like the eligibility
-   * verdict next to it and invalidated the same way -- planning re-reads these
-   * footers for every execution of every query over the same files.
+   * One file's row groups, memoised across executions and invalidated the same
+   * way as the eligibility verdict -- planning re-reads these footers for every
+   * execution of every query over the same files. Keyed by file version alone,
+   * unlike the eligibility verdict: a block's index and row count are properties
+   * of the row group, not of any column, so they are the same whichever columns
+   * a query asks for.
    */
   private def footerSplits(
-      file: String, configuration: Configuration): Seq[ParquetMembershipSplit] =
-    ParquetEligibility.cachedByFileVersion(file) {
+      file: String, configuration: Configuration): Seq[ParquetMembershipSplit] = {
+    def read(): Seq[ParquetMembershipSplit] = {
       val reader = ParquetFileReader.open(HadoopInputFile.fromPath(new Path(file), configuration))
       try {
         reader.getFooter.getBlocks.asScala.zipWithIndex.map { case (block, index) =>
@@ -446,6 +451,18 @@ case class MetalParquetMembershipCountExec(
         reader.close()
       }
     }
+    ParquetEligibility.fileVersion(file) match {
+      case None => read()
+      case Some(version) =>
+        MetalParquetMembershipCountExec.splitsByFile.get(version) match {
+          case Some(splits) => splits
+          case None =>
+            val splits = read()
+            MetalParquetMembershipCountExec.splitsByFile.put(version, splits)
+            splits
+        }
+    }
+  }
 
   override protected def withNewChildrenInternal(newChildren: IndexedSeq[SparkPlan]): SparkPlan =
     copy(keyPlans = newChildren)
@@ -461,4 +478,12 @@ private[sparkmetal] object MetalParquetMembershipCountExec {
    * reads from it.
    */
   def sharedConfiguration: Configuration = ParquetEligibility.sharedConfiguration
+
+  /**
+   * Row-group enumeration per file version, bounded and typed. See
+   * [[MetalParquetMembershipCountExec.footerSplits]] for why the file version
+   * alone is a sufficient key here.
+   */
+  private[sparkmetal] val splitsByFile =
+    new BoundedCache[FileVersion, Seq[ParquetMembershipSplit]](ParquetEligibility.MaxCachedFiles)
 }

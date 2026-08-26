@@ -82,6 +82,17 @@ int main() {
     PageRuns runs3;
     assert(!parseDataPageV1(page3.data(), page2Length, 12, true, runs3));
 
+    // Corrupted defLength that overflows the page: must be rejected.
+    // Create a page with defLength > remaining buffer size.
+    std::vector<uint8_t> pageCorrupted;
+    pageCorrupted.push_back(0xFF); pageCorrupted.push_back(0xFF);  // defLength = 65535 (too large)
+    pageCorrupted.push_back(0x00); pageCorrupted.push_back(0x00);
+    pageCorrupted.push_back(1);                                     // bit width 1
+    size_t corruptedLength = pageCorrupted.size();
+    pageCorrupted.resize(pageCorrupted.size() + 4, 0);  // pad for bit extraction
+    PageRuns runsCorrupted;
+    assert(!parseDataPageV1(pageCorrupted.data(), corruptedLength, 10, true, runsCorrupted));
+
     std::puts("parquet_page_runs_test OK");
     return 0;
 }

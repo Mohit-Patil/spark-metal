@@ -26,11 +26,11 @@ struct ByteCursor {
 };
 
 // Walks one RLE/bit-packed hybrid stream, invoking run(count, isRle, value,
-// bitOffsetOfRun) with counts clamped so the total equals expectedValues.
+// byteOffset) which returns false to signal an error, with counts clamped so
+// the total equals expectedValues.
 template <typename Run>
 bool walkHybrid(ByteCursor &cursor, uint32_t bitWidth, uint32_t expectedValues, Run run) {
     uint32_t produced = 0;
-    size_t payloadBase = cursor.offset;
     while (produced < expectedValues) {
         uint32_t header;
         if (!cursor.readUleb(header)) return false;
@@ -39,11 +39,10 @@ bool walkHybrid(ByteCursor &cursor, uint32_t bitWidth, uint32_t expectedValues, 
             uint32_t count = groups * 8;
             size_t payloadBytes = size_t(groups) * bitWidth;  // groups * 8 * width / 8
             if (cursor.offset + payloadBytes > cursor.length) return false;
-            uint64_t bitOffset = 0;
             // Bit offset is relative to the start of this run's payload; the
             // caller receives the byte offset so items are self-contained.
             if (count > expectedValues - produced) count = expectedValues - produced;
-            run(count, false, 0u, cursor.offset, bitOffset);
+            if (!run(count, false, 0u, cursor.offset)) return false;
             cursor.offset += payloadBytes;
             produced += count;
         } else {
@@ -52,11 +51,10 @@ bool walkHybrid(ByteCursor &cursor, uint32_t bitWidth, uint32_t expectedValues, 
             uint32_t value;
             if (!cursor.readLittleEndian((bitWidth + 7) / 8, value)) return false;
             if (count > expectedValues - produced) count = expectedValues - produced;
-            run(count, true, value, size_t(0), uint64_t(0));
+            if (!run(count, true, value, size_t(0))) return false;
             produced += count;
         }
     }
-    (void)payloadBase;
     return true;
 }
 
@@ -73,9 +71,10 @@ bool parseDataPageV1(const uint8_t *page, size_t length, uint32_t valueCount,
     if (hasDefLevels) {
         uint32_t defLength;
         if (!cursor.readLittleEndian(4, defLength)) return false;
+        if (cursor.offset + defLength > length) return false;
         ByteCursor def{page + cursor.offset, defLength};
         bool ok = walkHybrid(def, 1, valueCount,
-            [&](uint32_t count, bool isRle, uint32_t value, size_t byteOffset, uint64_t) {
+            [&](uint32_t count, bool isRle, uint32_t value, size_t byteOffset) {
                 if (isRle) {
                     defRuns.emplace_back(count, value != 0);
                 } else {
@@ -91,6 +90,7 @@ bool parseDataPageV1(const uint8_t *page, size_t length, uint32_t valueCount,
                         }
                     }
                 }
+                return true;
             });
         if (!ok) return false;
         cursor.offset += defLength;
@@ -133,7 +133,7 @@ bool parseDataPageV1(const uint8_t *page, size_t length, uint32_t valueCount,
     }
     uint32_t valueStart = 0;
     return walkHybrid(cursor, out.bitWidth, nonNull,
-        [&](uint32_t count, bool isRle, uint32_t value, size_t byteOffset, uint64_t) {
+        [&](uint32_t count, bool isRle, uint32_t value, size_t byteOffset) {
             uint64_t runBitBase =
                 (uint64_t(byteOffset) - out.valueBytesOffset) * 8;
             uint32_t emitted = 0;
@@ -143,11 +143,13 @@ bool parseDataPageV1(const uint8_t *page, size_t length, uint32_t valueCount,
                     out.items.push_back({valueStart + emitted, chunk, 0, value});
                 } else {
                     uint64_t bit = runBitBase + uint64_t(emitted) * out.bitWidth;
+                    if (bit > UINT32_MAX) return false;
                     out.items.push_back({valueStart + emitted, chunk, 1, uint32_t(bit)});
                 }
                 emitted += chunk;
             }
             valueStart += count;
+            return true;
         });
 }
 

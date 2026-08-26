@@ -203,13 +203,18 @@ kernel void scatter_segments(
 // columns: a row survives only if every key column is non-null AND every key
 // column's code lookup yields a non-negative code.
 //
-// Codes: code_tables[k] is indexed by the id/value plane's int32 for column k
-// (dictionary-id space for a dictionary-decoded column, value space
-// otherwise) and holds either -1 (this key is not in the build side, so the
-// row is dropped) or the column's PREMULTIPLIED group component, so that
-// group_id is simply the sum of the per-column codes. An index outside
-// code_length[k] is treated as a non-member rather than read (a corrupt page
-// or a mis-sized table must never read past the buffer).
+// Codes: code_tables[k] is indexed in DICTIONARY-ID space -- the id plane's
+// int32 for column k, which is always a dictionary id because join-key columns
+// only ever arrive through parquetDecodePage and eligibility admits a key
+// column only when its chunk is dictionary-encoded. Each entry is either -1
+// (this key is not in the build side, so the row is dropped) or the column's
+// PREMULTIPLIED group component, so that group_id is simply the sum of the
+// per-column codes. Ids are therefore non-negative by construction: the
+// negative-identifier check below is a guard against a corrupt plane, NOT
+// support for value-space tables (raw column values, which may be negative,
+// are not a supported code-table index space). An index outside code_length[k]
+// is likewise treated as a non-member rather than read (a corrupt page or a
+// mis-sized table must never read past the buffer).
 //
 // Factors: factor_tables[k], when factor_length[k] != 0, holds the
 // duplicate-build-key multiplicity for that key (1 for unique keys); the row's
@@ -299,6 +304,7 @@ kernel void fused_grouped_aggregate(
             return;
         }
         int identifier = key_ids[column][global_index];
+        // Defensive only: a dictionary id is never negative (see the header).
         if (identifier < 0) return;
         uint entry = uint(identifier);
         if (entry >= params.code_length[column]) return;

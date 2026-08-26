@@ -171,15 +171,25 @@ public final class NativeBridge {
      * Encodes the grouped-aggregation kernel over one row group's decoded key
      * and measure planes and consumes the row-group handle (same lifecycle as
      * parquetRowGroupCount: commits without waiting, then releases the handle
-     * -- the caller must not touch it again).
+     * -- the caller must not touch it again). The handle is consumed ONLY on
+     * the success path: if this method throws, the row group is still alive and
+     * still registered on the stream, so the caller must release it
+     * (parquetRowGroupRelease) or tear the whole stream down
+     * (parquetAggregateStreamAbort), exactly as for parquetRowGroupCount.
      *
-     * <p>codes[k] maps column k's decoded int32 (dictionary-id space for a
-     * dictionary-decoded column, value space otherwise) to either -1, meaning
-     * the key is not a member and the row is dropped, or that column's
+     * <p>codes[k] is indexed in DICTIONARY-ID space: it maps column k's decoded
+     * int32 -- which is always a dictionary id, because join-key columns are
+     * only ever decoded by parquetDecodePage and ParquetEligibility admits a
+     * key column only when its chunk is dictionary-encoded -- to either -1,
+     * meaning the key is not a member and the row is dropped, or that column's
      * PREMULTIPLIED group component, so the row's group id is the sum of the
-     * per-column codes. factors[k] may be null (every key unique, multiplier
-     * 1) or an equally indexed table of duplicate-key multiplicities; the
-     * row's weight is the product across columns.
+     * per-column codes. Value-space tables (a plane holding raw column values
+     * rather than ids) are NOT supported: dictionary ids are non-negative by
+     * construction, and the kernel treats a negative plane entry as a dropped
+     * row -- a defensive guard against a corrupt plane, not a value-space
+     * feature. factors[k] may be null (every key unique, multiplier 1) or an
+     * equally indexed table of POSITIVE duplicate-key multiplicities; the row's
+     * weight is the product across columns.
      *
      * <p>aggKinds[a] is 0 for count(*), 1 for sum(measure), 2 for
      * count(measure); aggMeasureSlots[a] names the measure slot for kinds 1
@@ -202,6 +212,11 @@ public final class NativeBridge {
      * partial table into long[groupCount * aggCount] (row-major: group-major,
      * aggregate-minor) and destroys the stream. Returns a zero-length array if
      * no row group was ever aggregated on this stream.
+     *
+     * <p>A stream must not mix parquetRowGroupCount and
+     * parquetRowGroupAggregate: the two produce unrelated results and neither
+     * finish can report both. Each finish refuses a stream carrying the other's
+     * partials (after tearing it down).
      *
      * <p>The stream is destroyed even when this throws, exactly like
      * membershipCount3StreamFinish: callers must set their

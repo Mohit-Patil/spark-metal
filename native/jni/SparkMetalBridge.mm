@@ -2667,6 +2667,20 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetRowGroupAggregate(
                 factorTable, 0, factorLength, static_cast<jint *>(factorBuffer.contents));
             environment->DeleteLocalRef(factorTable);
             if (environment->ExceptionCheck()) return;
+            // The kernel reads factors as uint (a multiplicity, never signed),
+            // so a negative jint would arrive as a multiplier near 2^32 and
+            // silently corrupt every accumulator the row touches; zero would
+            // silently erase the row instead of dropping it via its code. Both
+            // are caller bugs -- reject them here rather than on the GPU, where
+            // there is no way to report them.
+            const jint *factorValues = static_cast<const jint *>(factorBuffer.contents);
+            for (jsize entry = 0; entry < factorLength; ++entry) {
+                if (factorValues[entry] <= 0) {
+                    throwRuntime(environment,
+                        @"A grouped-aggregation factor table must hold positive multiplicities");
+                    return;
+                }
+            }
             usedStaging.push_back(factorBuffer);
             factorBuffers[column] = factorBuffer;
             params.factorLength[column] = static_cast<uint32_t>(factorLength);
@@ -2767,13 +2781,24 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetAggregateStreamFinish(
             static_cast<uintptr_t>(streamHandle));
         NSError *failure = drainStreamCommandBuffers(stream);
 
+        // The mirror image of membershipCount3StreamFinish's guard: a stream
+        // that also ran parquetRowGroupCount carries membership partials this
+        // function cannot report, and silently discarding them would turn a
+        // mixed-use mistake into a quietly missing count. Refuse -- after the
+        // teardown below, keeping the "the handle is consumed even on throw"
+        // contract both finishes share.
+        NSString *usageError = !stream->partialBuffers.empty()
+            ? @"Aggregate finish called on a stream that also ran membership "
+               "counting; a stream must not mix the two"
+            : nil;
+
         // Folded into host memory before the stream (which owns the device
         // buffer) is destroyed. (long)((ulong)hi << 32 | lo) is sign-correct by
         // construction: the two halves accumulated the low and high 32 bits of
         // one modulo-2^64 sum, so reassembling them reproduces the exact signed
         // total -- see aggregate_add_int64 in kernels.metal.
         std::vector<int64_t> results;
-        if (failure == nil && stream->aggregatePartials != nil) {
+        if (failure == nil && usageError == nil && stream->aggregatePartials != nil) {
             size_t accumulators = static_cast<size_t>(stream->aggregateGroupCount) *
                 static_cast<size_t>(stream->aggregateAggCount);
             const uint32_t *partials =
@@ -2795,6 +2820,10 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetAggregateStreamFinish(
         if (failure != nil) {
             throwRuntime(environment,
                 [NSString stringWithFormat:@"Streamed Metal command failed: %@", failure]);
+            return nullptr;
+        }
+        if (usageError != nil) {
+            throwRuntime(environment, usageError);
             return nullptr;
         }
         jlongArray output = environment->NewLongArray(static_cast<jsize>(results.size()));

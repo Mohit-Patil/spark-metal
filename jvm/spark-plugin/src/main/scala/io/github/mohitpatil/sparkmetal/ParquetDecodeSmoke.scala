@@ -811,8 +811,10 @@ object ParquetDecodeSmoke {
         actual = NativeBridge.parquetAggregateStreamFinish(streamHandle)
       } finally {
         if (!streamFinished) NativeBridge.parquetAggregateStreamAbort(streamHandle)
+        // Released here, not after the comparisons below: the prepared handle
+        // outlives the stream and must come back on the failure paths too.
+        NativeBridge.releaseMembershipCount3(preparedHandle)
       }
-      NativeBridge.releaseMembershipCount3(preparedHandle)
 
       require(coveredRows == rows, s"row groups covered $coveredRows rows, expected $rows")
       require(actual.length == expected.length,

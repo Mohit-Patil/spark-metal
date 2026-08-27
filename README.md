@@ -18,6 +18,41 @@ general GPU compute, explicit buffers, and command scheduling. MLX remains a
 useful numerical reference; Core ML/ANE and Spark ML remain relevant to model
 inference, but are not substitutes for a Spark SQL execution engine.
 
+## Results at a glance
+
+Full 103-query TPC-DS scale-factor-10 suite, Apple M5 (16 GB), Spark 4.2.0
+`local[8]`. Every number below is the *most conservative* of three measurement
+protocols (batched strict run, isolated rerun, winners-only rerun):
+
+| Query | Accelerated region | Speedup vs CPU |
+|---|---|---|
+| q88 | membership count | **1.44x** |
+| q90 | membership count | **1.36x** |
+| q96 | membership count | **1.34x** |
+| q53 | grouped aggregate | **1.16x** |
+| q63 | grouped aggregate | **1.14x** |
+| q89 | grouped aggregate | **1.13x** |
+
+And the honest context for those numbers:
+
+- **Correctness: 103/103 exact result-hash, row-count, and schema matches**
+  against vanilla Spark, with zero silent CPU fallbacks on accelerated queries.
+- **Whole-suite wall clock is essentially unchanged (≈1.0x).** The six winner
+  queries hold about 1.4% of total suite time; the heavy queries all need
+  sort-merge joins, which this prototype does not cover. This is Amdahl's law,
+  not measurement optimism.
+- With the region-budget gate disabled, the accelerator also fires on 18 more
+  queries and *loses* on most of them — worst case 11x slower — which is why
+  `spark.metal.parquetAggregate.maxRegions` defaults to 1. The losses are
+  CPU-side page-parsing and per-region setup cost, not GPU time (the kernel is
+  20–234 ms even on the worst loser).
+- The fanless test machine swings identical code ±40% with thermal state;
+  single runs are noise, and only wins that survive all three protocols are
+  claimed above.
+
+The complete data, protocols, and failure analysis are in
+[Prototype results](docs/PROTOTYPE_RESULTS.md).
+
 ## Getting started
 
 Requirements: an Apple Silicon Mac, Xcode with the Metal toolchain

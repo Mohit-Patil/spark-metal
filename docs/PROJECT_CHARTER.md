@@ -6,7 +6,7 @@ Apache Spark can schedule accelerator resources, but an accelerator becomes usef
 
 ## Objective
 
-Build a private research prototype that accelerates a supported subset of Spark SQL columnar execution on an integrated Apple Silicon GPU and demonstrates a correct end-to-end improvement on at least one TPC-DS scale-factor-10 query.
+Build a research prototype that accelerates a supported subset of Spark SQL columnar execution on an integrated Apple Silicon GPU and demonstrates a correct end-to-end improvement on at least one TPC-DS scale-factor-10 query.
 
 ## Primary research questions
 

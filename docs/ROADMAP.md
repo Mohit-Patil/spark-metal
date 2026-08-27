@@ -5,7 +5,7 @@
 - [x] Establish project goal and success threshold.
 - [x] Record first-host hardware and missing dependencies.
 - [x] Define roles for Metal, MLX, Core ML/ANE, Spark ML, and SynapseML.
-- [x] Publish the private repository.
+- [x] Publish the repository.
 
 ## M1 — Reproducible CPU baseline
 

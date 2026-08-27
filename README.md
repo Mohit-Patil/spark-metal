@@ -20,7 +20,7 @@ inference, but are not substitutes for a Spark SQL execution engine.
 
 ## Current status
 
-- Private repository and research charter: established.
+- Research charter: established.
 - First test host detected: 16 GB MacBook Air with Apple M5.
 - Xcode and the Metal compiler: available.
 - OpenJDK 21 and Apache Spark 4.2.0: installed and ARM64 smoke-tested.
@@ -161,4 +161,4 @@ scripts/inspect-grouped-aggregates.sh
 Performance numbers produced here are research results and are not comparable to
 official TPC benchmark results.
 
-This repository is private while the feasibility work is underway.
+Licensed under the Apache License 2.0 — see [LICENSE](LICENSE).

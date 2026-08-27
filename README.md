@@ -18,6 +18,53 @@ general GPU compute, explicit buffers, and command scheduling. MLX remains a
 useful numerical reference; Core ML/ANE and Spark ML remain relevant to model
 inference, but are not substitutes for a Spark SQL execution engine.
 
+## Getting started
+
+Requirements: an Apple Silicon Mac, Xcode with the Metal toolchain
+(`xcode-select --install` is not enough — the `metal` compiler must be
+available via `xcrun`), and [Homebrew](https://brew.sh). Everything else is
+installed by the setup script.
+
+```bash
+# 1. Install OpenJDK 21 and Apache Spark 4.2 via Homebrew, verify both
+scripts/setup-macos.sh
+
+# 2. Put the pinned JDK and Spark on PATH for this shell
+source scripts/project-env.sh
+
+# 3. Compile the Metal kernels, the JNI bridge, and the Spark plugin
+scripts/build-spark-plugin.sh
+
+# 4. Verify the build end to end — no benchmark data needed
+scripts/run-jni-smoke-test.sh
+scripts/run-spark-plugin-smoke-test.sh
+```
+
+To use the accelerator in your own Spark session, attach the plugin jar and
+native library from `build/spark-plugin/` and enable the extensions:
+
+```bash
+spark-submit \
+  --jars build/spark-plugin/spark-metal-plugin.jar \
+  --conf spark.sql.extensions=io.github.mohitpatil.sparkmetal.SparkMetalExtensions \
+  --conf spark.metal.nativeLibrary=build/spark-plugin/libsparkmetal.dylib \
+  --conf spark.metal.metalLibrary=build/spark-plugin/kernels.metallib \
+  --conf spark.sql.adaptive.enabled=false \
+  --conf spark.sql.ansi.enabled=false \
+  --conf spark.sql.columnVector.offheap.enabled=true \
+  ...
+```
+
+The accelerator replaces eligible plan regions automatically
+(`spark.metal.parquetScan.enabled` and `spark.metal.parquetAggregate.enabled`,
+both default `true`) and leaves every other plan untouched. It currently
+requires ANSI mode and adaptive query execution to be off; ineligible or
+rejected regions fall back to Spark's own operators. Verify the GPU actually
+ran via the `numMetalCommands` metric in the SQL UI.
+
+For the full TPC-DS benchmark reproduction, see [Local setup](#local-setup)
+below.
+
 ## Current status
 
 - Research charter: established.

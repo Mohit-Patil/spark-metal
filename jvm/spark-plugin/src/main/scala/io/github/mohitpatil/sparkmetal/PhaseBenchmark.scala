@@ -90,9 +90,12 @@ object PhaseBenchmark {
     val plan = spark.sql(sql).queryExecution.executedPlan
     val groupedNodes = plan.collect { case node: MetalParquetGroupedAggregateExec => node }
     val membershipNodes = plan.collect { case node: MetalParquetMembershipCountExec => node }
+    val joinNodes = plan.collect { case node: MetalParquetBroadcastJoinExec => node }
 
     val regionReports = groupedNodes.zipWithIndex.map { case (node, index) =>
       s"region_$index" -> benchmarkGroupedRegion(spark, node, runs)
+    } ++ joinNodes.zipWithIndex.map { case (node, index) =>
+      s"join_region_$index" -> benchmarkJoinRegion(spark, node, runs)
     }
 
     // Phase: end to end, with the final run's Metal metrics.
@@ -117,6 +120,7 @@ object PhaseBenchmark {
       "planning_warm_ms" -> median(planningTimes.tail.map(_._1)).toString,
       "grouped_regions" -> groupedNodes.length.toString,
       "membership_regions" -> membershipNodes.length.toString,
+      "join_regions" -> joinNodes.length.toString,
       "end_to_end_ms" -> jsonList(endToEnd.toSeq),
       "end_to_end_median_ms" -> median(endToEnd.toSeq).toString) ++
       regionReports ++
@@ -168,6 +172,47 @@ object PhaseBenchmark {
       "split_enum_memoised_ms" -> median(splitEnumMemo).toString,
       "dimension_collect_ms" -> median(dimensionTimes).toString,
       "group_space_build_ms" -> median(groupSpaceTimes).toString,
+      "rowgroup_read_ms" -> median(readRuns.map(_._1)).toString,
+      "read_plus_parse_ms" -> median(parseRuns.map(_._1)).toString,
+      "spark_scan_ms" -> median(scanTimes).toString), indent = 6)
+  }
+
+  /**
+   * Join-region stages: split enumeration, dimension collect (the region's
+   * keyPlans), row-group read of the DISTINCT key+fact columns without
+   * parse, the same walk plus the native CPU parse, and Spark's own scan of
+   * those columns -- the group-space stages do not apply.
+   */
+  private def benchmarkJoinRegion(
+      spark: SparkSession, node: MetalParquetBroadcastJoinExec, runs: Int): String = {
+    val columns = (node.keyColumnNames ++ node.factColumnNames).distinct
+
+    val splitEnumFresh = (0 until runs).map(_ => timeMs(freshFooterSplits(node.files))._1)
+    val splits = node.enumerateSplits()
+
+    val dimensionTimes = (0 until runs).map { _ =>
+      timeMs(node.keyPlans.foreach(_.executeCollect()))._1
+    }
+
+    SparkMetalNative.ensureInitialized(node.nativeLibrary, node.metalLibrary)
+    val readRuns = (0 until runs).map(_ => timeMs(walkRowGroups(node.files, columns, parse = false)))
+    val parseRuns = (0 until runs).map(_ => timeMs(walkRowGroups(node.files, columns, parse = true)))
+    val (pages, bytes) = readRuns.last._2
+
+    val scanAggregates = columns.map(column => s"count($column)")
+    val scanTimes = (0 until runs).map { _ =>
+      timeMs(spark.read.parquet(node.files: _*).selectExpr(scanAggregates: _*).collect())._1
+    }
+
+    jsonObject(Seq(
+      "files" -> node.files.length.toString,
+      "row_groups" -> splits.length.toString,
+      "pages" -> pages.toString,
+      "page_bytes" -> bytes.toString,
+      "key_columns" -> jsonStringList(node.keyColumnNames),
+      "fact_columns" -> jsonStringList(node.factColumnNames),
+      "split_enum_fresh_ms" -> median(splitEnumFresh).toString,
+      "dimension_collect_ms" -> median(dimensionTimes).toString,
       "rowgroup_read_ms" -> median(readRuns.map(_._1)).toString,
       "read_plus_parse_ms" -> median(parseRuns.map(_._1)).toString,
       "spark_scan_ms" -> median(scanTimes).toString), indent = 6)

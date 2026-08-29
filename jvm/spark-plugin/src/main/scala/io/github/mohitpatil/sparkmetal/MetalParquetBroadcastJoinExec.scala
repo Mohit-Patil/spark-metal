@@ -582,9 +582,100 @@ private[sparkmetal] object MetalParquetBroadcastJoinExec {
     protected val currentValues = new Array[Int](allColumnCount)
     protected val currentNull = new Array[Boolean](allColumnCount)
     private val keyCount = keyReaderIndex.length
+    private val factCount = factReaderIndex.length
     private val matchedRows = new Array[Int](keyCount)
     private var row = 0L
     private var closed = false
+
+    // Per-output-column emit plan, resolved ONCE: emitting through a
+    // per-value pattern match on columnSources/attributeTypes made
+    // outputBuildTime the dominant cost of every low-selectivity region
+    // (q22: 7.2s of a 10.7s query for 26.5M rows). outFactSlot(p) >= 0
+    // names a fact slot; otherwise outDimIndex/outDimOrdinal name the
+    // matched dimension attribute.
+    private val outFactSlot: Array[Int] = factIndexByOutput
+    private val outDimIndex = new Array[Int](outputAttributes.length)
+    private val outDimOrdinal = new Array[Int](outputAttributes.length)
+    columnSources.zipWithIndex.foreach {
+      case (BroadcastJoinShape.DimensionColumn(dimensionIndex, attributeOrdinal), position) =>
+        outDimIndex(position) = dimensionIndex
+        outDimOrdinal(position) = attributeOrdinal
+      case _ => ()
+    }
+
+    // Survivor capture buffers (column-major): the probe writes fact values
+    // and matched dimension row indices here; emission then runs one tight,
+    // monomorphic loop per OUTPUT column. Grown geometrically for multimap
+    // fan-out overshoot.
+    private var captureCapacity = BatchRows + 1024
+    private var capturedFactValues = Array.ofDim[Int](math.max(1, factCount), captureCapacity)
+    private var capturedFactNulls = Array.ofDim[Boolean](math.max(1, factCount), captureCapacity)
+    private var capturedDimRows = Array.ofDim[Int](keyCount, captureCapacity)
+    private var captured = 0
+
+    private def capture(): Unit = {
+      if (captured == captureCapacity) {
+        val grown = captureCapacity * 2
+        capturedFactValues = capturedFactValues.map(java.util.Arrays.copyOf(_, grown))
+        capturedFactNulls = capturedFactNulls.map(java.util.Arrays.copyOf(_, grown))
+        capturedDimRows = capturedDimRows.map(java.util.Arrays.copyOf(_, grown))
+        captureCapacity = grown
+      }
+      var f = 0
+      while (f < factCount) {
+        val readerIndex = factReaderIndex(f)
+        capturedFactValues(f)(captured) = currentValues(readerIndex)
+        capturedFactNulls(f)(captured) = currentNull(readerIndex)
+        f += 1
+      }
+      var k = 0
+      while (k < keyCount) {
+        capturedDimRows(k)(captured) = matchedRows(k)
+        k += 1
+      }
+      captured += 1
+    }
+
+    private def emitColumn(position: Int, vector: OnHeapColumnVector, count: Int): Unit = {
+      val factSlot = outFactSlot(position)
+      if (factSlot >= 0) {
+        val values = capturedFactValues(factSlot)
+        val nulls = capturedFactNulls(factSlot)
+        var i = 0
+        while (i < count) {
+          if (nulls(i)) vector.putNull(i) else vector.putInt(i, values(i))
+          i += 1
+        }
+      } else {
+        val dimension = dimensions(outDimIndex(position))
+        val ordinal = outDimOrdinal(position)
+        val dimensionRows = dimension.rows
+        val indices = capturedDimRows(outDimIndex(position))
+        def loop(write: (Int, InternalRow) => Unit): Unit = {
+          var i = 0
+          while (i < count) {
+            val attributeRow = dimensionRows(indices(i))._2
+            if (attributeRow.isNullAt(ordinal)) vector.putNull(i) else write(i, attributeRow)
+            i += 1
+          }
+        }
+        dimension.attributeTypes(ordinal) match {
+          case IntegerType | DateType => loop((i, r) => vector.putInt(i, r.getInt(ordinal)))
+          case LongType => loop((i, r) => vector.putLong(i, r.getLong(ordinal)))
+          case ShortType => loop((i, r) => vector.putShort(i, r.getShort(ordinal)))
+          case ByteType => loop((i, r) => vector.putByte(i, r.getByte(ordinal)))
+          case BooleanType => loop((i, r) => vector.putBoolean(i, r.getBoolean(ordinal)))
+          case StringType => loop { (i, r) =>
+            val bytes = r.getUTF8String(ordinal).getBytes
+            vector.putByteArray(i, bytes, 0, bytes.length)
+          }
+          case decimal: DecimalType => loop((i, r) =>
+            vector.putDecimal(i, r.getDecimal(ordinal, decimal.precision, decimal.scale), decimal.precision))
+          case other =>
+            throw new IllegalStateException(s"unsupported dimension attribute type $other")
+        }
+      }
+    }
 
     Option(org.apache.spark.TaskContext.get())
       .foreach(_.addTaskCompletionListener[Unit](_ => close()))
@@ -598,11 +689,8 @@ private[sparkmetal] object MetalParquetBroadcastJoinExec {
 
     override def next(): ColumnarBatch = {
       val buildStarted = System.nanoTime()
-      val vectors: Array[OnHeapColumnVector] = outputAttributes.map { attribute =>
-        new OnHeapColumnVector(8192, attribute.dataType)
-      }.toArray
-      var outputRow = 0
-      while (row < totalRows && outputRow < BatchRows) {
+      captured = 0
+      while (row < totalRows && captured < BatchRows) {
         readRow(row)
 
         denseTables match {
@@ -621,13 +709,7 @@ private[sparkmetal] object MetalParquetBroadcastJoinExec {
               }
               k += 1
             }
-            if (member) {
-              reserveCapacity(vectors, outputRow + 1)
-              writeOutputRow(
-                vectors, outputRow, columnSources, factIndexByOutput, factReaderIndex,
-                currentValues, currentNull, dimensions, matchedRows, outputAttributes)
-              outputRow += 1
-            }
+            if (member) capture()
           case None =>
             // Multimap probe. The whole fan-out of one fact row lands in one
             // batch (the odometer is not interruptible), so a batch may
@@ -657,11 +739,7 @@ private[sparkmetal] object MetalParquetBroadcastJoinExec {
                   matchedRows(i) = matches(i)(counters(i))
                   i += 1
                 }
-                reserveCapacity(vectors, outputRow + 1)
-                writeOutputRow(
-                  vectors, outputRow, columnSources, factIndexByOutput, factReaderIndex,
-                  currentValues, currentNull, dimensions, matchedRows, outputAttributes)
-                outputRow += 1
+                capture()
                 var position = keyCount - 1
                 var carrying = true
                 while (carrying && position >= 0) {
@@ -680,6 +758,16 @@ private[sparkmetal] object MetalParquetBroadcastJoinExec {
         row += 1
       }
       if (row >= totalRows) close()
+
+      val outputRow = captured
+      val vectors: Array[OnHeapColumnVector] = outputAttributes.map { attribute =>
+        new OnHeapColumnVector(math.max(1, outputRow), attribute.dataType)
+      }.toArray
+      var position = 0
+      while (position < vectors.length) {
+        emitColumn(position, vectors(position), outputRow)
+        position += 1
+      }
       numOutputRows += outputRow
       numOutputBatches += 1
       outputBuildTime += (System.nanoTime() - buildStarted) / 1000000
@@ -807,58 +895,4 @@ private[sparkmetal] object MetalParquetBroadcastJoinExec {
     override protected def onClose(): Unit = ()
   }
 
-  private def reserveCapacity(vectors: Array[OnHeapColumnVector], needed: Int): Unit = {
-    var i = 0
-    while (i < vectors.length) {
-      vectors(i).reserve(needed)
-      i += 1
-    }
-  }
-
-  private def writeOutputRow(
-      vectors: Array[OnHeapColumnVector],
-      outputRow: Int,
-      columnSources: Seq[BroadcastJoinShape.ColumnSource],
-      factIndexByOutput: Array[Int],
-      factReaderIndex: Array[Int],
-      currentValues: Array[Int],
-      currentNull: Array[Boolean],
-      dimensions: Seq[GroupSpace.Dimension],
-      matchedRows: Array[Int],
-      outputAttributes: Seq[Attribute]): Unit = {
-    var position = 0
-    while (position < columnSources.length) {
-      val vector = vectors(position)
-      columnSources(position) match {
-        case BroadcastJoinShape.FactColumn(_) =>
-          val readerIndex = factReaderIndex(factIndexByOutput(position))
-          if (currentNull(readerIndex)) vector.putNull(outputRow)
-          else vector.putInt(outputRow, currentValues(readerIndex))
-        case BroadcastJoinShape.DimensionColumn(dimensionIndex, attributeOrdinal) =>
-          val dimension = dimensions(dimensionIndex)
-          val attributeRow = dimension.rows(matchedRows(dimensionIndex))._2
-          if (attributeRow.isNullAt(attributeOrdinal)) {
-            vector.putNull(outputRow)
-          } else {
-            dimension.attributeTypes(attributeOrdinal) match {
-              case IntegerType | DateType => vector.putInt(outputRow, attributeRow.getInt(attributeOrdinal))
-              case LongType => vector.putLong(outputRow, attributeRow.getLong(attributeOrdinal))
-              case ShortType => vector.putShort(outputRow, attributeRow.getShort(attributeOrdinal))
-              case ByteType => vector.putByte(outputRow, attributeRow.getByte(attributeOrdinal))
-              case BooleanType => vector.putBoolean(outputRow, attributeRow.getBoolean(attributeOrdinal))
-              case StringType =>
-                val bytes = attributeRow.getUTF8String(attributeOrdinal).getBytes
-                vector.putByteArray(outputRow, bytes, 0, bytes.length)
-              case decimal: DecimalType =>
-                vector.putDecimal(outputRow,
-                  attributeRow.getDecimal(attributeOrdinal, decimal.precision, decimal.scale),
-                  decimal.precision)
-              case other =>
-                throw new IllegalStateException(s"unsupported dimension attribute type $other")
-            }
-          }
-      }
-      position += 1
-    }
-  }
 }

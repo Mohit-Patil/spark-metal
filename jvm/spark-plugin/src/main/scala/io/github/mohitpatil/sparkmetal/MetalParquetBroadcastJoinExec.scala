@@ -134,9 +134,7 @@ case class MetalParquetBroadcastJoinExec(
     val numPartitions = math.max(1, math.min(splits.length, sparkContext.defaultParallelism))
     val splitRDD = sparkContext.parallelize(splits, numPartitions)
 
-    val dimensions = prepared.dimensions
-    val denseTables = prepared.denseTables // Option[Broadcast[...]]
-    val multimaps = prepared.multimaps
+    val payloadBroadcast = prepared.payload
     val localColumnSources = columnSources
     val localFactIndex = factIndexByOutput
     val localOutput = outputAttributes
@@ -162,9 +160,10 @@ case class MetalParquetBroadcastJoinExec(
           // Bounded batches: the iterator owns store+reader and closes them
           // when the row group is exhausted (a task-completion listener
           // covers early termination, e.g. a LIMIT upstream).
+          val payload = payloadBroadcast.value
           new MetalParquetBroadcastJoinExec.CpuProbeBatchIterator(
             store, reader, schema, allColumnNames, descriptors, localKeyNames, localFactNames,
-            dimensions, denseTables.map(_.value), multimaps,
+            payload.dimensions, payload.denseTables, payload.multimaps,
             localColumnSources, localFactIndex, localOutput,
             numOutputRows, numOutputBatches, outputBuildTime)
         } catch {
@@ -256,16 +255,16 @@ case class MetalParquetBroadcastJoinExec(
       }
     }
 
-    val denseTables: Option[Broadcast[Array[Array[Int]]]] =
+    val denseTables: Option[Array[Array[Int]]] =
       if (denseUnavailable.isDefined) None
-      else Some(sparkContext.broadcast(dimensions.map { dimension =>
+      else Some(dimensions.map { dimension =>
         val maxKey = dimension.rows.iterator.map(_._1).max
         val table = Array.fill(maxKey + 1)(-1)
         dimension.rows.iterator.zipWithIndex.foreach { case ((key, _), rowIndex) =>
           table(key) = rowIndex
         }
         table
-      }.toArray))
+      }.toArray)
     val multimaps: Seq[Map[Int, Array[Int]]] =
       if (denseUnavailable.isEmpty) Seq.empty
       else dimensions.map { dimension =>
@@ -276,8 +275,9 @@ case class MetalParquetBroadcastJoinExec(
         grouped.view.mapValues(_.toArray).toMap
       }
 
-    MetalParquetBroadcastJoinExec.PreparedJoin(
-      dimensions, collectNanos, denseTables, multimaps, denseUnavailable)
+    val payload = sparkContext.broadcast(
+      MetalParquetBroadcastJoinExec.JoinProbePayload(dimensions, denseTables, multimaps))
+    MetalParquetBroadcastJoinExec.PreparedJoin(payload, collectNanos, denseUnavailable)
   }
 
   private[sparkmetal] def enumerateSplits(): Seq[ParquetGroupedAggregateSplit] = {
@@ -324,11 +324,21 @@ case class MetalParquetBroadcastJoinExec(
 
 private[sparkmetal] object MetalParquetBroadcastJoinExec {
 
-  private[sparkmetal] case class PreparedJoin(
+  /**
+   * Everything the executor-side probe needs, shipped as ONE broadcast so
+   * concurrent tasks share a single deserialized copy -- closure-captured
+   * dimensions were deserialized once PER TASK, and eight copies of a
+   * string-heavy dimension (item: ~204k rows) stacked on an already-heavy
+   * query's own buffers OOMed the 6g heap (q23b).
+   */
+  private[sparkmetal] case class JoinProbePayload(
       dimensions: Seq[GroupSpace.Dimension],
+      denseTables: Option[Array[Array[Int]]],
+      multimaps: Seq[Map[Int, Array[Int]]])
+
+  private[sparkmetal] case class PreparedJoin(
+      payload: Broadcast[JoinProbePayload],
       collectNanos: Long,
-      denseTables: Option[Broadcast[Array[Array[Int]]]],
-      multimaps: Seq[Map[Int, Array[Int]]],
       denseUnavailableReason: Option[String])
 
   private[sparkmetal] val preparedJoinCache =
@@ -368,7 +378,7 @@ private[sparkmetal] object MetalParquetBroadcastJoinExec {
       numOutputBatches: SQLMetric,
       outputBuildTime: SQLMetric) extends Iterator[ColumnarBatch] {
 
-    private val BatchRows = 131072
+    private val BatchRows = 32768
 
     private val readStore = new ColumnReadStoreImpl(
       store, new DummyRecordConverter(schema).getRootConverter, schema, "")
@@ -395,7 +405,7 @@ private[sparkmetal] object MetalParquetBroadcastJoinExec {
     override def next(): ColumnarBatch = {
       val buildStarted = System.nanoTime()
       val vectors: Array[OnHeapColumnVector] = outputAttributes.map { attribute =>
-        new OnHeapColumnVector(math.min(BatchRows, 65536), attribute.dataType)
+        new OnHeapColumnVector(8192, attribute.dataType)
       }.toArray
       var outputRow = 0
       while (row < rows && outputRow < BatchRows) {

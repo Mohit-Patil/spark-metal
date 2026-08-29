@@ -84,3 +84,20 @@ tier to selective regions regardless; a selectivity-aware gate (runtime,
 after the first row groups report survival) should decline regions that
 emit a large fraction of their input. Neither is speculative: both are
 sized by the phase data above.
+
+**Status (2026-08-29, kernel landed):** `fused_join_compact` shipped
+(atomic-slot compaction — join output order carries no meaning, so no
+prefix sum needed), with unified per-column page walks (a key that is also
+a fact output decodes into both plane types from one read), per-partition
+output scratch reuse, and 103/103 exact matches with the tier firing on 40
+queries. It moved the warmed batched-strict range from 0.37–0.70x to
+0.96–1.28x. The default-flip gate (>=1.10x on >=3 queries under ALL three
+protocols) is STILL not met — conservative-of-three after ~3h of sustained
+thermal load: q62 1.09x, q58 1.08x, q66 0.96x, q77 0.99x
+(`comparison-20260829T084052Z`, `comparison-isolated-*`,
+`comparison-join-winners`). Next levers, in measured order: the
+selectivity-aware runtime gate (cause 2 still burns the unselective
+regions the tier fires on), trimming rowGroupReadTime (parquet-mr page
+read + decompress is now the largest remaining stage), and a rested-machine
+protocol pass — the near-misses sit inside this machine's documented
+±40% thermal swing.

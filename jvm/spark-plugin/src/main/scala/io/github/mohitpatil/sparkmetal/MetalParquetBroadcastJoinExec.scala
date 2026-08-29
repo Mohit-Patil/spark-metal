@@ -186,6 +186,23 @@ case class MetalParquetBroadcastJoinExec(
 
       val DictionaryEncodings: Set[Encoding] = Set(Encoding.PLAIN_DICTIONARY, Encoding.RLE_DICTIONARY)
 
+      // Per-partition compact-output scratch, reused across row groups:
+      // allocating (and therefore zeroing) fresh rowCount-sized arrays per
+      // row group cost ~60-80MB of memset per row group for outputs that
+      // hold only survivors. Safe to reuse because flatMap fully drains one
+      // split's iterator before opening the next, and emitted batches copy
+      // into their own vectors. Grown to the largest row group seen.
+      var scratchRows = 0
+      var scratchDimIndices: Array[Array[Int]] = null
+      var scratchFactValues: Array[Array[Int]] = null
+      var scratchFactNulls: Array[Byte] = null
+      def ensureScratch(rowCount: Int): Unit = if (rowCount > scratchRows) {
+        scratchRows = rowCount
+        scratchDimIndices = Array.tabulate(keyCount)(_ => new Array[Int](rowCount))
+        scratchFactValues = Array.tabulate(factCount)(_ => new Array[Int](rowCount))
+        scratchFactNulls = new Array[Byte](math.max(1, factCount * rowCount))
+      }
+
       splitIterator.flatMap { split =>
         val readStarted = System.nanoTime()
         val reader = ParquetFileReader.open(HadoopInputFile.fromPath(
@@ -209,17 +226,25 @@ case class MetalParquetBroadcastJoinExec(
             rowGroupHandle = NativeBridge.parquetRowGroupBeginAggregate(
               streamHandle, rowCount, keyCount, factCount)
 
-            // Per non-overlapping key chunk: dictionary ids stay ids in the
-            // plane (the probe translates via the chunk's own dictionary);
-            // PLAIN chunks land raw values.
+            // One page walk per DISTINCT column: a column serving as both a
+            // join key and a fact output submits each page to BOTH plane
+            // types (the pages are read once; only the GPU expansion runs
+            // twice). Key planes keep dictionary IDS (the probe/kernel
+            // translates via the chunk's own dictionary); fact (measure)
+            // planes MATERIALIZE raw values through their staged dictionary.
             val keyDictionaries = new Array[Array[Int]](keyCount)
-            for (k <- 0 until keyCount if keyFactSlot(k) < 0) {
-              val descriptor = descriptorByName(localKeyNames(k))
+            for (columnName <- allColumnNames) {
+              val keyIndex = localKeyNames.indexOf(columnName)
+              val factSlot = localFactNames.indexOf(columnName)
+              val descriptor = descriptorByName(columnName)
               val pageReader = store.getPageReader(descriptor)
               val dictionaryPage = pageReader.readDictionaryPage()
               val isPlain = dictionaryPage == null
-              if (!isPlain) {
-                keyDictionaries(k) = MetalParquetBroadcastJoinExec.decodeDictionary(dictionaryPage)
+              val dictionaryValues =
+                if (isPlain) null else MetalParquetBroadcastJoinExec.decodeDictionary(dictionaryPage)
+              if (keyIndex >= 0) keyDictionaries(keyIndex) = dictionaryValues
+              if (factSlot >= 0 && dictionaryValues != null) {
+                NativeBridge.parquetSetMeasureDictionary(rowGroupHandle, factSlot, dictionaryValues)
               }
               val hasDefLevels = descriptor.getMaxDefinitionLevel > 0
               var rowOffset = 0
@@ -228,112 +253,114 @@ case class MetalParquetBroadcastJoinExec(
                 val dataPage = rawPage match {
                   case v1: DataPageV1 => v1
                   case other => throw new RuntimeException(
-                    s"${split.file}: ${localKeyNames(k)} unsupported Parquet page type ${other.getClass}")
+                    s"${split.file}: $columnName unsupported Parquet page type ${other.getClass}")
                 }
                 val encoding = dataPage.getValueEncoding
                 if (isPlain) {
                   if (encoding != Encoding.PLAIN) throw new RuntimeException(
-                    s"${split.file}: ${localKeyNames(k)} expected PLAIN encoding, got $encoding")
+                    s"${split.file}: $columnName expected PLAIN encoding, got $encoding")
                 } else if (!DictionaryEncodings.contains(encoding)) {
                   throw new RuntimeException(
-                    s"${split.file}: ${localKeyNames(k)} unsupported value encoding $encoding")
+                    s"${split.file}: $columnName unsupported value encoding $encoding")
                 }
                 val pageBytes = dataPage.getBytes.toByteArray
                 val valueCount = dataPage.getValueCount
                 val submitStarted = System.nanoTime()
-                NativeBridge.parquetDecodePage(
-                  streamHandle, rowGroupHandle, k, pageBytes, pageBytes.length, valueCount,
-                  rowOffset, hasDefLevels, isPlain)
+                if (keyIndex >= 0) {
+                  NativeBridge.parquetDecodePage(
+                    streamHandle, rowGroupHandle, keyIndex, pageBytes, pageBytes.length, valueCount,
+                    rowOffset, hasDefLevels, isPlain)
+                }
+                if (factSlot >= 0) {
+                  NativeBridge.parquetDecodeMeasurePage(
+                    streamHandle, rowGroupHandle, factSlot, pageBytes, pageBytes.length, valueCount,
+                    rowOffset, hasDefLevels)
+                }
                 pageSubmitTime += (System.nanoTime() - submitStarted) / 1000000
                 numPagesDecoded += 1
                 rowOffset += valueCount
                 rawPage = pageReader.readPage()
               }
               if (rowOffset != rowCount) throw new RuntimeException(
-                s"${split.file}: ${localKeyNames(k)} pages covered $rowOffset rows, expected $rowCount")
-            }
-
-            // Per fact chunk: values MATERIALIZE through the staged
-            // dictionary (or memcpy for PLAIN), so the plane holds raw ints.
-            for (m <- 0 until factCount) {
-              val descriptor = descriptorByName(localFactNames(m))
-              val pageReader = store.getPageReader(descriptor)
-              val dictionaryPage = pageReader.readDictionaryPage()
-              if (dictionaryPage != null) {
-                NativeBridge.parquetSetMeasureDictionary(
-                  rowGroupHandle, m, MetalParquetBroadcastJoinExec.decodeDictionary(dictionaryPage))
-              }
-              val hasDefLevels = descriptor.getMaxDefinitionLevel > 0
-              var rowOffset = 0
-              var rawPage = pageReader.readPage()
-              while (rawPage != null) {
-                val dataPage = rawPage match {
-                  case v1: DataPageV1 => v1
-                  case other => throw new RuntimeException(
-                    s"${split.file}: ${localFactNames(m)} unsupported Parquet page type ${other.getClass}")
-                }
-                val encoding = dataPage.getValueEncoding
-                if (dictionaryPage != null) {
-                  if (!DictionaryEncodings.contains(encoding)) throw new RuntimeException(
-                    s"${split.file}: ${localFactNames(m)} expected dictionary encoding, got $encoding")
-                } else if (encoding != Encoding.PLAIN) {
-                  throw new RuntimeException(
-                    s"${split.file}: ${localFactNames(m)} expected PLAIN encoding, got $encoding")
-                }
-                val pageBytes = dataPage.getBytes.toByteArray
-                val valueCount = dataPage.getValueCount
-                val submitStarted = System.nanoTime()
-                NativeBridge.parquetDecodeMeasurePage(
-                  streamHandle, rowGroupHandle, m, pageBytes, pageBytes.length, valueCount,
-                  rowOffset, hasDefLevels)
-                pageSubmitTime += (System.nanoTime() - submitStarted) / 1000000
-                numPagesDecoded += 1
-                rowOffset += valueCount
-                rawPage = pageReader.readPage()
-              }
-              if (rowOffset != rowCount) throw new RuntimeException(
-                s"${split.file}: ${localFactNames(m)} pages covered $rowOffset rows, expected $rowCount")
+                s"${split.file}: $columnName pages covered $rowOffset rows, expected $rowCount")
             }
             decodeParseTime += (System.nanoTime() - parseStarted) / 1000000
 
-            // ---- Blocking readback of the decoded planes ----
-            val metalStarted = System.nanoTime()
-            val columnValues = new Array[Array[Int]](allColumnNames.length)
-            val columnValidity = new Array[Array[Byte]](allColumnNames.length)
-            val columnDictionaries = new Array[Array[Int]](allColumnNames.length)
-            for (m <- 0 until factCount) {
-              val position = columnIndexByName(localFactNames(m))
-              val values = new Array[Int](rowCount)
-              val validity = new Array[Byte](rowCount)
-              NativeBridge.parquetRowGroupReadMeasure(
-                streamHandle, rowGroupHandle, m, values, validity)
-              columnValues(position) = values
-              columnValidity(position) = validity
-            }
-            for (k <- 0 until keyCount if keyFactSlot(k) < 0) {
-              val position = columnIndexByName(localKeyNames(k))
-              val values = new Array[Int](rowCount)
-              val validity = new Array[Byte](rowCount)
-              NativeBridge.parquetRowGroupRead(
-                streamHandle, rowGroupHandle, k, values, validity)
-              columnValues(position) = values
-              columnValidity(position) = validity
-              columnDictionaries(position) = keyDictionaries(k)
-            }
-            NativeBridge.parquetRowGroupRelease(rowGroupHandle)
-            rowGroupHandle = 0L
-            metalTime += (System.nanoTime() - metalStarted) / 1000000
+            payload.denseTables match {
+              case Some(tables) =>
+                // ---- GPU probe + compaction (v1.1): only SURVIVORS come
+                // back. Per-chunk translation exactly as the grouped tier:
+                // a dictionary chunk's table is re-indexed into that
+                // chunk's dictionary-id space; a PLAIN chunk uses the
+                // value-space table directly.
+                val codesTables: Array[Array[Int]] = Array.tabulate(keyCount) { k =>
+                  val table = tables(k)
+                  val dictionary = keyDictionaries(k)
+                  if (dictionary == null) table
+                  else dictionary.map(value =>
+                    if (value >= 0 && value < table.length) table(value) else -1)
+                }
+                val metalStarted = System.nanoTime()
+                ensureScratch(rowCount)
+                val outDimIndices = scratchDimIndices
+                val outFactValues = scratchFactValues
+                val outFactNulls = scratchFactNulls
+                val survivors = NativeBridge.parquetRowGroupJoinCompact(
+                  streamHandle, rowGroupHandle, codesTables,
+                  outDimIndices, outFactValues, outFactNulls)
+                NativeBridge.parquetRowGroupRelease(rowGroupHandle)
+                rowGroupHandle = 0L
+                metalTime += (System.nanoTime() - metalStarted) / 1000000
 
-            store.close()
-            reader.close()
-            new MetalParquetBroadcastJoinExec.PlaneProbeBatchIterator(
-              rowCount, allColumnNames.length,
-              localKeyNames.map(columnIndexByName).toArray,
-              localFactNames.map(columnIndexByName).toArray,
-              columnValues, columnValidity, columnDictionaries,
-              payload.dimensions, payload.denseTables, payload.multimaps,
-              localColumnSources, localFactIndex, localOutput,
-              numOutputRows, numOutputBatches, outputBuildTime)
+                store.close()
+                reader.close()
+                new MetalParquetBroadcastJoinExec.CompactedBatchIterator(
+                  survivors, rowCount, outDimIndices, outFactValues, outFactNulls,
+                  payload.dimensions, localColumnSources, localFactIndex, localOutput,
+                  numOutputRows, numOutputBatches, outputBuildTime)
+
+              case None =>
+                // ---- Duplicate-key/multimap region: full-plane readback and
+                // JVM probe with Cartesian fan-out (the kernel cannot fan
+                // out; these regions are rare and stay on this path).
+                val metalStarted = System.nanoTime()
+                val columnValues = new Array[Array[Int]](allColumnNames.length)
+                val columnValidity = new Array[Array[Byte]](allColumnNames.length)
+                val columnDictionaries = new Array[Array[Int]](allColumnNames.length)
+                for (m <- 0 until factCount) {
+                  val position = columnIndexByName(localFactNames(m))
+                  val values = new Array[Int](rowCount)
+                  val validity = new Array[Byte](rowCount)
+                  NativeBridge.parquetRowGroupReadMeasure(
+                    streamHandle, rowGroupHandle, m, values, validity)
+                  columnValues(position) = values
+                  columnValidity(position) = validity
+                }
+                for (k <- 0 until keyCount if keyFactSlot(k) < 0) {
+                  val position = columnIndexByName(localKeyNames(k))
+                  val values = new Array[Int](rowCount)
+                  val validity = new Array[Byte](rowCount)
+                  NativeBridge.parquetRowGroupRead(
+                    streamHandle, rowGroupHandle, k, values, validity)
+                  columnValues(position) = values
+                  columnValidity(position) = validity
+                  columnDictionaries(position) = keyDictionaries(k)
+                }
+                NativeBridge.parquetRowGroupRelease(rowGroupHandle)
+                rowGroupHandle = 0L
+                metalTime += (System.nanoTime() - metalStarted) / 1000000
+
+                store.close()
+                reader.close()
+                new MetalParquetBroadcastJoinExec.PlaneProbeBatchIterator(
+                  rowCount, allColumnNames.length,
+                  localKeyNames.map(columnIndexByName).toArray,
+                  localFactNames.map(columnIndexByName).toArray,
+                  columnValues, columnValidity, columnDictionaries,
+                  payload.dimensions, payload.denseTables, payload.multimaps,
+                  localColumnSources, localFactIndex, localOutput,
+                  numOutputRows, numOutputBatches, outputBuildTime)
+            }
           } catch {
             case e: RuntimeException =>
               // The native decoder rejected a page (or some other runtime
@@ -533,6 +560,112 @@ private[sparkmetal] object MetalParquetBroadcastJoinExec {
   private[sparkmetal] val preparedJoinCache =
     new BoundedCache[(String, Seq[SparkPlan]), PreparedJoin](32)
 
+  /**
+   * Gathers one dimension-attribute output column: for batch rows
+   * 0..count-1, reads `indices(sourceOffset + i)`'s build row and writes its
+   * attribute `ordinal` (or a null) into the vector — one type dispatch per
+   * COLUMN, tight monomorphic loops per case. Shared by the probe iterators
+   * and the compacted-survivor iterator.
+   */
+  private def gatherDimensionColumn(
+      vector: OnHeapColumnVector,
+      dimension: GroupSpace.Dimension,
+      ordinal: Int,
+      indices: Array[Int],
+      sourceOffset: Int,
+      count: Int): Unit = {
+    val dimensionRows = dimension.rows
+    def loop(write: (Int, InternalRow) => Unit): Unit = {
+      var i = 0
+      while (i < count) {
+        val attributeRow = dimensionRows(indices(sourceOffset + i))._2
+        if (attributeRow.isNullAt(ordinal)) vector.putNull(i) else write(i, attributeRow)
+        i += 1
+      }
+    }
+    dimension.attributeTypes(ordinal) match {
+      case IntegerType | DateType => loop((i, r) => vector.putInt(i, r.getInt(ordinal)))
+      case LongType => loop((i, r) => vector.putLong(i, r.getLong(ordinal)))
+      case ShortType => loop((i, r) => vector.putShort(i, r.getShort(ordinal)))
+      case ByteType => loop((i, r) => vector.putByte(i, r.getByte(ordinal)))
+      case BooleanType => loop((i, r) => vector.putBoolean(i, r.getBoolean(ordinal)))
+      case StringType => loop { (i, r) =>
+        val bytes = r.getUTF8String(ordinal).getBytes
+        vector.putByteArray(i, bytes, 0, bytes.length)
+      }
+      case decimal: DecimalType => loop((i, r) =>
+        vector.putDecimal(i, r.getDecimal(ordinal, decimal.precision, decimal.scale), decimal.precision))
+      case other =>
+        throw new IllegalStateException(s"unsupported dimension attribute type $other")
+    }
+  }
+
+  /**
+   * Emits bounded batches from fused_join_compact's survivor arrays: fact
+   * values/null flags come straight from the compacted readback
+   * (`factNulls` is fact-major with `nullStride` — the row-group row count
+   * — matching the kernel's out_fact_nulls layout); dimension attributes
+   * gather by compacted build-row index. No probing happens here — the GPU
+   * already did it.
+   */
+  private[sparkmetal] final class CompactedBatchIterator(
+      survivors: Int,
+      nullStride: Int,
+      dimIndices: Array[Array[Int]],
+      factValues: Array[Array[Int]],
+      factNulls: Array[Byte],
+      dimensions: Seq[GroupSpace.Dimension],
+      columnSources: Seq[BroadcastJoinShape.ColumnSource],
+      factIndexByOutput: Array[Int],
+      outputAttributes: Seq[Attribute],
+      numOutputRows: SQLMetric,
+      numOutputBatches: SQLMetric,
+      outputBuildTime: SQLMetric) extends Iterator[ColumnarBatch] {
+
+    private val BatchRows = 32768
+    private var offset = 0
+
+    override def hasNext: Boolean = offset < survivors
+
+    override def next(): ColumnarBatch = {
+      val buildStarted = System.nanoTime()
+      val count = math.min(BatchRows, survivors - offset)
+      val vectors: Array[OnHeapColumnVector] = outputAttributes.map { attribute =>
+        new OnHeapColumnVector(math.max(1, count), attribute.dataType)
+      }.toArray
+      var position = 0
+      while (position < vectors.length) {
+        val factSlot = factIndexByOutput(position)
+        if (factSlot >= 0) {
+          val values = factValues(factSlot)
+          val nullBase = factSlot * nullStride + offset
+          val vector = vectors(position)
+          var i = 0
+          while (i < count) {
+            if (factNulls(nullBase + i) != 0) vector.putNull(i)
+            else vector.putInt(i, values(offset + i))
+            i += 1
+          }
+        } else {
+          columnSources(position) match {
+            case BroadcastJoinShape.DimensionColumn(dimensionIndex, ordinal) =>
+              gatherDimensionColumn(
+                vectors(position), dimensions(dimensionIndex), ordinal,
+                dimIndices(dimensionIndex), offset, count)
+            case other =>
+              throw new IllegalStateException(s"unexpected column source $other")
+          }
+        }
+        position += 1
+      }
+      offset += count
+      numOutputRows += count
+      numOutputBatches += 1
+      outputBuildTime += (System.nanoTime() - buildStarted) / 1000000
+      new ColumnarBatch(vectors.map(vector => vector: ColumnVector), count)
+    }
+  }
+
   private[sparkmetal] def decodeDictionary(dictionaryPage: DictionaryPage): Array[Int] = {
     val bytes = dictionaryPage.getBytes.toByteArray
     val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
@@ -647,33 +780,9 @@ private[sparkmetal] object MetalParquetBroadcastJoinExec {
           i += 1
         }
       } else {
-        val dimension = dimensions(outDimIndex(position))
-        val ordinal = outDimOrdinal(position)
-        val dimensionRows = dimension.rows
-        val indices = capturedDimRows(outDimIndex(position))
-        def loop(write: (Int, InternalRow) => Unit): Unit = {
-          var i = 0
-          while (i < count) {
-            val attributeRow = dimensionRows(indices(i))._2
-            if (attributeRow.isNullAt(ordinal)) vector.putNull(i) else write(i, attributeRow)
-            i += 1
-          }
-        }
-        dimension.attributeTypes(ordinal) match {
-          case IntegerType | DateType => loop((i, r) => vector.putInt(i, r.getInt(ordinal)))
-          case LongType => loop((i, r) => vector.putLong(i, r.getLong(ordinal)))
-          case ShortType => loop((i, r) => vector.putShort(i, r.getShort(ordinal)))
-          case ByteType => loop((i, r) => vector.putByte(i, r.getByte(ordinal)))
-          case BooleanType => loop((i, r) => vector.putBoolean(i, r.getBoolean(ordinal)))
-          case StringType => loop { (i, r) =>
-            val bytes = r.getUTF8String(ordinal).getBytes
-            vector.putByteArray(i, bytes, 0, bytes.length)
-          }
-          case decimal: DecimalType => loop((i, r) =>
-            vector.putDecimal(i, r.getDecimal(ordinal, decimal.precision, decimal.scale), decimal.precision))
-          case other =>
-            throw new IllegalStateException(s"unsupported dimension attribute type $other")
-        }
+        gatherDimensionColumn(
+          vector, dimensions(outDimIndex(position)), outDimOrdinal(position),
+          capturedDimRows(outDimIndex(position)), 0, count)
       }
     }
 

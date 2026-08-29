@@ -24,6 +24,7 @@ id<MTLComputePipelineState> membershipCountMultiplicityPipeline;
 id<MTLComputePipelineState> expandValueRunsPipeline;
 id<MTLComputePipelineState> scatterSegmentsPipeline;
 id<MTLComputePipelineState> groupedAggregatePipeline;
+id<MTLComputePipelineState> joinCompactPipeline;
 // Bound as fused_grouped_aggregate's factor table for every key column that
 // has no factor table of its own (factor_length = 0, so the kernel never
 // dereferences it) and for every unused key/measure buffer slot. Holds the
@@ -625,6 +626,17 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_initialize(
             [device newComputePipelineStateWithFunction:groupedAggregateFunction error:&error];
         if (groupedAggregatePipeline == nil) {
             throwRuntime(environment, [NSString stringWithFormat:@"Cannot build grouped-aggregate pipeline: %@", error]);
+            return;
+        }
+        id<MTLFunction> joinCompactFunction = [library newFunctionWithName:@"fused_join_compact"];
+        if (joinCompactFunction == nil) {
+            throwRuntime(environment, @"Kernel fused_join_compact was not found");
+            return;
+        }
+        joinCompactPipeline =
+            [device newComputePipelineStateWithFunction:joinCompactFunction error:&error];
+        if (joinCompactPipeline == nil) {
+            throwRuntime(environment, [NSString stringWithFormat:@"Cannot build join-compact pipeline: %@", error]);
             return;
         }
         unitFactorBuffer = [device newBufferWithLength:sizeof(uint32_t)
@@ -2933,6 +2945,239 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetRowGroupAggregate(
         auto &rowGroups = stream->rowGroups;
         rowGroups.erase(std::remove(rowGroups.begin(), rowGroups.end(), rowGroup), rowGroups.end());
         delete rowGroup;
+    }
+}
+
+// Mirrors kernels.metal's JoinCompactParams field-for-field (all uint32).
+struct JoinCompactParams {
+    uint32_t rowCount;
+    uint32_t keyCount;
+    uint32_t factCount;
+    uint32_t codeLength[kMaxAggregateKeyColumns];
+};
+
+// v1.1 broadcast-join tier: encodes fused_join_compact over the row group's
+// decoded key + fact (measure) planes with per-key build-row-index tables,
+// commits and WAITS, then copies back only the survivors: per-key matched
+// build-row indices, per-fact values, and per-fact null flags (fact-major,
+// rowCount stride, matching the kernel's out_fact_nulls layout). Returns the
+// survivor count. The row-group handle stays alive; the caller releases it.
+extern "C" JNIEXPORT jint JNICALL
+Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetRowGroupJoinCompact(
+    JNIEnv *environment,
+    jclass,
+    jlong streamHandle,
+    jlong rowGroupHandle,
+    jobjectArray codes,
+    jobjectArray outDimIndices,
+    jobjectArray outFactValues,
+    jbyteArray outFactNulls) {
+    @autoreleasepool {
+        if (joinCompactPipeline == nil || commandQueue == nil) {
+            throwRuntime(environment, @"NativeBridge.initialize must be called first");
+            return -1;
+        }
+        if (streamHandle == 0 || rowGroupHandle == 0 || codes == nullptr ||
+            outDimIndices == nullptr || outFactValues == nullptr || outFactNulls == nullptr) {
+            throwRuntime(environment, @"Invalid join-compact arguments");
+            return -1;
+        }
+        auto *stream = reinterpret_cast<MembershipStream *>(
+            static_cast<uintptr_t>(streamHandle));
+        auto *rowGroup = reinterpret_cast<ParquetRowGroup *>(
+            static_cast<uintptr_t>(rowGroupHandle));
+        if (rowGroup->stream != stream) {
+            throwRuntime(environment, @"Row group does not belong to the given stream");
+            return -1;
+        }
+        uint32_t keyCount = rowGroup->keyCount;
+        uint32_t factCount = rowGroup->measureCount;
+        uint32_t rowCount = rowGroup->rowCount;
+        if (keyCount == 0 || keyCount > kMaxAggregateKeyColumns ||
+            factCount > kMaxAggregateMeasureSlots) {
+            throwRuntime(environment, @"Join compaction supports 1-4 keys and 0-4 fact columns");
+            return -1;
+        }
+        if (static_cast<uint32_t>(environment->GetArrayLength(codes)) != keyCount ||
+            static_cast<uint32_t>(environment->GetArrayLength(outDimIndices)) != keyCount ||
+            static_cast<uint32_t>(environment->GetArrayLength(outFactValues)) != factCount ||
+            static_cast<uint32_t>(environment->GetArrayLength(outFactNulls)) <
+                factCount * rowCount) {
+            throwRuntime(environment, @"Join-compact array shapes do not match the row group");
+            return -1;
+        }
+
+        JoinCompactParams params = {};
+        params.rowCount = rowCount;
+        params.keyCount = keyCount;
+        params.factCount = factCount;
+
+        std::vector<id<MTLBuffer>> usedStaging;
+        id<MTLBuffer> codeBuffers[kMaxAggregateKeyColumns] = {nil, nil, nil, nil};
+        for (uint32_t column = 0; column < keyCount; ++column) {
+            auto codeTable = static_cast<jintArray>(
+                environment->GetObjectArrayElement(codes, static_cast<jsize>(column)));
+            if (codeTable == nullptr) {
+                throwRuntime(environment, @"Join compaction requires a code table per key column");
+                return -1;
+            }
+            jsize codeLength = environment->GetArrayLength(codeTable);
+            if (codeLength <= 0) {
+                environment->DeleteLocalRef(codeTable);
+                throwRuntime(environment, @"A join-compact code table must not be empty");
+                return -1;
+            }
+            id<MTLBuffer> codeBuffer = acquireStagingBuffer(
+                stream, static_cast<size_t>(codeLength) * sizeof(int32_t));
+            if (codeBuffer == nil) {
+                environment->DeleteLocalRef(codeTable);
+                throwRuntime(environment, @"Cannot allocate a join-compact code table");
+                return -1;
+            }
+            environment->GetIntArrayRegion(
+                codeTable, 0, codeLength, static_cast<jint *>(codeBuffer.contents));
+            environment->DeleteLocalRef(codeTable);
+            if (environment->ExceptionCheck()) return -1;
+            usedStaging.push_back(codeBuffer);
+            codeBuffers[column] = codeBuffer;
+            params.codeLength[column] = static_cast<uint32_t>(codeLength);
+        }
+
+        id<MTLBuffer> counterBuffer = acquireStagingBuffer(stream, sizeof(uint32_t));
+        if (counterBuffer == nil) {
+            throwRuntime(environment, @"Cannot allocate the join-compact survivor counter");
+            return -1;
+        }
+        usedStaging.push_back(counterBuffer);
+        memset(counterBuffer.contents, 0, sizeof(uint32_t));
+
+        id<MTLBuffer> outDimBuffers[kMaxAggregateKeyColumns] = {nil, nil, nil, nil};
+        for (uint32_t column = 0; column < keyCount; ++column) {
+            outDimBuffers[column] = acquireStagingBuffer(
+                stream, std::max<size_t>(4, static_cast<size_t>(rowCount) * sizeof(int32_t)));
+            if (outDimBuffers[column] == nil) {
+                throwRuntime(environment, @"Cannot allocate a join-compact dimension output");
+                return -1;
+            }
+            usedStaging.push_back(outDimBuffers[column]);
+        }
+        id<MTLBuffer> outFactBuffers[kMaxAggregateMeasureSlots] = {nil, nil, nil, nil};
+        for (uint32_t fact = 0; fact < factCount; ++fact) {
+            outFactBuffers[fact] = acquireStagingBuffer(
+                stream, std::max<size_t>(4, static_cast<size_t>(rowCount) * sizeof(int32_t)));
+            if (outFactBuffers[fact] == nil) {
+                throwRuntime(environment, @"Cannot allocate a join-compact fact output");
+                return -1;
+            }
+            usedStaging.push_back(outFactBuffers[fact]);
+        }
+        id<MTLBuffer> outFactNullBuffer = acquireStagingBuffer(
+            stream, std::max<size_t>(4, static_cast<size_t>(factCount) * rowCount));
+        if (outFactNullBuffer == nil) {
+            throwRuntime(environment, @"Cannot allocate the join-compact null-flag output");
+            return -1;
+        }
+        usedStaging.push_back(outFactNullBuffer);
+
+        id<MTLComputeCommandEncoder> encoder = rowGroupEncoder(rowGroup);
+        if (encoder == nil) {
+            rowGroup->pendingStaging.insert(
+                rowGroup->pendingStaging.end(), usedStaging.begin(), usedStaging.end());
+            throwRuntime(environment, @"Cannot open a Parquet row-group compute encoder");
+            return -1;
+        }
+        [encoder setComputePipelineState:joinCompactPipeline];
+        // Every fixed slot bound, used or not (an unbound argument is
+        // undefined behaviour in Metal); the kernel's key_count/fact_count
+        // guards keep unused placeholders undereferenced.
+        for (uint32_t column = 0; column < kMaxAggregateKeyColumns; ++column) {
+            bool used = column < keyCount;
+            [encoder setBuffer:(used ? rowGroup->ids[column] : dummyDictionaryBuffer)
+                offset:0 atIndex:column];
+            [encoder setBuffer:(used ? rowGroup->validity[column] : dummyDictionaryBuffer)
+                offset:0 atIndex:column + 4];
+            [encoder setBuffer:(used ? codeBuffers[column] : dummyDictionaryBuffer)
+                offset:0 atIndex:column + 8];
+        }
+        for (uint32_t fact = 0; fact < kMaxAggregateMeasureSlots; ++fact) {
+            bool used = fact < factCount;
+            [encoder setBuffer:(used ? rowGroup->measureValues[fact] : dummyDictionaryBuffer)
+                offset:0 atIndex:fact + 12];
+            [encoder setBuffer:(used ? rowGroup->measureValidity[fact] : dummyDictionaryBuffer)
+                offset:0 atIndex:fact + 16];
+        }
+        [encoder setBuffer:counterBuffer offset:0 atIndex:20];
+        for (uint32_t column = 0; column < kMaxAggregateKeyColumns; ++column) {
+            [encoder setBuffer:(column < keyCount ? outDimBuffers[column] : dummyDictionaryBuffer)
+                offset:0 atIndex:column + 21];
+        }
+        for (uint32_t fact = 0; fact < kMaxAggregateMeasureSlots; ++fact) {
+            [encoder setBuffer:(fact < factCount ? outFactBuffers[fact] : dummyDictionaryBuffer)
+                offset:0 atIndex:fact + 25];
+        }
+        [encoder setBuffer:outFactNullBuffer offset:0 atIndex:29];
+        [encoder setBytes:&params length:sizeof(params) atIndex:30];
+        constexpr NSUInteger threadsPerGroup = 256;
+        NSUInteger threadgroups =
+            (static_cast<NSUInteger>(rowCount) + threadsPerGroup - 1) / threadsPerGroup;
+        [encoder dispatchThreadgroups:MTLSizeMake(threadgroups, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+
+        // Park this call's staging on the row group BEFORE the wait, so a
+        // throw below still leaves everything keyed to the commit.
+        rowGroup->pendingStaging.insert(
+            rowGroup->pendingStaging.end(), usedStaging.begin(), usedStaging.end());
+
+        // Commit the row group's open command buffer and wait for the whole
+        // stream, exactly like parquetRowGroupRead: the serial queue runs the
+        // decode dispatches before this kernel, and the wait makes the output
+        // buffers readable.
+        commitRowGroup(rowGroup);
+        for (id<MTLCommandBuffer> commandBuffer : stream->commandBuffers) {
+            [commandBuffer waitUntilCompleted];
+            if (commandBuffer.status == MTLCommandBufferStatusError) {
+                throwRuntime(environment,
+                    [NSString stringWithFormat:@"Metal command failed: %@", commandBuffer.error]);
+                return -1;
+            }
+        }
+
+        uint32_t survivors = *static_cast<uint32_t *>(counterBuffer.contents);
+        if (survivors > rowCount) {
+            throwRuntime(environment, @"Join compaction produced more survivors than rows");
+            return -1;
+        }
+        for (uint32_t column = 0; column < keyCount && survivors > 0; ++column) {
+            auto target = static_cast<jintArray>(
+                environment->GetObjectArrayElement(outDimIndices, static_cast<jsize>(column)));
+            if (target == nullptr ||
+                static_cast<uint32_t>(environment->GetArrayLength(target)) < survivors) {
+                throwRuntime(environment, @"Join-compact dimension output array is too small");
+                return -1;
+            }
+            environment->SetIntArrayRegion(target, 0, static_cast<jsize>(survivors),
+                static_cast<jint *>(outDimBuffers[column].contents));
+            environment->DeleteLocalRef(target);
+            if (environment->ExceptionCheck()) return -1;
+        }
+        for (uint32_t fact = 0; fact < factCount && survivors > 0; ++fact) {
+            auto target = static_cast<jintArray>(
+                environment->GetObjectArrayElement(outFactValues, static_cast<jsize>(fact)));
+            if (target == nullptr ||
+                static_cast<uint32_t>(environment->GetArrayLength(target)) < survivors) {
+                throwRuntime(environment, @"Join-compact fact output array is too small");
+                return -1;
+            }
+            environment->SetIntArrayRegion(target, 0, static_cast<jsize>(survivors),
+                static_cast<jint *>(outFactBuffers[fact].contents));
+            environment->DeleteLocalRef(target);
+            if (environment->ExceptionCheck()) return -1;
+            environment->SetByteArrayRegion(outFactNulls,
+                static_cast<jsize>(fact * rowCount), static_cast<jsize>(survivors),
+                static_cast<jbyte *>(outFactNullBuffer.contents) + fact * rowCount);
+            if (environment->ExceptionCheck()) return -1;
+        }
+        return static_cast<jint>(survivors);
     }
 }
 

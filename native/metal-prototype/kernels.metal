@@ -407,3 +407,89 @@ kernel void fused_membership_count_3_multiplicity(
         partial_counts[group_index] = scratch[0];
     }
 }
+
+// v1.1 broadcast-join tier (docs/GPU_BROADCAST_JOIN_SPEC.md, ROADMAP M6):
+// probes each decoded row against per-key build-row-index tables and
+// compacts the SURVIVORS -- their fact-column values and null flags plus
+// their matched per-dimension build-row indices -- into dense output
+// buffers, so the host reads back only survivors instead of every decoded
+// plane. Gating mirrors fused_grouped_aggregate exactly: a row survives iff
+// every key column is non-null (validity planes are zero-filled = valid;
+// the decode marks NULL rows 1) and every key's table lookup is >= 0 (the
+// tables map dictionary ids or raw values to the dimension's build-row
+// index, -1 = non-member). Output slots come from a relaxed atomic counter,
+// so output ORDER is unspecified -- join output order carries no meaning.
+// out_fact_nulls is fact-major with row_count stride:
+// out_fact_nulls[fact * row_count + slot].
+struct JoinCompactParams {
+    uint row_count;
+    uint key_count;
+    uint fact_count;
+    uint code_length[4];
+};
+
+kernel void fused_join_compact(
+    device const int *key_ids_0 [[buffer(0)]],
+    device const int *key_ids_1 [[buffer(1)]],
+    device const int *key_ids_2 [[buffer(2)]],
+    device const int *key_ids_3 [[buffer(3)]],
+    device const uchar *key_nulls_0 [[buffer(4)]],
+    device const uchar *key_nulls_1 [[buffer(5)]],
+    device const uchar *key_nulls_2 [[buffer(6)]],
+    device const uchar *key_nulls_3 [[buffer(7)]],
+    device const int *code_table_0 [[buffer(8)]],
+    device const int *code_table_1 [[buffer(9)]],
+    device const int *code_table_2 [[buffer(10)]],
+    device const int *code_table_3 [[buffer(11)]],
+    device const int *fact_values_0 [[buffer(12)]],
+    device const int *fact_values_1 [[buffer(13)]],
+    device const int *fact_values_2 [[buffer(14)]],
+    device const int *fact_values_3 [[buffer(15)]],
+    device const uchar *fact_nulls_0 [[buffer(16)]],
+    device const uchar *fact_nulls_1 [[buffer(17)]],
+    device const uchar *fact_nulls_2 [[buffer(18)]],
+    device const uchar *fact_nulls_3 [[buffer(19)]],
+    device atomic_uint *survivor_count [[buffer(20)]],
+    device int *out_dim_0 [[buffer(21)]],
+    device int *out_dim_1 [[buffer(22)]],
+    device int *out_dim_2 [[buffer(23)]],
+    device int *out_dim_3 [[buffer(24)]],
+    device int *out_fact_0 [[buffer(25)]],
+    device int *out_fact_1 [[buffer(26)]],
+    device int *out_fact_2 [[buffer(27)]],
+    device int *out_fact_3 [[buffer(28)]],
+    device uchar *out_fact_nulls [[buffer(29)]],
+    constant JoinCompactParams &params [[buffer(30)]],
+    uint global_index [[thread_position_in_grid]])
+{
+    if (global_index >= params.row_count) return;
+
+    device const int *key_ids[4] = {key_ids_0, key_ids_1, key_ids_2, key_ids_3};
+    device const uchar *key_nulls[4] = {key_nulls_0, key_nulls_1, key_nulls_2, key_nulls_3};
+    device const int *code_tables[4] = {code_table_0, code_table_1, code_table_2, code_table_3};
+    device const int *fact_values[4] = {fact_values_0, fact_values_1, fact_values_2, fact_values_3};
+    device const uchar *fact_nulls[4] = {fact_nulls_0, fact_nulls_1, fact_nulls_2, fact_nulls_3};
+    device int *out_dims[4] = {out_dim_0, out_dim_1, out_dim_2, out_dim_3};
+    device int *out_facts[4] = {out_fact_0, out_fact_1, out_fact_2, out_fact_3};
+
+    int matched[4] = {0, 0, 0, 0};
+    for (uint column = 0u; column < params.key_count && column < 4u; ++column) {
+        if (key_nulls[column][global_index] != 0) return;
+        int identifier = key_ids[column][global_index];
+        if (identifier < 0) return;
+        uint entry = uint(identifier);
+        if (entry >= params.code_length[column]) return;
+        int build_row = code_tables[column][entry];
+        if (build_row < 0) return;
+        matched[column] = build_row;
+    }
+
+    uint slot = atomic_fetch_add_explicit(survivor_count, 1u, memory_order_relaxed);
+    for (uint column = 0u; column < params.key_count && column < 4u; ++column) {
+        out_dims[column][slot] = matched[column];
+    }
+    for (uint fact = 0u; fact < params.fact_count && fact < 4u; ++fact) {
+        out_facts[fact][slot] = fact_values[fact][global_index];
+        out_fact_nulls[fact * params.row_count + slot] = fact_nulls[fact][global_index];
+    }
+}

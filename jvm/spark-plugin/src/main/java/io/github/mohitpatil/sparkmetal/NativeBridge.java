@@ -245,6 +245,24 @@ public final class NativeBridge {
     public static native void parquetAggregateStreamAbort(long streamHandle);
 
     /**
+     * v1.1 broadcast-join tier: probes the row group's decoded key planes
+     * against per-key build-row-index tables (dictionary-id or value space,
+     * exactly like parquetRowGroupAggregate's codes) and compacts the
+     * SURVIVORS on the GPU: outDimIndices[k] receives dimension k's matched
+     * build-row index for survivors 0..n-1, outFactValues[m] receives fact
+     * slot m's values, and outFactNulls (fact-major, rowCount stride:
+     * index m * rowCount + i) their null flags (nonzero = null). Blocks
+     * until the stream's work completes and returns n. Output order is
+     * unspecified. The row-group handle stays alive; release it afterward.
+     */
+    public static native int parquetRowGroupJoinCompact(
+            long streamHandle, long rowGroupHandle,
+            int[][] codes,
+            int[][] outDimIndices,
+            int[][] outFactValues,
+            byte[] outFactNulls);
+
+    /**
      * Reads back the stream's page-decode sub-phase accumulators as
      * {stagingNanos, parseNanos, encodeNanos, pages}: staging is the JNI byte
      * transfer into a pooled staging buffer, parse is parseDataPageV1, encode

@@ -86,13 +86,17 @@ New pieces:
    (`-1` = non-member) — the same construction as the grouped tier's code
    tables with the premultiplied group code replaced by the dimension's own
    row index — plus the duplicate-key check; broadcast the tables.
-3. **Kernel** (`fused_join_compact`): per row group, over the decoded key
-   planes and fact-output planes: a row survives iff every key is non-null
-   and every dimension's table lookup is >= 0. A threadgroup-scan prefix
-   sum assigns each surviving row its compacted output slot; the kernel
-   scatters (a) each fact output column's int32 value and (b) each
-   dimension's matched build-row index into per-row-group output buffers,
-   and writes the surviving-row count.
+3. **Probe and compaction — staged.** The GPU's measured leverage is the
+   Parquet decode (phase benchmark, 2026-08-29: native parse/encode
+   dominate the accelerated stages; a table probe is one array read per
+   row, ~1ms per million rows on CPU). v1 therefore runs the existing GPU
+   page decode, reads the decoded key and fact planes back through the
+   existing `parquetRowGroupRead` / `parquetRowGroupReadMeasure` surface,
+   and fuses probe + compaction + gather into the single CPU pass that
+   builds the output vectors (which must walk every surviving row anyway).
+   A `fused_join_compact` kernel (GPU probe, prefix-sum compaction,
+   scatter) is a v1.1 follow-up, justified only if the extended phase
+   benchmark shows the CPU probe/compact pass as a first-order term.
 4. **Output** (`supportsColumnar = true`): per row group, the JVM wraps the
    compacted fact columns into off-heap `ColumnVector`s and CPU-gathers each
    dimension-attribute output column from the collected dimension rows by

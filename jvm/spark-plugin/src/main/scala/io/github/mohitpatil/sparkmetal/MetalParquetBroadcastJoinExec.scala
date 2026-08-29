@@ -144,8 +144,7 @@ case class MetalParquetBroadcastJoinExec(
     val localFactNames = factColumnNames
 
     splitRDD.mapPartitions { splitIterator =>
-      val splitsInPartition = splitIterator.toArray
-      splitsInPartition.iterator.map { split =>
+      splitIterator.flatMap { split =>
         val readStarted = System.nanoTime()
         val reader = ParquetFileReader.open(HadoopInputFile.fromPath(
           new Path(split.file), MetalParquetGroupedAggregateExec.sharedConfiguration))
@@ -158,23 +157,20 @@ case class MetalParquetBroadcastJoinExec(
           reader.setRequestedSchema(descriptors.asJava)
           val store = reader.readRowGroup(split.rowGroupIndex)
           rowGroupReadTime += (System.nanoTime() - readStarted) / 1000000
-          try {
-            val buildStarted = System.nanoTime()
-            val batch = MetalParquetBroadcastJoinExec.probeRowGroupOnCpu(
-              store, schema, allColumnNames, descriptors, localKeyNames, localFactNames,
-              dimensions, denseTables.map(_.value), multimaps,
-              localColumnSources, localFactIndex, localOutput)
-            numRowGroups += 1
-            cpuFallbackRowGroups += 1
-            numOutputRows += batch.numRows()
-            numOutputBatches += 1
-            outputBuildTime += (System.nanoTime() - buildStarted) / 1000000
-            batch
-          } finally {
-            store.close()
-          }
-        } finally {
-          reader.close()
+          numRowGroups += 1
+          cpuFallbackRowGroups += 1
+          // Bounded batches: the iterator owns store+reader and closes them
+          // when the row group is exhausted (a task-completion listener
+          // covers early termination, e.g. a LIMIT upstream).
+          new MetalParquetBroadcastJoinExec.CpuProbeBatchIterator(
+            store, reader, schema, allColumnNames, descriptors, localKeyNames, localFactNames,
+            dimensions, denseTables.map(_.value), multimaps,
+            localColumnSources, localFactIndex, localOutput,
+            numOutputRows, numOutputBatches, outputBuildTime)
+        } catch {
+          case error: Throwable =>
+            reader.close()
+            throw error
         }
       }
     }
@@ -339,16 +335,24 @@ private[sparkmetal] object MetalParquetBroadcastJoinExec {
     new BoundedCache[(String, Seq[SparkPlan]), PreparedJoin](32)
 
   /**
-   * CPU probe of one row group: parquet-mr readers over the DISTINCT key +
-   * fact columns (a column serving as both key and output is read once);
-   * per row, either the dense tables (unique keys: at most one match per
+   * CPU probe of one row group as an iterator of BOUNDED batches (~128k
+   * output rows each): parquet-mr readers over the DISTINCT key + fact
+   * columns (a column serving as both key and output is read once); per
+   * row, either the dense tables (unique keys: at most one match per
    * dimension) or the multimaps (duplicate keys: Cartesian fan-out across
    * dimensions) decide survival, and survivors append into
    * [[OnHeapColumnVector]]s -- fact values by int, dimension attributes by
-   * type from the matched build row. Returns the finished batch.
+   * type from the matched build row.
+   *
+   * Bounding matters: a whole-row-group batch of a low-selectivity join
+   * over a multi-million-row row group (inventory joined to item's string
+   * attributes, q22) OOMed a 6g heap across 8 concurrent tasks. The
+   * iterator owns `store` and `reader`, closing both when the row group is
+   * exhausted; a task-completion listener covers early termination (LIMIT).
    */
-  private[sparkmetal] def probeRowGroupOnCpu(
+  private[sparkmetal] final class CpuProbeBatchIterator(
       store: org.apache.parquet.column.page.PageReadStore,
+      reader: ParquetFileReader,
       schema: MessageType,
       allColumnNames: Seq[String],
       descriptors: Seq[ColumnDescriptor],
@@ -359,120 +363,143 @@ private[sparkmetal] object MetalParquetBroadcastJoinExec {
       multimaps: Seq[Map[Int, Array[Int]]],
       columnSources: Seq[BroadcastJoinShape.ColumnSource],
       factIndexByOutput: Array[Int],
-      outputAttributes: Seq[Attribute]): ColumnarBatch = {
-    val readStore = new ColumnReadStoreImpl(
+      outputAttributes: Seq[Attribute],
+      numOutputRows: SQLMetric,
+      numOutputBatches: SQLMetric,
+      outputBuildTime: SQLMetric) extends Iterator[ColumnarBatch] {
+
+    private val BatchRows = 131072
+
+    private val readStore = new ColumnReadStoreImpl(
       store, new DummyRecordConverter(schema).getRootConverter, schema, "")
-    val readers = descriptors.map(readStore.getColumnReader)
-    val maxDefinitionLevels = descriptors.map(_.getMaxDefinitionLevel)
-    val columnIndexByName = allColumnNames.zipWithIndex.toMap
-    val keyReaderIndex = keyColumnNames.map(columnIndexByName).toArray
-    val factReaderIndex = factColumnNames.map(columnIndexByName).toArray
-    val keyCount = keyColumnNames.length
+    private val readers = descriptors.map(readStore.getColumnReader).toArray
+    private val maxDefinitionLevels = descriptors.map(_.getMaxDefinitionLevel).toArray
+    private val columnIndexByName = allColumnNames.zipWithIndex.toMap
+    private val keyReaderIndex = keyColumnNames.map(columnIndexByName).toArray
+    private val factReaderIndex = factColumnNames.map(columnIndexByName).toArray
+    private val keyCount = keyColumnNames.length
 
-    // Vectors start small and grow geometrically via reserve() as survivors
-    // land: pre-sizing to the row-group row count wastes worst-case memory
-    // (an inventory row group holds millions of rows; eight concurrent tasks
-    // pre-allocating full-size vectors for a selective join would dwarf the
-    // survivors they actually hold).
-    val vectors: Array[OnHeapColumnVector] = outputAttributes.map { attribute =>
-      new OnHeapColumnVector(65536, attribute.dataType)
-    }.toArray
+    private val currentValues = new Array[Int](allColumnNames.length)
+    private val currentNull = new Array[Boolean](allColumnNames.length)
+    private val matchedRows = new Array[Int](keyCount)
+    private var row = 0L
+    private val rows = store.getRowCount
+    private var closed = false
 
-    val currentValues = new Array[Int](allColumnNames.length)
-    val currentNull = new Array[Boolean](allColumnNames.length)
-    val matchedRows = new Array[Int](keyCount) // dense path: build-row index per dimension
-    var outputRow = 0
-    var row = 0L
-    val rows = store.getRowCount
-    while (row < rows) {
-      var column = 0
-      while (column < readers.length) {
-        val reader = readers(column)
-        if (reader.getCurrentDefinitionLevel < maxDefinitionLevels(column)) {
-          currentNull(column) = true
-          currentValues(column) = 0
-        } else {
-          currentNull(column) = false
-          currentValues(column) = reader.getInteger
+    Option(org.apache.spark.TaskContext.get())
+      .foreach(_.addTaskCompletionListener[Unit](_ => close()))
+    if (rows == 0) close()
+
+    override def hasNext: Boolean = !closed && row < rows
+
+    override def next(): ColumnarBatch = {
+      val buildStarted = System.nanoTime()
+      val vectors: Array[OnHeapColumnVector] = outputAttributes.map { attribute =>
+        new OnHeapColumnVector(math.min(BatchRows, 65536), attribute.dataType)
+      }.toArray
+      var outputRow = 0
+      while (row < rows && outputRow < BatchRows) {
+        var column = 0
+        while (column < readers.length) {
+          val columnReader = readers(column)
+          if (columnReader.getCurrentDefinitionLevel < maxDefinitionLevels(column)) {
+            currentNull(column) = true
+            currentValues(column) = 0
+          } else {
+            currentNull(column) = false
+            currentValues(column) = columnReader.getInteger
+          }
+          columnReader.consume()
+          column += 1
         }
-        reader.consume()
-        column += 1
-      }
 
-      denseTables match {
-        case Some(tables) =>
-          var member = true
-          var k = 0
-          while (member && k < keyCount) {
-            val readerIndex = keyReaderIndex(k)
-            if (currentNull(readerIndex)) {
-              member = false
-            } else {
-              val value = currentValues(readerIndex)
-              val table = tables(k)
-              val matched = if (value >= 0 && value < table.length) table(value) else -1
-              if (matched < 0) member = false else matchedRows(k) = matched
-            }
-            k += 1
-          }
-          if (member) {
-            reserveCapacity(vectors, outputRow + 1)
-            writeOutputRow(
-              vectors, outputRow, columnSources, factIndexByOutput, factReaderIndex,
-              currentValues, currentNull, dimensions, matchedRows, outputAttributes)
-            outputRow += 1
-          }
-        case None =>
-          // Multimap probe with Cartesian fan-out across dimensions.
-          var member = true
-          val matches = new Array[Array[Int]](keyCount)
-          var k = 0
-          while (member && k < keyCount) {
-            val readerIndex = keyReaderIndex(k)
-            if (currentNull(readerIndex)) {
-              member = false
-            } else {
-              multimaps(k).get(currentValues(readerIndex)) match {
-                case Some(rowIndices) => matches(k) = rowIndices
-                case None => member = false
+        denseTables match {
+          case Some(tables) =>
+            var member = true
+            var k = 0
+            while (member && k < keyCount) {
+              val readerIndex = keyReaderIndex(k)
+              if (currentNull(readerIndex)) {
+                member = false
+              } else {
+                val value = currentValues(readerIndex)
+                val table = tables(k)
+                val matched = if (value >= 0 && value < table.length) table(value) else -1
+                if (matched < 0) member = false else matchedRows(k) = matched
               }
+              k += 1
             }
-            k += 1
-          }
-          if (member) {
-            val counters = new Array[Int](keyCount)
-            var exhausted = false
-            while (!exhausted) {
-              var i = 0
-              while (i < keyCount) {
-                matchedRows(i) = matches(i)(counters(i))
-                i += 1
-              }
+            if (member) {
               reserveCapacity(vectors, outputRow + 1)
               writeOutputRow(
                 vectors, outputRow, columnSources, factIndexByOutput, factReaderIndex,
                 currentValues, currentNull, dimensions, matchedRows, outputAttributes)
               outputRow += 1
-              // Odometer increment over the per-dimension match lists.
-              var position = keyCount - 1
-              var carrying = true
-              while (carrying && position >= 0) {
-                counters(position) += 1
-                if (counters(position) < matches(position).length) {
-                  carrying = false
-                } else {
-                  counters(position) = 0
-                  position -= 1
+            }
+          case None =>
+            // Multimap probe with Cartesian fan-out across dimensions. The
+            // whole fan-out of one fact row lands in one batch (the odometer
+            // is not interruptible), so a batch may overshoot BatchRows by
+            // one row's fan-out -- bounded by the dimensions' duplicate
+            // multiplicities, not by the row group size.
+            var member = true
+            val matches = new Array[Array[Int]](keyCount)
+            var k = 0
+            while (member && k < keyCount) {
+              val readerIndex = keyReaderIndex(k)
+              if (currentNull(readerIndex)) {
+                member = false
+              } else {
+                multimaps(k).get(currentValues(readerIndex)) match {
+                  case Some(rowIndices) => matches(k) = rowIndices
+                  case None => member = false
                 }
               }
-              exhausted = carrying
+              k += 1
             }
-          }
+            if (member) {
+              val counters = new Array[Int](keyCount)
+              var exhausted = false
+              while (!exhausted) {
+                var i = 0
+                while (i < keyCount) {
+                  matchedRows(i) = matches(i)(counters(i))
+                  i += 1
+                }
+                reserveCapacity(vectors, outputRow + 1)
+                writeOutputRow(
+                  vectors, outputRow, columnSources, factIndexByOutput, factReaderIndex,
+                  currentValues, currentNull, dimensions, matchedRows, outputAttributes)
+                outputRow += 1
+                var position = keyCount - 1
+                var carrying = true
+                while (carrying && position >= 0) {
+                  counters(position) += 1
+                  if (counters(position) < matches(position).length) {
+                    carrying = false
+                  } else {
+                    counters(position) = 0
+                    position -= 1
+                  }
+                }
+                exhausted = carrying
+              }
+            }
+        }
+        row += 1
       }
-      row += 1
+      if (row >= rows) close()
+      numOutputRows += outputRow
+      numOutputBatches += 1
+      outputBuildTime += (System.nanoTime() - buildStarted) / 1000000
+      new ColumnarBatch(vectors.map(vector => vector: ColumnVector), outputRow)
     }
 
-    new ColumnarBatch(vectors.map(vector => vector: ColumnVector), outputRow)
+    private def close(): Unit = if (!closed) {
+      closed = true
+      store.close()
+      reader.close()
+    }
   }
 
   private def reserveCapacity(vectors: Array[OnHeapColumnVector], needed: Int): Unit = {

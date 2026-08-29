@@ -51,8 +51,36 @@
 ## M5 — Expansion
 
 - [x] Null masks for the initial fused integer expression.
-- [ ] Limited fixed-point decimals.
-- [ ] Grouped aggregation.
-- [ ] Integer equi-join.
+- [x] Limited fixed-point decimals (unscaled int64 partial sums; decimal p<=9
+      fact columns decode as int32).
+- [x] Grouped aggregation (`MetalParquetGroupedAggregateExec`).
+- [x] Integer equi-join, v1 (`MetalParquetBroadcastJoinExec`,
+      `spark.metal.parquetJoin.enabled`, default false — see below).
 - [ ] Wider TPC-DS coverage.
 - [ ] Extend zero-copy coverage and revisit Parquet decoding and local shuffle.
+
+## M6 — Broadcast-join tier v1.1: fused probe+compact kernel
+
+The v1 columnar broadcast-join tier (2026-08-29, docs/GPU_BROADCAST_JOIN_SPEC.md)
+is CORRECT on all 103 queries (fires on 40, zero CPU fallbacks) but loses
+0.37-0.70x on every candidate under the warmed batched-strict protocol
+(`comparison-20260829T075044Z`); its cold-run wins were Spark JIT-warmup
+artifacts. Measured causes (phase runs `phase-join-20260829T073320Z`,
+`phase-join2-*`):
+
+1. **Full-plane readback + JVM probe**: every decoded plane (all rows) is
+   copied back and probed on the CPU; for a selective join almost all of
+   that volume is discarded (q60: 39k survivors of 28.8M rows).
+2. **Materialization boundary**: Spark fuses scan->join->agg in one codegen
+   stage and never materializes the join output; this tier materializes
+   full batches, and dimension-string gather dominates low-selectivity
+   regions (q22: 26.5M output rows, outputBuildTime 7-10s).
+
+A `fused_join_compact` kernel (GPU probe against the row-index tables,
+prefix-sum compaction, scatter of survivor fact values + per-dimension
+build-row indices; readback of survivors only) attacks cause 1 directly —
+readback and probe shrink by the selectivity factor. Cause 2 bounds the
+tier to selective regions regardless; a selectivity-aware gate (runtime,
+after the first row groups report survival) should decline regions that
+emit a large fraction of their input. Neither is speculative: both are
+sized by the phase data above.

@@ -125,3 +125,13 @@ New pieces:
 - Staged delivery: the CPU-only operator lands first (planner + columnar
   output + fallback path, verified 103/103) before any kernel work, so
   correctness plumbing is never entangled with GPU debugging.
+
+## Outcome (2026-08-29)
+
+v1 shipped correct — 103/103 exact matches with the tier enabled, firing on
+40 queries with zero CPU fallbacks — but the speed gate was NOT met: under
+the warmed batched-strict protocol every candidate lost (0.37–0.70x,
+`comparison-20260829T075044Z`); cold-run wins were JIT-warmup artifacts.
+`spark.metal.parquetJoin.enabled` therefore remains false. The measured
+causes and the v1.1 plan (fused probe+compact kernel, selectivity-aware
+gate) are recorded in docs/ROADMAP.md M6.

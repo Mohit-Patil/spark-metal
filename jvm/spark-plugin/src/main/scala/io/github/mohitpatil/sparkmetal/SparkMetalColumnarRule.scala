@@ -38,7 +38,8 @@ final class SparkMetalColumnarRule(
     adaptiveEnabled: Boolean,
     parquetScanEnabled: Boolean,
     parquetAggregateEnabled: Boolean,
-    parquetAggregateMaxRegions: Int)
+    parquetAggregateMaxRegions: Int,
+    parquetJoinEnabled: Boolean = false)
     extends ColumnarRule with Logging {
 
   override def preColumnarTransitions: Rule[SparkPlan] = new Rule[SparkPlan] {
@@ -56,14 +57,98 @@ final class SparkMetalColumnarRule(
       // per node -- `groupedAggregateAllowed` is then just a captured local
       // read by every `replaceGroupedAggregate` call below.
       val groupedAggregateAllowed = isGroupedAggregateAllowed(plan)
-      plan.transformUp {
+      val transformed = plan.transformUp {
         case aggregate: HashAggregateExec =>
           (if (groupedAggregateAllowed) replaceGroupedAggregate(aggregate) else None)
             .orElse(replaceMembershipCount(aggregate))
             .orElse(replace(aggregate))
             .getOrElse(aggregate)
       }
+      // Broadcast-join tier (third tier): runs AFTER the reduction tiers on
+      // the already-transformed plan, so a region an aggregate/membership
+      // replacement consumed no longer exists here and the fusing tiers
+      // always win their regions. transformDown replaces the OUTERMOST
+      // matching join region; recursion then descends into the replacement's
+      // keyPlans (dimension subplans), which do not match the shape.
+      if (parquetJoinEnabled && !ansiEnabled && !adaptiveEnabled) {
+        transformed.transformDown {
+          case candidate @ (_: ProjectExec | _: BroadcastHashJoinExec) =>
+            replaceBroadcastJoin(candidate).getOrElse(candidate)
+        }
+      } else {
+        transformed
+      }
     }
+  }
+
+  /**
+   * Plans [[MetalParquetBroadcastJoinExec]] in place of a matched
+   * scan+broadcast-join region (docs/GPU_BROADCAST_JOIN_SPEC.md):
+   * [[BroadcastJoinShape.matchRegion]] does the structural matching; this
+   * method adds the eligibility gate ([[ParquetEligibility]] over the join
+   * keys and the int32-backed fact output columns) and builds the
+   * per-dimension keyPlans `(joinKey, consumedAttrs...)` off the stripped
+   * build sides. Safe-fallback: any planner-time surprise leaves the region
+   * untouched.
+   */
+  private def replaceBroadcastJoin(candidate: SparkPlan): Option[SparkPlan] = {
+    try {
+      BroadcastJoinShape.matchRegion(candidate) match {
+        case scala.util.Left(_) => None
+        case scala.util.Right(region) => buildBroadcastJoinExec(region)
+      }
+    } catch {
+      case NonFatal(e) =>
+        logWarning(
+          "Broadcast-join eligibility check failed; leaving the region untouched", e)
+        None
+    }
+  }
+
+  private def buildBroadcastJoinExec(region: BroadcastJoinShape.Region): Option[SparkPlan] = {
+    // A region with no output columns is a pure membership count -- the
+    // membership tier's territory (and worthless as a join: every batch
+    // would be zero-width). Decline it.
+    if (region.output.isEmpty) {
+      return None
+    }
+    val buildPlanOptions = region.joins.map(joinBuildPlan)
+    if (buildPlanOptions.exists(_.isEmpty)) {
+      return None
+    }
+    val buildPlans = buildPlanOptions.map(_.get)
+
+    val keyPlans = region.joins.indices.map { index =>
+      ProjectExec(
+        region.dimensionKeys(index) +: region.dimensionAttributes(index),
+        buildPlans(index))
+    }
+    val keyColumnNames = region.factKeys.map(_.name)
+    val factColumnNames = region.columnSources.collect {
+      case BroadcastJoinShape.FactColumn(attribute) => attribute.name
+    }.distinct
+    if (factColumnNames.length > 4) {
+      return None
+    }
+    val files = region.scan.relation.location.inputFiles.toSeq
+
+    if (ParquetEligibility.checkKeys(files, keyColumnNames).isLeft) {
+      return None
+    }
+    if (factColumnNames.nonEmpty &&
+        ParquetEligibility.checkMeasures(files, factColumnNames).isLeft) {
+      return None
+    }
+
+    Some(MetalParquetBroadcastJoinExec(
+      region.output,
+      region.columnSources,
+      files,
+      keyColumnNames,
+      factColumnNames,
+      keyPlans,
+      nativeLibrary,
+      metalLibrary))
   }
 
   /**

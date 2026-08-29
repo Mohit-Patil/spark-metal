@@ -53,11 +53,11 @@ private[sparkmetal] object GroupedAggregateShape {
       measureColumns: Seq[Attribute]) // distinct fact measure columns
 
   /** Where an attribute's lineage bottoms out while walking down from the aggregate. */
-  private sealed trait Lineage
-  private case class OnFact(attribute: Attribute) extends Lineage
-  private case class OnDimension(attribute: Attribute) extends Lineage
+  private[sparkmetal] sealed trait Lineage
+  private[sparkmetal] case class OnFact(attribute: Attribute) extends Lineage
+  private[sparkmetal] case class OnDimension(attribute: Attribute) extends Lineage
 
-  private case class FactWalk(
+  private[sparkmetal] case class FactWalk(
       scan: FileSourceScanExec,
       joins: Seq[BroadcastHashJoinExec],
       factKeys: Seq[Attribute],
@@ -168,7 +168,7 @@ private[sparkmetal] object GroupedAggregateShape {
    * either one, so their exprIds already line up whenever they name the
    * same underlying column -- no re-resolution needed.
    */
-  private def validateNotNullTargets(walk: FactWalk): Either[String, Unit] = {
+  private[sparkmetal] def validateNotNullTargets(walk: FactWalk): Either[String, Unit] = {
     val factKeyIds = walk.factKeys.map(_.exprId).toSet
     walk.notNullTargets.find(attribute => !factKeyIds.contains(attribute.exprId)) match {
       case Some(attribute) => Left(s"IsNotNull filter on non-key column ${attribute.name}#${attribute.exprId.id}")
@@ -273,7 +273,7 @@ private[sparkmetal] object GroupedAggregateShape {
    * and [[BroadcastHashJoinExec]]. Anything else -- a computed projection, an
    * unsupported node shape -- fails resolution with a reason.
    */
-  private def resolve(exprId: ExprId, plan: SparkPlan): Either[String, Lineage] = plan match {
+  private[sparkmetal] def resolve(exprId: ExprId, plan: SparkPlan): Either[String, Lineage] = plan match {
     // Whole-stage codegen wraps fused operators in WholeStageCodegenExec /
     // InputAdapter without changing attributes -- transparent pass-through.
     case codegen: WholeStageCodegenExec => resolve(exprId, codegen.child)
@@ -308,7 +308,7 @@ private[sparkmetal] object GroupedAggregateShape {
    * collecting the join chain outermost-first and validating each join and
    * the terminal scan against the v1 shape.
    */
-  private def walkFactSide(plan: SparkPlan): Either[String, FactWalk] = plan match {
+  private[sparkmetal] def walkFactSide(plan: SparkPlan): Either[String, FactWalk] = plan match {
     case codegen: WholeStageCodegenExec => walkFactSide(codegen.child)
     case adapter: InputAdapter => walkFactSide(adapter.child)
     case project: ProjectExec => walkFactSide(project.child)

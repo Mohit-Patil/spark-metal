@@ -1,5 +1,6 @@
 package io.github.mohitpatil.sparkmetal
 
+import java.nio.{ByteBuffer, ByteOrder}
 import java.util.concurrent.Executors
 
 import scala.collection.mutable
@@ -8,8 +9,9 @@ import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.jdk.CollectionConverters._
 
 import org.apache.hadoop.fs.Path
-import org.apache.parquet.column.ColumnDescriptor
+import org.apache.parquet.column.{ColumnDescriptor, Encoding}
 import org.apache.parquet.column.impl.ColumnReadStoreImpl
+import org.apache.parquet.column.page.{DataPageV1, DictionaryPage}
 import org.apache.parquet.example.DummyRecordConverter
 import org.apache.parquet.hadoop.ParquetFileReader
 import org.apache.parquet.hadoop.util.HadoopInputFile
@@ -84,6 +86,7 @@ case class MetalParquetBroadcastJoinExec(
     "numOutputBatches" -> SQLMetrics.createMetric(sparkContext, "number of output batches"),
     "rowGroupReadTime" -> SQLMetrics.createTimingMetric(sparkContext, "row group read time"),
     "decodeParseTime" -> SQLMetrics.createTimingMetric(sparkContext, "page parse and GPU-encode time"),
+    "pageSubmitTime" -> SQLMetrics.createTimingMetric(sparkContext, "native page submit time"),
     "metalTime" -> SQLMetrics.createTimingMetric(sparkContext, "Metal decode and wait time"),
     "dimensionTime" -> SQLMetrics.createTimingMetric(sparkContext, "dimension collection time"),
     "splitPlanTime" -> SQLMetrics.createTimingMetric(sparkContext, "split planning time"),
@@ -112,6 +115,13 @@ case class MetalParquetBroadcastJoinExec(
     val numOutputBatches = longMetric("numOutputBatches")
     val rowGroupReadTime = longMetric("rowGroupReadTime")
     val outputBuildTime = longMetric("outputBuildTime")
+    val decodeParseTime = longMetric("decodeParseTime")
+    val pageSubmitTime = longMetric("pageSubmitTime")
+    val metalTime = longMetric("metalTime")
+    val numPagesDecoded = longMetric("numPagesDecoded")
+    val nativeStagingTime = longMetric("nativeStagingTime")
+    val nativeParseTime = longMetric("nativeParseTime")
+    val nativeEncodeTime = longMetric("nativeEncodeTime")
 
     val executionId = Option(sparkContext.getLocalProperty(
       org.apache.spark.sql.execution.SQLExecution.EXECUTION_ID_KEY))
@@ -141,31 +151,210 @@ case class MetalParquetBroadcastJoinExec(
     val localKeyNames = keyColumnNames
     val localFactNames = factColumnNames
 
+    val localNativeLibrary = nativeLibrary
+    val localMetalLibrary = metalLibrary
+
     splitRDD.mapPartitions { splitIterator =>
+      val payload = payloadBroadcast.value
+      val allColumnNames = (localKeyNames ++ localFactNames).distinct
+      val columnIndexByName = allColumnNames.zipWithIndex.toMap
+      // A key column that is also a fact output column decodes ONCE, through
+      // the fact (measure) plane -- which materializes raw values -- and the
+      // key probes that same plane by value; keyFactSlot(k) >= 0 names it.
+      val keyFactSlot: Array[Int] = localKeyNames.map(localFactNames.indexOf(_)).toArray
+      val keyCount = localKeyNames.length
+      val factCount = localFactNames.length
+
+      SparkMetalNative.ensureInitialized(localNativeLibrary, localMetalLibrary)
+      val preparedHandle = NativeBridge.prepareMembershipCount3(Array(1), Array(1), Array(1))
+      val streamHandle = NativeBridge.membershipCount3StreamBegin(preparedHandle)
+      var streamClosed = false
+      def closeStream(): Unit = if (!streamClosed) {
+        streamClosed = true
+        try {
+          val timers = NativeBridge.parquetStreamTimers(streamHandle)
+          nativeStagingTime += timers(0) / 1000000
+          nativeParseTime += timers(1) / 1000000
+          nativeEncodeTime += timers(2) / 1000000
+        } finally {
+          NativeBridge.parquetAggregateStreamAbort(streamHandle)
+          NativeBridge.releaseMembershipCount3(preparedHandle)
+        }
+      }
+      Option(org.apache.spark.TaskContext.get())
+        .foreach(_.addTaskCompletionListener[Unit](_ => closeStream()))
+
+      val DictionaryEncodings: Set[Encoding] = Set(Encoding.PLAIN_DICTIONARY, Encoding.RLE_DICTIONARY)
+
       splitIterator.flatMap { split =>
         val readStarted = System.nanoTime()
         val reader = ParquetFileReader.open(HadoopInputFile.fromPath(
           new Path(split.file), MetalParquetGroupedAggregateExec.sharedConfiguration))
         try {
           val schema = reader.getFooter.getFileMetaData.getSchema
-          val allColumnNames = (localKeyNames ++ localFactNames).distinct
           val descriptors = allColumnNames.map(name =>
             schema.getColumns.asScala.find(_.getPath()(0) == name)
               .getOrElse(throw new RuntimeException(s"${split.file}: missing column $name")))
+          val descriptorByName = allColumnNames.zip(descriptors).toMap
           reader.setRequestedSchema(descriptors.asJava)
           val store = reader.readRowGroup(split.rowGroupIndex)
           rowGroupReadTime += (System.nanoTime() - readStarted) / 1000000
           numRowGroups += 1
-          cpuFallbackRowGroups += 1
-          // Bounded batches: the iterator owns store+reader and closes them
-          // when the row group is exhausted (a task-completion listener
-          // covers early termination, e.g. a LIMIT upstream).
-          val payload = payloadBroadcast.value
-          new MetalParquetBroadcastJoinExec.CpuProbeBatchIterator(
-            store, reader, schema, allColumnNames, descriptors, localKeyNames, localFactNames,
-            payload.dimensions, payload.denseTables, payload.multimaps,
-            localColumnSources, localFactIndex, localOutput,
-            numOutputRows, numOutputBatches, outputBuildTime)
+
+          val rowCount = split.rowCount.toInt
+          var rowGroupHandle = 0L
+          try {
+            // ---- GPU decode: pages into planes on the stream ----
+            val parseStarted = System.nanoTime()
+            rowGroupHandle = NativeBridge.parquetRowGroupBeginAggregate(
+              streamHandle, rowCount, keyCount, factCount)
+
+            // Per non-overlapping key chunk: dictionary ids stay ids in the
+            // plane (the probe translates via the chunk's own dictionary);
+            // PLAIN chunks land raw values.
+            val keyDictionaries = new Array[Array[Int]](keyCount)
+            for (k <- 0 until keyCount if keyFactSlot(k) < 0) {
+              val descriptor = descriptorByName(localKeyNames(k))
+              val pageReader = store.getPageReader(descriptor)
+              val dictionaryPage = pageReader.readDictionaryPage()
+              val isPlain = dictionaryPage == null
+              if (!isPlain) {
+                keyDictionaries(k) = MetalParquetBroadcastJoinExec.decodeDictionary(dictionaryPage)
+              }
+              val hasDefLevels = descriptor.getMaxDefinitionLevel > 0
+              var rowOffset = 0
+              var rawPage = pageReader.readPage()
+              while (rawPage != null) {
+                val dataPage = rawPage match {
+                  case v1: DataPageV1 => v1
+                  case other => throw new RuntimeException(
+                    s"${split.file}: ${localKeyNames(k)} unsupported Parquet page type ${other.getClass}")
+                }
+                val encoding = dataPage.getValueEncoding
+                if (isPlain) {
+                  if (encoding != Encoding.PLAIN) throw new RuntimeException(
+                    s"${split.file}: ${localKeyNames(k)} expected PLAIN encoding, got $encoding")
+                } else if (!DictionaryEncodings.contains(encoding)) {
+                  throw new RuntimeException(
+                    s"${split.file}: ${localKeyNames(k)} unsupported value encoding $encoding")
+                }
+                val pageBytes = dataPage.getBytes.toByteArray
+                val valueCount = dataPage.getValueCount
+                val submitStarted = System.nanoTime()
+                NativeBridge.parquetDecodePage(
+                  streamHandle, rowGroupHandle, k, pageBytes, pageBytes.length, valueCount,
+                  rowOffset, hasDefLevels, isPlain)
+                pageSubmitTime += (System.nanoTime() - submitStarted) / 1000000
+                numPagesDecoded += 1
+                rowOffset += valueCount
+                rawPage = pageReader.readPage()
+              }
+              if (rowOffset != rowCount) throw new RuntimeException(
+                s"${split.file}: ${localKeyNames(k)} pages covered $rowOffset rows, expected $rowCount")
+            }
+
+            // Per fact chunk: values MATERIALIZE through the staged
+            // dictionary (or memcpy for PLAIN), so the plane holds raw ints.
+            for (m <- 0 until factCount) {
+              val descriptor = descriptorByName(localFactNames(m))
+              val pageReader = store.getPageReader(descriptor)
+              val dictionaryPage = pageReader.readDictionaryPage()
+              if (dictionaryPage != null) {
+                NativeBridge.parquetSetMeasureDictionary(
+                  rowGroupHandle, m, MetalParquetBroadcastJoinExec.decodeDictionary(dictionaryPage))
+              }
+              val hasDefLevels = descriptor.getMaxDefinitionLevel > 0
+              var rowOffset = 0
+              var rawPage = pageReader.readPage()
+              while (rawPage != null) {
+                val dataPage = rawPage match {
+                  case v1: DataPageV1 => v1
+                  case other => throw new RuntimeException(
+                    s"${split.file}: ${localFactNames(m)} unsupported Parquet page type ${other.getClass}")
+                }
+                val encoding = dataPage.getValueEncoding
+                if (dictionaryPage != null) {
+                  if (!DictionaryEncodings.contains(encoding)) throw new RuntimeException(
+                    s"${split.file}: ${localFactNames(m)} expected dictionary encoding, got $encoding")
+                } else if (encoding != Encoding.PLAIN) {
+                  throw new RuntimeException(
+                    s"${split.file}: ${localFactNames(m)} expected PLAIN encoding, got $encoding")
+                }
+                val pageBytes = dataPage.getBytes.toByteArray
+                val valueCount = dataPage.getValueCount
+                val submitStarted = System.nanoTime()
+                NativeBridge.parquetDecodeMeasurePage(
+                  streamHandle, rowGroupHandle, m, pageBytes, pageBytes.length, valueCount,
+                  rowOffset, hasDefLevels)
+                pageSubmitTime += (System.nanoTime() - submitStarted) / 1000000
+                numPagesDecoded += 1
+                rowOffset += valueCount
+                rawPage = pageReader.readPage()
+              }
+              if (rowOffset != rowCount) throw new RuntimeException(
+                s"${split.file}: ${localFactNames(m)} pages covered $rowOffset rows, expected $rowCount")
+            }
+            decodeParseTime += (System.nanoTime() - parseStarted) / 1000000
+
+            // ---- Blocking readback of the decoded planes ----
+            val metalStarted = System.nanoTime()
+            val columnValues = new Array[Array[Int]](allColumnNames.length)
+            val columnValidity = new Array[Array[Byte]](allColumnNames.length)
+            val columnDictionaries = new Array[Array[Int]](allColumnNames.length)
+            for (m <- 0 until factCount) {
+              val position = columnIndexByName(localFactNames(m))
+              val values = new Array[Int](rowCount)
+              val validity = new Array[Byte](rowCount)
+              NativeBridge.parquetRowGroupReadMeasure(
+                streamHandle, rowGroupHandle, m, values, validity)
+              columnValues(position) = values
+              columnValidity(position) = validity
+            }
+            for (k <- 0 until keyCount if keyFactSlot(k) < 0) {
+              val position = columnIndexByName(localKeyNames(k))
+              val values = new Array[Int](rowCount)
+              val validity = new Array[Byte](rowCount)
+              NativeBridge.parquetRowGroupRead(
+                streamHandle, rowGroupHandle, k, values, validity)
+              columnValues(position) = values
+              columnValidity(position) = validity
+              columnDictionaries(position) = keyDictionaries(k)
+            }
+            NativeBridge.parquetRowGroupRelease(rowGroupHandle)
+            rowGroupHandle = 0L
+            metalTime += (System.nanoTime() - metalStarted) / 1000000
+
+            store.close()
+            reader.close()
+            new MetalParquetBroadcastJoinExec.PlaneProbeBatchIterator(
+              rowCount, allColumnNames.length,
+              localKeyNames.map(columnIndexByName).toArray,
+              localFactNames.map(columnIndexByName).toArray,
+              columnValues, columnValidity, columnDictionaries,
+              payload.dimensions, payload.denseTables, payload.multimaps,
+              localColumnSources, localFactIndex, localOutput,
+              numOutputRows, numOutputBatches, outputBuildTime)
+          } catch {
+            case e: RuntimeException =>
+              // The native decoder rejected a page (or some other runtime
+              // surprise) partway through this row group: release the
+              // still-alive handle, and recompute the row group on the CPU
+              // from a FRESH PageReadStore (pages already consumed by the
+              // failed decode cannot be re-read).
+              logWarning(s"Row group ${split.file}#${split.rowGroupIndex} fell back to CPU", e)
+              if (rowGroupHandle != 0L) {
+                NativeBridge.parquetRowGroupRelease(rowGroupHandle)
+              }
+              store.close()
+              cpuFallbackRowGroups += 1
+              val freshStore = reader.readRowGroup(split.rowGroupIndex)
+              new MetalParquetBroadcastJoinExec.CpuProbeBatchIterator(
+                freshStore, reader, schema, allColumnNames, descriptors,
+                localKeyNames, localFactNames,
+                payload.dimensions, payload.denseTables, payload.multimaps,
+                localColumnSources, localFactIndex, localOutput,
+                numOutputRows, numOutputBatches, outputBuildTime)
+          }
         } catch {
           case error: Throwable =>
             reader.close()
@@ -344,30 +533,34 @@ private[sparkmetal] object MetalParquetBroadcastJoinExec {
   private[sparkmetal] val preparedJoinCache =
     new BoundedCache[(String, Seq[SparkPlan]), PreparedJoin](32)
 
+  private[sparkmetal] def decodeDictionary(dictionaryPage: DictionaryPage): Array[Int] = {
+    val bytes = dictionaryPage.getBytes.toByteArray
+    val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+    Array.tabulate(dictionaryPage.getDictionarySize)(entry => buffer.getInt(entry * 4))
+  }
+
   /**
-   * CPU probe of one row group as an iterator of BOUNDED batches (~128k
-   * output rows each): parquet-mr readers over the DISTINCT key + fact
-   * columns (a column serving as both key and output is read once); per
-   * row, either the dense tables (unique keys: at most one match per
-   * dimension) or the multimaps (duplicate keys: Cartesian fan-out across
-   * dimensions) decide survival, and survivors append into
+   * Probe of one row group as an iterator of BOUNDED batches (~32k output
+   * rows each): per fact row, either the dense tables (unique keys: at most
+   * one match per dimension) or the multimaps (duplicate keys: Cartesian
+   * fan-out across dimensions -- an inner join with duplicate build keys
+   * multiplies rows) decide survival; survivors append into
    * [[OnHeapColumnVector]]s -- fact values by int, dimension attributes by
-   * type from the matched build row.
+   * type from the matched build row. Subclasses supply the per-row column
+   * values (`readRow`): parquet-mr readers (CPU decode) or decoded GPU
+   * planes.
    *
    * Bounding matters: a whole-row-group batch of a low-selectivity join
    * over a multi-million-row row group (inventory joined to item's string
    * attributes, q22) OOMed a 6g heap across 8 concurrent tasks. The
-   * iterator owns `store` and `reader`, closing both when the row group is
-   * exhausted; a task-completion listener covers early termination (LIMIT).
+   * iterator closes its resources when the row group is exhausted; a
+   * task-completion listener covers early termination (LIMIT).
    */
-  private[sparkmetal] final class CpuProbeBatchIterator(
-      store: org.apache.parquet.column.page.PageReadStore,
-      reader: ParquetFileReader,
-      schema: MessageType,
-      allColumnNames: Seq[String],
-      descriptors: Seq[ColumnDescriptor],
-      keyColumnNames: Seq[String],
-      factColumnNames: Seq[String],
+  private[sparkmetal] abstract class ProbeBatchIterator(
+      totalRows: Long,
+      allColumnCount: Int,
+      keyReaderIndex: Array[Int],
+      factReaderIndex: Array[Int],
       dimensions: Seq[GroupSpace.Dimension],
       denseTables: Option[Array[Array[Int]]],
       multimaps: Seq[Map[Int, Array[Int]]],
@@ -380,27 +573,28 @@ private[sparkmetal] object MetalParquetBroadcastJoinExec {
 
     private val BatchRows = 32768
 
-    private val readStore = new ColumnReadStoreImpl(
-      store, new DummyRecordConverter(schema).getRootConverter, schema, "")
-    private val readers = descriptors.map(readStore.getColumnReader).toArray
-    private val maxDefinitionLevels = descriptors.map(_.getMaxDefinitionLevel).toArray
-    private val columnIndexByName = allColumnNames.zipWithIndex.toMap
-    private val keyReaderIndex = keyColumnNames.map(columnIndexByName).toArray
-    private val factReaderIndex = factColumnNames.map(columnIndexByName).toArray
-    private val keyCount = keyColumnNames.length
+    /** Fill currentValues/currentNull for row `rowIndex` (RAW column values). */
+    protected def readRow(rowIndex: Long): Unit
 
-    private val currentValues = new Array[Int](allColumnNames.length)
-    private val currentNull = new Array[Boolean](allColumnNames.length)
+    /** Release the subclass's resources; called exactly once. */
+    protected def onClose(): Unit
+
+    protected val currentValues = new Array[Int](allColumnCount)
+    protected val currentNull = new Array[Boolean](allColumnCount)
+    private val keyCount = keyReaderIndex.length
     private val matchedRows = new Array[Int](keyCount)
     private var row = 0L
-    private val rows = store.getRowCount
     private var closed = false
 
     Option(org.apache.spark.TaskContext.get())
       .foreach(_.addTaskCompletionListener[Unit](_ => close()))
-    if (rows == 0) close()
 
-    override def hasNext: Boolean = !closed && row < rows
+    // Cannot run in this constructor -- the subclass's fields (readers,
+    // planes) are not initialized yet when this body executes. Subclasses
+    // call it at the end of their own constructor.
+    protected def closeIfEmpty(): Unit = if (totalRows == 0) close()
+
+    override def hasNext: Boolean = !closed && row < totalRows
 
     override def next(): ColumnarBatch = {
       val buildStarted = System.nanoTime()
@@ -408,20 +602,8 @@ private[sparkmetal] object MetalParquetBroadcastJoinExec {
         new OnHeapColumnVector(8192, attribute.dataType)
       }.toArray
       var outputRow = 0
-      while (row < rows && outputRow < BatchRows) {
-        var column = 0
-        while (column < readers.length) {
-          val columnReader = readers(column)
-          if (columnReader.getCurrentDefinitionLevel < maxDefinitionLevels(column)) {
-            currentNull(column) = true
-            currentValues(column) = 0
-          } else {
-            currentNull(column) = false
-            currentValues(column) = columnReader.getInteger
-          }
-          columnReader.consume()
-          column += 1
-        }
+      while (row < totalRows && outputRow < BatchRows) {
+        readRow(row)
 
         denseTables match {
           case Some(tables) =>
@@ -447,11 +629,10 @@ private[sparkmetal] object MetalParquetBroadcastJoinExec {
               outputRow += 1
             }
           case None =>
-            // Multimap probe with Cartesian fan-out across dimensions. The
-            // whole fan-out of one fact row lands in one batch (the odometer
-            // is not interruptible), so a batch may overshoot BatchRows by
-            // one row's fan-out -- bounded by the dimensions' duplicate
-            // multiplicities, not by the row group size.
+            // Multimap probe. The whole fan-out of one fact row lands in one
+            // batch (the odometer is not interruptible), so a batch may
+            // overshoot BatchRows by one row's fan-out -- bounded by the
+            // dimensions' duplicate multiplicities, not the row group size.
             var member = true
             val matches = new Array[Array[Int]](keyCount)
             var k = 0
@@ -498,7 +679,7 @@ private[sparkmetal] object MetalParquetBroadcastJoinExec {
         }
         row += 1
       }
-      if (row >= rows) close()
+      if (row >= totalRows) close()
       numOutputRows += outputRow
       numOutputBatches += 1
       outputBuildTime += (System.nanoTime() - buildStarted) / 1000000
@@ -507,9 +688,123 @@ private[sparkmetal] object MetalParquetBroadcastJoinExec {
 
     private def close(): Unit = if (!closed) {
       closed = true
+      onClose()
+    }
+  }
+
+  /** CPU decode: parquet-mr column readers over the distinct key + fact columns. */
+  private[sparkmetal] final class CpuProbeBatchIterator(
+      store: org.apache.parquet.column.page.PageReadStore,
+      reader: ParquetFileReader,
+      schema: MessageType,
+      allColumnNames: Seq[String],
+      descriptors: Seq[ColumnDescriptor],
+      keyColumnNames: Seq[String],
+      factColumnNames: Seq[String],
+      dimensions: Seq[GroupSpace.Dimension],
+      denseTables: Option[Array[Array[Int]]],
+      multimaps: Seq[Map[Int, Array[Int]]],
+      columnSources: Seq[BroadcastJoinShape.ColumnSource],
+      factIndexByOutput: Array[Int],
+      outputAttributes: Seq[Attribute],
+      numOutputRows: SQLMetric,
+      numOutputBatches: SQLMetric,
+      outputBuildTime: SQLMetric)
+    extends ProbeBatchIterator(
+      store.getRowCount, allColumnNames.length,
+      keyColumnNames.map(allColumnNames.zipWithIndex.toMap).toArray,
+      factColumnNames.map(allColumnNames.zipWithIndex.toMap).toArray,
+      dimensions, denseTables, multimaps, columnSources, factIndexByOutput, outputAttributes,
+      numOutputRows, numOutputBatches, outputBuildTime) {
+
+    private val readStore = new ColumnReadStoreImpl(
+      store, new DummyRecordConverter(schema).getRootConverter, schema, "")
+    private val readers = descriptors.map(readStore.getColumnReader).toArray
+    private val maxDefinitionLevels = descriptors.map(_.getMaxDefinitionLevel).toArray
+
+    closeIfEmpty()
+
+    override protected def readRow(rowIndex: Long): Unit = {
+      var column = 0
+      while (column < readers.length) {
+        val columnReader = readers(column)
+        if (columnReader.getCurrentDefinitionLevel < maxDefinitionLevels(column)) {
+          currentNull(column) = true
+          currentValues(column) = 0
+        } else {
+          currentNull(column) = false
+          currentValues(column) = columnReader.getInteger
+        }
+        columnReader.consume()
+        column += 1
+      }
+    }
+
+    override protected def onClose(): Unit = {
       store.close()
       reader.close()
     }
+  }
+
+  /**
+   * GPU decode: reads the row group's decoded planes back from the stream
+   * (blocking) and probes them. `columnValues(c)` holds column c's plane in
+   * `allColumnNames` order; `columnDictionaries(c)` translates a
+   * dictionary-decoded KEY plane's ids to raw values (null when the plane
+   * already holds raw values -- PLAIN key chunks and all fact planes, which
+   * materialize through their dictionary natively).
+   */
+  private[sparkmetal] final class PlaneProbeBatchIterator(
+      totalRows: Int,
+      allColumnCount: Int,
+      keyReaderIndex: Array[Int],
+      factReaderIndex: Array[Int],
+      columnValues: Array[Array[Int]],
+      columnValidity: Array[Array[Byte]],
+      columnDictionaries: Array[Array[Int]],
+      dimensions: Seq[GroupSpace.Dimension],
+      denseTables: Option[Array[Array[Int]]],
+      multimaps: Seq[Map[Int, Array[Int]]],
+      columnSources: Seq[BroadcastJoinShape.ColumnSource],
+      factIndexByOutput: Array[Int],
+      outputAttributes: Seq[Attribute],
+      numOutputRows: SQLMetric,
+      numOutputBatches: SQLMetric,
+      outputBuildTime: SQLMetric)
+    extends ProbeBatchIterator(
+      totalRows, allColumnCount, keyReaderIndex, factReaderIndex,
+      dimensions, denseTables, multimaps, columnSources, factIndexByOutput, outputAttributes,
+      numOutputRows, numOutputBatches, outputBuildTime) {
+
+    closeIfEmpty()
+
+    override protected def readRow(rowIndex: Long): Unit = {
+      val index = rowIndex.toInt
+      var column = 0
+      while (column < allColumnCount) {
+        // Plane validity convention (see scatter_segments and
+        // ParquetDecodeSmoke): the zero-filled plane means VALID; the decode
+        // writes 1 to mark a NULL row.
+        if (columnValidity(column)(index) != 0) {
+          currentNull(column) = true
+          currentValues(column) = 0
+        } else {
+          currentNull(column) = false
+          val raw = columnValues(column)(index)
+          val dictionary = columnDictionaries(column)
+          currentValues(column) =
+            if (dictionary == null) raw
+            else if (raw >= 0 && raw < dictionary.length) dictionary(raw)
+            // A dictionary id outside its own dictionary means a corrupt
+            // plane; surface it rather than fabricate a value.
+            else throw new IllegalStateException(
+              s"dictionary id $raw outside dictionary of ${dictionary.length}")
+        }
+        column += 1
+      }
+    }
+
+    override protected def onClose(): Unit = ()
   }
 
   private def reserveCapacity(vectors: Array[OnHeapColumnVector], needed: Int): Unit = {

@@ -119,13 +119,38 @@ case class MetalParquetGroupedAggregateExec(
     "decodeParseTime" -> SQLMetrics.createTimingMetric(sparkContext, "page parse and GPU-encode time"),
     "metalTime" -> SQLMetrics.createTimingMetric(sparkContext, "Metal aggregate and final wait time"),
     "dimensionTime" -> SQLMetrics.createTimingMetric(sparkContext, "dimension key collection time"),
+    "splitPlanTime" -> SQLMetrics.createTimingMetric(sparkContext, "split planning time"),
+    "rowGroupReadTime" -> SQLMetrics.createTimingMetric(sparkContext, "row group read time"),
+    "pageSubmitTime" -> SQLMetrics.createTimingMetric(sparkContext, "native page submit time"),
+    "outputBuildTime" -> SQLMetrics.createTimingMetric(sparkContext, "partial output row build time"),
+    "nativeStagingTime" -> SQLMetrics.createTimingMetric(sparkContext, "native staging copy time"),
+    "nativeParseTime" -> SQLMetrics.createTimingMetric(sparkContext, "native page parse time"),
+    "nativeEncodeTime" -> SQLMetrics.createTimingMetric(sparkContext, "native GPU encode time"),
     "numGroups" -> SQLMetrics.createMetric(sparkContext, "group space size"),
     "numOutputRows" -> SQLMetrics.createMetric(sparkContext, "number of partial rows emitted"))
 
   override protected def doExecute(): RDD[InternalRow] = {
     val dimensionTime = longMetric("dimensionTime")
-    val (dimensions, dimensionNanos) = collectDimensions()
-    dimensionTime += dimensionNanos / 1000000
+    // Fix 2 (per-region fixed-cost sharing): everything derived purely from
+    // this region's keyPlans -- the collected dimensions, the domain guard,
+    // GroupSpace.build's result, and the broadcast value-space tables -- is
+    // cached per (SQL execution, canonicalized keyPlans), so UNION siblings
+    // whose dimension subplans are semantically identical (canonicalized
+    // equality, the same test Spark's own ReuseExchange applies) pay those
+    // costs once per query instead of once per region. The 64MB memory
+    // estimate stays OUTSIDE the cache: it depends on this region's own
+    // internal aggregate count.
+    val executionId = Option(sparkContext.getLocalProperty(
+      org.apache.spark.sql.execution.SQLExecution.EXECUTION_ID_KEY))
+    val regionCacheKey = executionId.map(id => (id, keyPlans.map(_.canonicalized)))
+    val cachedRegion = regionCacheKey.flatMap(MetalParquetGroupedAggregateExec.preparedRegionCache.get)
+    val prepared = cachedRegion.getOrElse(prepareRegion(executionId))
+    if (cachedRegion.isEmpty) {
+      dimensionTime += prepared.collectNanos / 1000000
+      regionCacheKey.foreach(key =>
+        MetalParquetGroupedAggregateExec.preparedRegionCache.put(key, prepared))
+    }
+    val dimensions = prepared.dimensions
     // Captured once, on the driver, for BOTH execution paths: a dimension's
     // OWN attribute types (not outputAttributes' declared types) are what a
     // dimension's attribute row was actually encoded with (UnsafeProjection
@@ -141,6 +166,67 @@ case class MetalParquetGroupedAggregateExec(
     require(outputAttributes.length == expectedOutputColumns,
       s"outputAttributes has ${outputAttributes.length} columns, expected $expectedOutputColumns " +
         s"(${groupKeyDimensionIndex.length} group keys + ${aggSpecs.length} aggregates)")
+
+    val builtEither: Either[String, GroupSpace.Built] = prepared.buildResult.flatMap { built =>
+      val estimatedBytes = built.groupCount.toLong * internalAggCount.toLong * 16L
+      if (estimatedBytes > 64L * 1024 * 1024) {
+        Left(s"group space memory estimate $estimatedBytes bytes (groups=${built.groupCount}, " +
+          s"internalAggs=$internalAggCount) exceeds the 64MB budget")
+      } else {
+        Right(built)
+      }
+    }
+
+    val numGroups = longMetric("numGroups")
+
+    builtEither match {
+      case Right(built) =>
+        numGroups += built.groupCount
+        executeWithGroupSpace(
+          built, dimensionAttributeTypes, prepared.valueTables.get, aggKinds, aggMeasureSlots,
+          aggSlotMappings, occupancySlot, internalAggCount)
+      // An unsupported dimension attribute type is a planning defect, not a
+      // runtime data condition: GroupedAggregateShape/Task 6's matcher is
+      // expected to reject any such region before this operator is ever
+      // constructed, so this throws driver-side (loudly, at doExecute time)
+      // rather than routing into the whole-operator CPU fallback, which
+      // would otherwise crash INSIDE an executor task the first time
+      // attributeValue() hit the same unsupported type (IllegalStateException
+      // from deep inside a Spark task is a much worse failure mode than a
+      // clear driver-side throw naming the type).
+      case Left(reason) if reason.contains("unsupported attribute type") =>
+        throw new IllegalStateException(
+          s"MetalParquetGroupedAggregateExec: GroupSpace.build rejected a dimension attribute type " +
+            s"($reason) -- this should have been rejected at planning time, not reached construction")
+      case Left(reason) =>
+        // reason may come from three independent sources -- the value-space
+        // domain guard (GroupSpace.build never even runs), the 64MB
+        // group-space memory estimate (GroupSpace.build DID succeed; the
+        // estimate check on its result rejected it), or GroupSpace.build
+        // itself (a duplicate key or oversized cross product) -- each
+        // already carries its own distinguishing prefix/detail, so this
+        // message states only what is true of all three: dense group-space
+        // execution is unavailable for this reason and this call is falling
+        // back.
+        logWarning(s"MetalParquetGroupedAggregateExec: cannot use the dense group-space GPU path " +
+          s"($reason); falling back to a whole-operator CPU hash-join + hash-aggregate")
+        executeWholeOperatorCpuFallback(
+          dimensions, dimensionAttributeTypes, aggKinds, aggMeasureSlots, aggSlotMappings, occupancySlot)
+    }
+  }
+
+  /**
+   * Collects this region's dimensions and derives everything that depends
+   * only on them: the value-space domain guard, GroupSpace.build's result,
+   * and (on success) the per-dimension dense value-space code/factor tables,
+   * built ONCE here on the driver and broadcast -- both the PLAIN decode
+   * path and the per-chunk dictionary translation index them by raw key
+   * value, replacing the boxed per-partition Map lookups that used to run
+   * in every task (see decodeKeyColumn). Cached per (execution, canonical
+   * keyPlans) by doExecute.
+   */
+  private def prepareRegion(executionId: Option[String]): MetalParquetGroupedAggregateExec.PreparedRegion = {
+    val (dimensions, dimensionNanos) = collectDimensions(executionId)
 
     // Task 6b: a PLAIN-decoded key chunk decodes straight into VALUE space
     // (decodeKeyColumn) -- the JVM builds that dimension's code/factor tables
@@ -158,7 +244,7 @@ case class MetalParquetGroupedAggregateExec(
     // Violating it is a runtime data condition, not a planning defect (the
     // rule's eligibility gate has no access to these rows), so -- exactly
     // like GroupSpace.build itself failing -- it routes the whole operator
-    // through the CPU hash-join fallback below rather than throwing.
+    // through doExecute's CPU hash-join fallback rather than throwing.
     val keyDomains: Seq[Option[(Int, Int)]] = dimensions.map { dimension =>
       if (dimension.rows.isEmpty) {
         None
@@ -179,63 +265,33 @@ case class MetalParquetGroupedAggregateExec(
           s"[$min, $max] falls outside the value-space code table's supported range " +
           s"[0, ${MetalParquetGroupedAggregateExec.MaxValueSpaceKey}]"
     }
-    // dimMaxKeys(k) sizes dimension k's PLAIN value-space table lazily, the
-    // first time decodeKeyColumn actually encounters a PLAIN chunk for
-    // column k (executeWithGroupSpace); -1 for an empty dimension (never
-    // dereferenced -- GroupSpace.build already fails a truly empty dimension
-    // before this would matter).
+    // dimMaxKeys(k) sizes dimension k's dense value-space table, built once
+    // right below; -1 for an empty dimension (never dereferenced --
+    // GroupSpace.build already fails a truly empty dimension before the
+    // tables are ever built).
     val dimMaxKeys: Array[Int] = keyDomains.map(_.map(_._2).getOrElse(-1)).toArray
 
-    val builtEither: Either[String, GroupSpace.Built] = domainViolation match {
+    val buildResult: Either[String, GroupSpace.Built] = domainViolation match {
       case Some(reason) => Left(reason)
-      case None =>
-        GroupSpace.build(dimensions, maxGroups = 1 << 20).flatMap { built =>
-          val estimatedBytes = built.groupCount.toLong * internalAggCount.toLong * 16L
-          if (estimatedBytes > 64L * 1024 * 1024) {
-            Left(s"group space memory estimate $estimatedBytes bytes (groups=${built.groupCount}, " +
-              s"internalAggs=$internalAggCount) exceeds the 64MB budget")
-          } else {
-            Right(built)
-          }
-        }
+      case None => GroupSpace.build(dimensions, maxGroups = 1 << 20)
     }
 
-    val numGroups = longMetric("numGroups")
-
-    builtEither match {
-      case Right(built) =>
-        numGroups += built.groupCount
-        executeWithGroupSpace(
-          built, dimensionAttributeTypes, dimMaxKeys, aggKinds, aggMeasureSlots, aggSlotMappings,
-          occupancySlot, internalAggCount)
-      // An unsupported dimension attribute type is a planning defect, not a
-      // runtime data condition: GroupedAggregateShape/Task 6's matcher is
-      // expected to reject any such region before this operator is ever
-      // constructed, so this throws driver-side (loudly, at doExecute time)
-      // rather than routing into the whole-operator CPU fallback, which
-      // would otherwise crash INSIDE an executor task the first time
-      // attributeValue() hit the same unsupported type (IllegalStateException
-      // from deep inside a Spark task is a much worse failure mode than a
-      // clear driver-side throw naming the type).
-      case Left(reason) if reason.contains("unsupported attribute type") =>
-        throw new IllegalStateException(
-          s"MetalParquetGroupedAggregateExec: GroupSpace.build rejected a dimension attribute type " +
-            s"($reason) -- this should have been rejected at planning time, not reached construction")
-      case Left(reason) =>
-        // reason may come from three independent sources -- the value-space
-        // domain guard above (GroupSpace.build never even runs), the 64MB
-        // group-space memory estimate (GroupSpace.build DID succeed; the
-        // estimate check on its result rejected it), or GroupSpace.build
-        // itself (a duplicate key or oversized cross product) -- each
-        // already carries its own distinguishing prefix/detail, so this
-        // message states only what is true of all three: dense group-space
-        // execution is unavailable for this reason and this call is falling
-        // back.
-        logWarning(s"MetalParquetGroupedAggregateExec: cannot use the dense group-space GPU path " +
-          s"($reason); falling back to a whole-operator CPU hash-join + hash-aggregate")
-        executeWholeOperatorCpuFallback(
-          dimensions, dimensionAttributeTypes, aggKinds, aggMeasureSlots, aggSlotMappings, occupancySlot)
+    // Fix 1 (dense value-space tables): built once here, on the driver, and
+    // broadcast -- previously buildValueSpaceTables ran once per (partition,
+    // PLAIN key column) and the dictionary path did a boxed Map lookup per
+    // dictionary entry per row group. The domain guard above guarantees
+    // every dimension's keys fit [0, MaxValueSpaceKey], so a dense array
+    // indexed by raw key value is valid for EVERY dimension on the GPU path
+    // (and for the per-row-group CPU fallback, which shares the same
+    // tables).
+    val valueTables = buildResult.toOption.map { built =>
+      sparkContext.broadcast(Array.tabulate(keyColumnNames.length) { k =>
+        MetalParquetGroupedAggregateExec.buildValueSpaceTables(
+          dimMaxKeys(k), built.codesByKey(k), built.factorsByKey(k))
+      })
     }
+
+    MetalParquetGroupedAggregateExec.PreparedRegion(dimensions, dimensionNanos, buildResult, valueTables)
   }
 
   // -------------------------------------------------------------------
@@ -256,8 +312,16 @@ case class MetalParquetGroupedAggregateExec(
    * genuinely differ). `.copy()` on the projection's output is required
    * (not just defensive): `UnsafeProjection.apply` reuses its own output
    * buffer across calls.
+   *
+   * Fix 2: each keyPlan's raw `executeCollect()` result is cached per
+   * (execution id, canonicalized plan), so a dimension subplan shared by
+   * several UNION regions of one query executes once -- the projection over
+   * the cached rows still runs per caller (cheap relative to executing the
+   * subplan). `executionId = None` (a caller outside a SQL execution, e.g.
+   * the phase benchmark) collects directly with no caching.
    */
-  private def collectDimensions(): (Seq[GroupSpace.Dimension], Long) = {
+  private[sparkmetal] def collectDimensions(
+      executionId: Option[String] = None): (Seq[GroupSpace.Dimension], Long) = {
     val started = System.nanoTime()
     val executor = Executors.newFixedThreadPool(math.max(1, keyPlans.length))
     val dimensions = try {
@@ -276,7 +340,19 @@ case class MetalParquetGroupedAggregateExec(
             } else {
               null
             }
-          val rows = plan.executeCollect().flatMap { row =>
+          val collected: Array[InternalRow] = executionId match {
+            case Some(id) =>
+              val cacheKey = (id, plan.canonicalized)
+              MetalParquetGroupedAggregateExec.collectedSubplanCache.get(cacheKey) match {
+                case Some(rows) => rows
+                case None =>
+                  val rows: Array[InternalRow] = plan.executeCollect().toArray
+                  MetalParquetGroupedAggregateExec.collectedSubplanCache.put(cacheKey, rows)
+                  rows
+              }
+            case None => plan.executeCollect().toArray
+          }
+          val rows = collected.flatMap { row =>
             if (row.isNullAt(0)) {
               None
             } else {
@@ -302,7 +378,7 @@ case class MetalParquetGroupedAggregateExec(
   private def executeWithGroupSpace(
       built: GroupSpace.Built,
       dimensionAttributeTypes: Seq[Seq[DataType]],
-      dimMaxKeys: Array[Int],
+      valueTables: org.apache.spark.broadcast.Broadcast[Array[(Array[Int], Array[Int])]],
       aggKinds: Array[Int],
       aggMeasureSlots: Array[Int],
       aggSlotMappings: Seq[AggSlotMapping],
@@ -314,8 +390,17 @@ case class MetalParquetGroupedAggregateExec(
     val decodeParseTime = longMetric("decodeParseTime")
     val metalTime = longMetric("metalTime")
     val numOutputRows = longMetric("numOutputRows")
+    val splitPlanTime = longMetric("splitPlanTime")
+    val rowGroupReadTime = longMetric("rowGroupReadTime")
+    val pageSubmitTime = longMetric("pageSubmitTime")
+    val outputBuildTime = longMetric("outputBuildTime")
+    val nativeStagingTime = longMetric("nativeStagingTime")
+    val nativeParseTime = longMetric("nativeParseTime")
+    val nativeEncodeTime = longMetric("nativeEncodeTime")
 
+    val splitPlanStarted = System.nanoTime()
     val splits = enumerateSplits()
+    splitPlanTime += (System.nanoTime() - splitPlanStarted) / 1000000
     val numPartitions = math.max(1, math.min(splits.length, sparkContext.defaultParallelism))
     val splitRDD = sparkContext.parallelize(splits, numPartitions)
     val groupCount = built.groupCount
@@ -335,22 +420,20 @@ case class MetalParquetGroupedAggregateExec(
           opened
         })
 
-      // PLAIN value-space code/factor tables (Task 6b), one slot per key
-      // column, built lazily by decodeKeyColumn the first time this
-      // partition actually decodes a PLAIN chunk for that column, and reused
-      // for every subsequent row group: unlike a dictionary chunk's
-      // per-row-group translation (which depends on THAT file's dictionary),
-      // a PLAIN column's value-space table depends only on the dimension's
-      // own data (built.codesByKey(k)/factorsByKey(k), fixed for the whole
-      // operator), so building it once per partition avoids repeating a
-      // dimMaxKeys(k)-sized allocation and fill for every row group.
-      val plainValueSpaceTables = new Array[(Array[Int], Array[Int])](keyColumnNames.length)
+      // Dense value-space code/factor tables, one pair per key column,
+      // built ONCE on the driver (prepareRegion) and broadcast: both the
+      // PLAIN decode path and the per-chunk dictionary translation index
+      // them by raw key value, and the per-row-group CPU fallback shares
+      // them too.
+      val partitionValueTables = valueTables.value
 
       var localRowGroups = 0L
       var localPages = 0L
       var localFallbacks = 0L
       var parseNanos = 0L
       var metalNanos = 0L
+      var readNanos = 0L
+      val submitNanos = new Array[Long](1)
       // Allocated lazily -- only once this partition actually needs a
       // per-row-group CPU fallback -- since eagerly allocating it up front
       // would cost up to groupCount * internalAggCount * 8 bytes (as much
@@ -392,7 +475,9 @@ case class MetalParquetGroupedAggregateExec(
             // rowGroupHandle on success.
             var aggregateLanded = false
             try {
+              val readStarted = System.nanoTime()
               val pageReadStore = reader.readRowGroup(split.rowGroupIndex)
+              readNanos += System.nanoTime() - readStarted
               try {
                 val parseStarted = System.nanoTime()
                 rowGroupHandle = NativeBridge.parquetRowGroupBeginAggregate(
@@ -403,15 +488,15 @@ case class MetalParquetGroupedAggregateExec(
                 for (k <- keyColumnNames.indices) {
                   val (codes, factors) = decodeKeyColumn(
                     streamHandle, rowGroupHandle, k, split, pageReadStore, keyDescriptors(k),
-                    built.codesByKey(k), built.factorsByKey(k), dimMaxKeys(k), plainValueSpaceTables,
-                    () => localPages += 1)
+                    partitionValueTables(k)._1, partitionValueTables(k)._2,
+                    () => localPages += 1, submitNanos)
                   codeTables(k) = codes
                   factorTables(k) = factors
                 }
                 for (m <- measureColumnNames.indices) {
                   decodeMeasureColumn(
                     streamHandle, rowGroupHandle, m, split, pageReadStore, measureDescriptors(m),
-                    () => localPages += 1)
+                    () => localPages += 1, submitNanos)
                 }
                 parseNanos += System.nanoTime() - parseStarted
 
@@ -467,12 +552,19 @@ case class MetalParquetGroupedAggregateExec(
                 try {
                   aggregateRowGroupOnCpu(
                     freshStore, schema, keyDescriptors, measureDescriptors,
-                    built.codesByKey, built.factorsByKey, aggKinds, aggMeasureSlots, cpuFallback())
+                    partitionValueTables, aggKinds, aggMeasureSlots, cpuFallback())
                 } finally {
                   freshStore.close()
                 }
             }
           }
+
+          // Harvested BEFORE Finish (which destroys the stream): the native
+          // sub-phase split of the pages this stream decoded.
+          val streamTimers = NativeBridge.parquetStreamTimers(streamHandle)
+          nativeStagingTime += streamTimers(0) / 1000000
+          nativeParseTime += streamTimers(1) / 1000000
+          nativeEncodeTime += streamTimers(2) / 1000000
 
           // Set the flag BEFORE Finish: Finish destroys the native stream
           // even when it throws, so the finally-block Abort must never fire
@@ -493,6 +585,8 @@ case class MetalParquetGroupedAggregateExec(
         }
         metalTime += metalNanos / 1000000
         decodeParseTime += parseNanos / 1000000
+        rowGroupReadTime += readNanos / 1000000
+        pageSubmitTime += submitNanos(0) / 1000000
         numRowGroups += localRowGroups
         numPagesDecoded += localPages
         cpuFallbackRowGroups += localFallbacks
@@ -525,6 +619,7 @@ case class MetalParquetGroupedAggregateExec(
           if (cpuFallbackBuffer != null) cpuFallbackBuffer else new Array[Long](totalCells)
         }
 
+      val outputStarted = System.nanoTime()
       val toUnsafeRow = outputProjection()
       val outputRows = mutable.ArrayBuffer.empty[InternalRow]
       var g = 0
@@ -537,6 +632,7 @@ case class MetalParquetGroupedAggregateExec(
         g += 1
       }
       numOutputRows += outputRows.size
+      outputBuildTime += (System.nanoTime() - outputStarted) / 1000000
       outputRows.iterator
     }
   }
@@ -547,24 +643,23 @@ case class MetalParquetGroupedAggregateExec(
    * one file and PLAIN in another, so this is decided per chunk, not once
    * for the whole operator):
    *
-   *  - Dictionary chunk (unchanged from before Task 6b): translates
-   *    [[GroupSpace.Built]]'s VALUE-keyed code/factor maps into
-   *    dictionary-id-indexed tables for THIS row group's own dictionary,
+   *  - Dictionary chunk: translates the dimension's dense VALUE-space
+   *    code/factor tables into dictionary-id-indexed tables for THIS row
+   *    group's own dictionary (a primitive array index per dictionary
+   *    entry -- Fix 1 replaced the boxed Map lookup that used to run here),
    *    then decodes every page via `NativeBridge.parquetDecodePage`'s
    *    dictionary path (`isPlain = false`).
-   *  - PLAIN chunk (no dictionary page at all): reuses (building once per
-   *    partition, in `plainValueSpaceTables(ordinal)`) a dense VALUE-space
-   *    table sized `dimMaxKey + 1` and indexed directly by raw key value --
-   *    [[GroupSpace.Built]]'s code/factor maps are ALREADY value-keyed, so
-   *    this is a direct array-fill, not a translation -- then decodes every
-   *    page via `parquetDecodePage`'s PLAIN path (`isPlain = true`), which
-   *    writes literal packed int32 values straight into the key plane (see
+   *  - PLAIN chunk (no dictionary page at all): uses the broadcast dense
+   *    VALUE-space tables directly -- they are sized `dimMaxKey + 1` and
+   *    indexed by raw key value, exactly the layout the kernel expects --
+   *    then decodes every page via `parquetDecodePage`'s PLAIN path
+   *    (`isPlain = true`), which writes literal packed int32 values
+   *    straight into the key plane (see
    *    `NativeBridge.parquetRowGroupAggregate`'s Javadoc for why the fact
    *    side needs no min offset or extra bounds handling here).
    *
-   * `dimMaxKey` and `plainValueSpaceTables` are only ever touched on the
-   * PLAIN path; a dimension that always turns out to be dictionary-encoded
-   * across every file this partition reads never allocates one.
+   * `codeTable`/`factorTable` are dimension `ordinal`'s broadcast dense
+   * tables (prepareRegion); `factorTable` is null when every key is unique.
    */
   private def decodeKeyColumn(
       streamHandle: Long,
@@ -573,27 +668,25 @@ case class MetalParquetGroupedAggregateExec(
       split: ParquetGroupedAggregateSplit,
       pageReadStore: PageReadStore,
       descriptor: ColumnDescriptor,
-      codesByKey: Map[Int, Int],
-      factorsByKey: Map[Int, Int],
-      dimMaxKey: Int,
-      plainValueSpaceTables: Array[(Array[Int], Array[Int])],
-      onPageDecoded: () => Unit): (Array[Int], Array[Int]) = {
+      codeTable: Array[Int],
+      factorTable: Array[Int],
+      onPageDecoded: () => Unit,
+      submitNanos: Array[Long]): (Array[Int], Array[Int]) = {
     val pageReader = pageReadStore.getPageReader(descriptor)
     val dictionaryPage = pageReader.readDictionaryPage()
     val isPlain = dictionaryPage == null
-    val (codeTable, factorTable) =
+    val (codes, factors) =
       if (!isPlain) {
         val dictionaryValues = decodeDictionary(dictionaryPage)
-        val codes = dictionaryValues.map(value => codesByKey.getOrElse(value, -1))
-        val factors =
-          if (factorsByKey.isEmpty) null else dictionaryValues.map(value => factorsByKey.getOrElse(value, 1))
-        (codes, factors)
+        val dictCodes = dictionaryValues.map(value =>
+          if (value >= 0 && value < codeTable.length) codeTable(value) else -1)
+        val dictFactors =
+          if (factorTable == null) null
+          else dictionaryValues.map(value =>
+            if (value >= 0 && value < factorTable.length) factorTable(value) else 1)
+        (dictCodes, dictFactors)
       } else {
-        if (plainValueSpaceTables(ordinal) == null) {
-          plainValueSpaceTables(ordinal) =
-            MetalParquetGroupedAggregateExec.buildValueSpaceTables(dimMaxKey, codesByKey, factorsByKey)
-        }
-        plainValueSpaceTables(ordinal)
+        (codeTable, factorTable)
       }
 
     val hasDefLevels = descriptor.getMaxDefinitionLevel > 0
@@ -618,9 +711,11 @@ case class MetalParquetGroupedAggregateExec(
       }
       val pageBytes = dataPage.getBytes.toByteArray
       val valueCount = dataPage.getValueCount
+      val submitStarted = System.nanoTime()
       NativeBridge.parquetDecodePage(
         streamHandle, rowGroupHandle, ordinal, pageBytes, pageBytes.length, valueCount, rowOffset, hasDefLevels,
         isPlain)
+      submitNanos(0) += System.nanoTime() - submitStarted
       onPageDecoded()
       rowOffset += valueCount
       rawPage = pageReader.readPage()
@@ -629,7 +724,7 @@ case class MetalParquetGroupedAggregateExec(
       throw new RuntimeException(
         s"${split.file}: ${keyColumnNames(ordinal)} pages covered $rowOffset rows, expected ${split.rowCount}")
     }
-    (codeTable, factorTable)
+    (codes, factors)
   }
 
   /**
@@ -645,7 +740,8 @@ case class MetalParquetGroupedAggregateExec(
       split: ParquetGroupedAggregateSplit,
       pageReadStore: PageReadStore,
       descriptor: ColumnDescriptor,
-      onPageDecoded: () => Unit): Unit = {
+      onPageDecoded: () => Unit,
+      submitNanos: Array[Long]): Unit = {
     val pageReader = pageReadStore.getPageReader(descriptor)
     val dictionaryPage = pageReader.readDictionaryPage()
     if (dictionaryPage != null) {
@@ -674,8 +770,10 @@ case class MetalParquetGroupedAggregateExec(
       }
       val pageBytes = dataPage.getBytes.toByteArray
       val valueCount = dataPage.getValueCount
+      val submitStarted = System.nanoTime()
       NativeBridge.parquetDecodeMeasurePage(
         streamHandle, rowGroupHandle, slot, pageBytes, pageBytes.length, valueCount, rowOffset, hasDefLevels)
+      submitNanos(0) += System.nanoTime() - submitStarted
       onPageDecoded()
       rowOffset += valueCount
       rawPage = pageReader.readPage()
@@ -700,19 +798,19 @@ case class MetalParquetGroupedAggregateExec(
    * count-column) and accumulating into `buffer` -- the SAME dense
    * `groupCount * internalAggCount` layout the GPU path uses, so a
    * partition's GPU and CPU-fallback contributions can simply be added
-   * element-wise. `codesByKey`/`factorsByKey` are [[GroupSpace.Built]]'s
-   * VALUE-keyed maps used directly: `getInteger()` already returns the
-   * decoded value regardless of encoding, so no dictionary-id translation
-   * is needed here (unlike the GPU path, which decodes to dictionary ids
-   * and needs a per-row-group translation table).
+   * element-wise. `valueTables` holds each dimension's dense VALUE-space
+   * code/factor tables (the same broadcast pair the GPU path uses):
+   * `getInteger()` already returns the decoded value regardless of
+   * encoding, so the raw value indexes the tables directly -- no
+   * dictionary-id translation is needed here (unlike the GPU path, which
+   * decodes to dictionary ids and needs a per-row-group translation table).
    */
   private def aggregateRowGroupOnCpu(
       store: PageReadStore,
       schema: MessageType,
       keyDescriptors: Seq[ColumnDescriptor],
       measureDescriptors: Seq[ColumnDescriptor],
-      codesByKey: Seq[Map[Int, Int]],
-      factorsByKey: Seq[Map[Int, Int]],
+      valueTables: Array[(Array[Int], Array[Int])],
       aggKinds: Array[Int],
       aggMeasureSlots: Array[Int],
       buffer: Array[Long]): Unit = {
@@ -742,12 +840,14 @@ case class MetalParquetGroupedAggregateExec(
         } else {
           val value = reader.getInteger
           if (member) {
-            codesByKey(k).get(value) match {
-              case Some(code) => groupId += code
-              case None => member = false
-            }
-            if (member) {
-              factorsByKey(k).get(value).foreach(f => factor *= f)
+            val codes = valueTables(k)._1
+            val code = if (value >= 0 && value < codes.length) codes(value) else -1
+            if (code < 0) {
+              member = false
+            } else {
+              groupId += code
+              val factors = valueTables(k)._2
+              if (factors != null) factor *= factors(value)
             }
           }
         }
@@ -1128,7 +1228,7 @@ case class MetalParquetGroupedAggregateExec(
   private def allColumnDescriptors(file: String, schema: MessageType): Seq[ColumnDescriptor] =
     (keyColumnNames ++ measureColumnNames).distinct.map(name => descriptorFor(schema, file, name))
 
-  private def enumerateSplits(): Seq[ParquetGroupedAggregateSplit] = {
+  private[sparkmetal] def enumerateSplits(): Seq[ParquetGroupedAggregateSplit] = {
     val configuration = MetalParquetGroupedAggregateExec.sharedConfiguration
     if (files.length <= 1) {
       return files.flatMap(footerSplits(_, configuration))
@@ -1180,6 +1280,34 @@ private[sparkmetal] object MetalParquetGroupedAggregateExec {
     new BoundedCache[FileVersion, Seq[ParquetGroupedAggregateSplit]](ParquetEligibility.MaxCachedFiles)
 
   /**
+   * Everything a region derives purely from its keyPlans (prepareRegion):
+   * the collected dimensions, GroupSpace.build's verdict (WITHOUT the
+   * per-region 64MB memory estimate, which depends on the region's own
+   * aggregate count), and -- on a successful build -- the broadcast dense
+   * value-space code/factor tables. `collectNanos` is the dimension-collect
+   * cost actually paid building this value; a cache hit reports zero
+   * additional dimensionTime because no additional work ran.
+   */
+  private[sparkmetal] case class PreparedRegion(
+      dimensions: Seq[GroupSpace.Dimension],
+      collectNanos: Long,
+      buildResult: Either[String, GroupSpace.Built],
+      valueTables: Option[org.apache.spark.broadcast.Broadcast[Array[(Array[Int], Array[Int])]]])
+
+  /**
+   * Fix 2 caches, both keyed by SQL execution id + canonicalized plan(s), so
+   * reuse happens only WITHIN one query execution -- the same scope and the
+   * same semantic-equality test (`canonicalized`) Spark's own ReuseExchange
+   * relies on. Bounded LRU: stale executions age out; nothing here is
+   * workload-specific.
+   */
+  private[sparkmetal] val collectedSubplanCache =
+    new BoundedCache[(String, SparkPlan), Array[InternalRow]](64)
+
+  private[sparkmetal] val preparedRegionCache =
+    new BoundedCache[(String, Seq[SparkPlan]), PreparedRegion](32)
+
+  /**
    * Task 6b: the largest join-key value a PLAIN key column's value-space
    * code table may need to hold, 4,194,303 (4M - 1) -- chosen so ONE table
    * (`(dimMaxKey + 1)` int32s) stays at or under 16MB; the codes table alone
@@ -1198,10 +1326,10 @@ private[sparkmetal] object MetalParquetGroupedAggregateExec {
    * overwritten at every key value `codesByKey`/`factorsByKey` actually maps
    * -- no min offset (see `NativeBridge.parquetRowGroupAggregate`'s Javadoc):
    * every index below the dimension's smallest join key is left `-1`, exactly
-   * like any other non-member slot, rather than treated specially. Called at
-   * most once per (partition, key column) by `decodeKeyColumn`, since the
-   * result depends only on the dimension's own (fixed, driver-collected)
-   * data, not on any particular row group.
+   * like any other non-member slot, rather than treated specially. Fix 1:
+   * called once per (region, key column) on the DRIVER (prepareRegion) and
+   * broadcast, since the result depends only on the dimension's own (fixed,
+   * driver-collected) data, not on any particular row group or partition.
    */
   private[sparkmetal] def buildValueSpaceTables(
       dimMaxKey: Int, codesByKey: Map[Int, Int], factorsByKey: Map[Int, Int]): (Array[Int], Array[Int]) = {

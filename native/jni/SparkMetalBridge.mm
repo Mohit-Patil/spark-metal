@@ -126,6 +126,34 @@ struct MembershipStream {
     id<MTLBuffer> aggregatePartials = nil;
     uint32_t aggregateGroupCount = 0;
     uint32_t aggregateAggCount = 0;
+    // Diagnostic sub-phase accumulators for the page-decode path
+    // (parquetDecodePage / parquetDecodeMeasurePage), read back by
+    // parquetStreamTimers BEFORE the stream is finished. A stream is driven
+    // by one Spark task, so plain counters suffice. These split the JVM-side
+    // decodeParseTime umbrella into: staging (JNI byte transfer into a
+    // staging buffer, pool acquisition included), parse (parseDataPageV1),
+    // and encode (blit/compute-encoder dispatch after a successful parse).
+    uint64_t debugStagingNanos = 0;
+    uint64_t debugParseNanos = 0;
+    uint64_t debugEncodeNanos = 0;
+    uint64_t debugPages = 0;
+};
+
+// CLOCK_UPTIME_RAW matches mach_absolute_time at ~20ns per read: two orders
+// of magnitude below the tens-of-microseconds per-page costs these timers
+// exist to expose, so leaving them permanently on does not perturb the path.
+uint64_t debugNowNanos() {
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+}
+
+// Accumulates the guarded scope's elapsed time into `sink` on destruction,
+// so every early-return path of a decode function is covered.
+struct DebugPhaseTimer {
+    uint64_t *sink;
+    uint64_t started;
+    explicit DebugPhaseTimer(uint64_t *sinkPointer)
+        : sink(sinkPointer), started(debugNowNanos()) {}
+    ~DebugPhaseTimer() { *sink += debugNowNanos() - started; }
 };
 
 // Mirrors kernels.metal's ExpandParams/ScatterParams field-for-field.
@@ -1606,6 +1634,8 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetDecodePage(
             return;
         }
 
+        stream->debugPages += 1;
+        uint64_t stagingStarted = debugNowNanos();
         // pageLength + 4: expand_value_runs's 4-byte bit window may read up to
         // 3 bytes past the payload (Dictionary pages only); the tail is
         // zeroed so that read is inert. Harmless padding for Plain pages too.
@@ -1619,6 +1649,7 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetDecodePage(
             pageBytes, 0, pageLength, reinterpret_cast<jbyte *>(pageContents));
         if (environment->ExceptionCheck()) return;
         memset(pageContents + pageLength, 0, 4);
+        stream->debugStagingNanos += debugNowNanos() - stagingStarted;
 
         // Task 6b: isPlain selects the value-section layout exactly as
         // parquetDecodeMeasurePage infers Dictionary-vs-PLAIN from whether a
@@ -1632,13 +1663,16 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetDecodePage(
         // One PageRuns per decoding thread, reused across pages: see
         // parseDataPageV1, which resets it in place and so keeps its capacity.
         static thread_local sparkmetal::PageRuns runs;
+        uint64_t parseStarted = debugNowNanos();
         bool parsed = sparkmetal::parseDataPageV1(
             pageContents, static_cast<size_t>(pageLength), static_cast<uint32_t>(valueCount),
             hasDefLevels == JNI_TRUE, encoding, runs);
+        stream->debugParseNanos += debugNowNanos() - parseStarted;
         if (!parsed) {
             throwRuntime(environment, @"Unsupported Parquet page");
             return;
         }
+        DebugPhaseTimer encodeTimer(&stream->debugEncodeNanos);
         // Structural sanity check, mirroring parquetDecodeMeasurePage's: this
         // can only fail if the isPlain/encoding wiring above is broken by a
         // future change, since runs.plain is set by parseDataPageV1 purely
@@ -2020,6 +2054,7 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetDecodeMeasurePage(
         }
         if (valueCount == 0) return;  // Nothing to write for this page.
 
+        stream->debugPages += 1;
         id<MTLBuffer> dictionaryBuffer = rowGroup->measureDictionary[measureSlot];
         uint32_t dictionaryCount = rowGroup->measureDictionaryCount[measureSlot];
         bool isDictionary = dictionaryBuffer != nil;
@@ -2027,6 +2062,7 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetDecodeMeasurePage(
             ? sparkmetal::PageValueEncoding::Dictionary
             : sparkmetal::PageValueEncoding::Plain;
 
+        uint64_t stagingStarted = debugNowNanos();
         // pageLength + 4: expand_value_runs's 4-byte bit window may read up to
         // 3 bytes past the payload (Dictionary pages only); the tail is
         // zeroed so that read is inert. Harmless padding for Plain pages too.
@@ -2048,11 +2084,14 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetDecodeMeasurePage(
             pageBytes, 0, pageLength, reinterpret_cast<jbyte *>(pageContents));
         if (environment->ExceptionCheck()) return;
         memset(pageContents + pageLength, 0, 4);
+        stream->debugStagingNanos += debugNowNanos() - stagingStarted;
 
         static thread_local sparkmetal::PageRuns runs;
+        uint64_t parseStarted = debugNowNanos();
         bool parsed = sparkmetal::parseDataPageV1(
             pageContents, static_cast<size_t>(pageLength), static_cast<uint32_t>(valueCount),
             hasDefLevels == JNI_TRUE, encoding, runs);
+        stream->debugParseNanos += debugNowNanos() - parseStarted;
         if (!parsed) {
             throwRuntime(environment, @"Unsupported Parquet measure page");
             return;
@@ -2074,6 +2113,7 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetDecodeMeasurePage(
             throwRuntime(environment, @"Parquet measure page encoding disagreement");
             return;
         }
+        DebugPhaseTimer encodeTimer(&stream->debugEncodeNanos);
         if (!runs.allValid && runs.segments.empty()) {
             // Defensive: a non-empty page always yields at least one segment
             // once its definition levels are folded, but guard against
@@ -2893,6 +2933,66 @@ Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetRowGroupAggregate(
         auto &rowGroups = stream->rowGroups;
         rowGroups.erase(std::remove(rowGroups.begin(), rowGroups.end(), rowGroup), rowGroups.end());
         delete rowGroup;
+    }
+}
+
+// Reads back the stream's page-decode sub-phase accumulators as
+// {stagingNanos, parseNanos, encodeNanos, pages}. Purely observational: call
+// any time BEFORE the stream is finished/aborted (both destroy the stream).
+extern "C" JNIEXPORT jlongArray JNICALL
+Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetStreamTimers(
+    JNIEnv *environment,
+    jclass,
+    jlong streamHandle) {
+    if (streamHandle == 0) {
+        throwRuntime(environment, @"Invalid stream handle");
+        return nullptr;
+    }
+    auto *stream = reinterpret_cast<MembershipStream *>(static_cast<uintptr_t>(streamHandle));
+    jlongArray result = environment->NewLongArray(4);
+    if (result == nullptr) return nullptr;
+    jlong values[4] = {
+        static_cast<jlong>(stream->debugStagingNanos),
+        static_cast<jlong>(stream->debugParseNanos),
+        static_cast<jlong>(stream->debugEncodeNanos),
+        static_cast<jlong>(stream->debugPages)};
+    environment->SetLongArrayRegion(result, 0, 4, values);
+    return result;
+}
+
+// Benchmark-only: runs the CPU-side page parse (JNI byte transfer +
+// parseDataPageV1) with no stream, no staging pool, and no GPU work, so a
+// standalone harness can price the parse stage in isolation. Uses its own
+// thread_local scratch/PageRuns; never touches Metal state, so it is safe to
+// call before NativeBridge.initialize.
+extern "C" JNIEXPORT void JNICALL
+Java_io_github_mohitpatil_sparkmetal_NativeBridge_parquetParsePageBenchmark(
+    JNIEnv *environment,
+    jclass,
+    jbyteArray pageBytes,
+    jint pageLength,
+    jint valueCount,
+    jboolean hasDefLevels,
+    jboolean isPlain) {
+    if (pageBytes == nullptr || pageLength <= 0 || valueCount < 0) {
+        throwRuntime(environment, @"Invalid Parquet parse-benchmark arguments");
+        return;
+    }
+    static thread_local std::vector<uint8_t> scratch;
+    scratch.resize(static_cast<size_t>(pageLength) + 4);
+    environment->GetByteArrayRegion(
+        pageBytes, 0, pageLength, reinterpret_cast<jbyte *>(scratch.data()));
+    if (environment->ExceptionCheck()) return;
+    memset(scratch.data() + pageLength, 0, 4);
+    sparkmetal::PageValueEncoding encoding = isPlain == JNI_TRUE
+        ? sparkmetal::PageValueEncoding::Plain
+        : sparkmetal::PageValueEncoding::Dictionary;
+    static thread_local sparkmetal::PageRuns runs;
+    bool parsed = sparkmetal::parseDataPageV1(
+        scratch.data(), static_cast<size_t>(pageLength), static_cast<uint32_t>(valueCount),
+        hasDefLevels == JNI_TRUE, encoding, runs);
+    if (!parsed) {
+        throwRuntime(environment, @"Unsupported Parquet page");
     }
 }
 

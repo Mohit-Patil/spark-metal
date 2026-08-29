@@ -54,7 +54,14 @@ def accelerator_metrics(plan) -> dict[str, dict[str, int]]:
             while iterator.hasNext():
                 entry = iterator.next()
                 metrics[str(entry._1())] = int(entry._2().value())
-            observations[node_name] = metrics
+            # A UNION query can hold several operators with the same node
+            # name; suffix repeats so no region's metrics are overwritten.
+            key = node_name
+            suffix = 1
+            while key in observations:
+                suffix += 1
+                key = f"{node_name}#{suffix}"
+            observations[key] = metrics
         children = node.children().iterator()
         while children.hasNext():
             pending.append(children.next())

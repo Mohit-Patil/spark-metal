@@ -72,7 +72,10 @@ case class MetalParquetMembershipCountExec(
     "pageSubmitTime" -> SQLMetrics.createTimingMetric(sparkContext, "native page-submit time"),
     "metalTime" -> SQLMetrics.createTimingMetric(sparkContext, "Metal count and final wait time"),
     "dimensionTime" -> SQLMetrics.createTimingMetric(sparkContext, "dimension key collection time"),
-    "membershipBuildTime" -> SQLMetrics.createTimingMetric(sparkContext, "membership map build time"))
+    "membershipBuildTime" -> SQLMetrics.createTimingMetric(sparkContext, "membership map build time"),
+    "nativeStagingTime" -> SQLMetrics.createTimingMetric(sparkContext, "native staging copy time"),
+    "nativeParseTime" -> SQLMetrics.createTimingMetric(sparkContext, "native page parse time"),
+    "nativeEncodeTime" -> SQLMetrics.createTimingMetric(sparkContext, "native GPU encode time"))
 
   override protected def doExecute(): RDD[InternalRow] =
     throw new UnsupportedOperationException("MetalParquetMembershipCountExec is columnar-only")
@@ -100,6 +103,9 @@ case class MetalParquetMembershipCountExec(
     val pageSubmitTime = longMetric("pageSubmitTime")
     val metalTime = longMetric("metalTime")
     val membershipBuildTime = longMetric("membershipBuildTime")
+    val nativeStagingTime = longMetric("nativeStagingTime")
+    val nativeParseTime = longMetric("nativeParseTime")
+    val nativeEncodeTime = longMetric("nativeEncodeTime")
 
     val denseDomains = keys.forall { values =>
       values.nonEmpty && {
@@ -230,6 +236,12 @@ case class MetalParquetMembershipCountExec(
           }
 
           if (streamHandle != 0L) {
+            // Harvested BEFORE Finish (which destroys the stream): the
+            // native sub-phase split of the pages this stream decoded.
+            val streamTimers = NativeBridge.parquetStreamTimers(streamHandle)
+            nativeStagingTime += streamTimers(0) / 1000000
+            nativeParseTime += streamTimers(1) / 1000000
+            nativeEncodeTime += streamTimers(2) / 1000000
             val started = System.nanoTime()
             // Set the flag before calling Finish: Finish deletes the native
             // stream even when it throws, so the finally block's Abort must

@@ -63,7 +63,8 @@ java -cp "${SPARK_HOME}/jars/*" scala.tools.nsc.Main \
   "${plugin_root}/scala/io/github/mohitpatil/sparkmetal/AnsiFallbackSmoke.scala" \
   "${plugin_root}/scala/io/github/mohitpatil/sparkmetal/SyntheticBenchmark.scala" \
   "${plugin_root}/scala/io/github/mohitpatil/sparkmetal/Q96SyntheticBenchmark.scala" \
-  "${plugin_root}/scala/io/github/mohitpatil/sparkmetal/ParquetDecodeSmoke.scala"
+  "${plugin_root}/scala/io/github/mohitpatil/sparkmetal/ParquetDecodeSmoke.scala" \
+  "${plugin_root}/scala/io/github/mohitpatil/sparkmetal/PhaseBenchmark.scala"
 
 jar --create \
   --file "${build_root}/spark-metal-plugin.jar" \

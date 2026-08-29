@@ -244,4 +244,24 @@ public final class NativeBridge {
     /** Waits, reclaims and destroys the stream without producing a result. */
     public static native void parquetAggregateStreamAbort(long streamHandle);
 
+    /**
+     * Reads back the stream's page-decode sub-phase accumulators as
+     * {stagingNanos, parseNanos, encodeNanos, pages}: staging is the JNI byte
+     * transfer into a pooled staging buffer, parse is parseDataPageV1, encode
+     * is the blit/compute dispatch work after a successful parse. Purely
+     * observational; must be called BEFORE the stream is finished or aborted
+     * (both destroy the stream).
+     */
+    public static native long[] parquetStreamTimers(long streamHandle);
+
+    /**
+     * Benchmark-only: runs the CPU-side page parse (JNI byte transfer +
+     * parseDataPageV1) with no stream and no GPU work, so a standalone
+     * harness can price the parse stage in isolation. Throws on an
+     * unsupported page, exactly like parquetDecodePage would.
+     */
+    public static native void parquetParsePageBenchmark(
+            byte[] pageBytes, int pageLength, int valueCount,
+            boolean hasDefLevels, boolean isPlain);
+
 }
